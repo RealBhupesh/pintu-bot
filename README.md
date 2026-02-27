@@ -13,6 +13,8 @@ Discord moderation bot with prefix commands (default: `&`).
 - `&lock`, `&unlock`, `&slowmode`
 - `&warn`, `&warnings`, `&clearwarns` (stored in `data/warnings.json`)
 - `&automod <on|off|toggle|status>` (moderators can control AutoMod per server)
+- `&setgenderroles <@male_role> <@female_role>` for per-server `aicrush` mapping
+- `&genderroles`, `&cleargenderroles`
 - Auto moderation:
   - blocked words from `data/bad_words.txt`
   - link blocking
@@ -118,6 +120,18 @@ Most new AI fun commands are hybrid, so you can use both prefix (`&...`) and sla
 - `VIBE_MIN_REQUIRED_MESSAGES=25`
 - `VIBE_MAX_PROMPT_MESSAGES=80`
 - `VIBE_MAX_PROMPT_CHARS=12000`
+- `AICRUSH_SCAN_PER_CHANNEL=450` (used when full-history scan is disabled)
+- `AICRUSH_MAX_CHANNELS=0` (`0` means scan all visible text channels)
+- `AICRUSH_FULL_HISTORY_SCAN=true`
+- `AICRUSH_MAX_CONTEXT_CHARS=16000`
+- `AICRUSH_MAX_HISTORY_MESSAGES=12000` (per-run safety cap)
+- `AICRUSH_SCAN_PAUSE_EVERY=260` (small pacing interval)
+- `AICRUSH_SCAN_PAUSE_SECONDS=0.12` (sleep duration for pacing)
+- `AICRUSH_CACHE_SECONDS=900` (reuse recent result to avoid repeated scans)
+- `MALE_ROLE_IDS=` (comma-separated role IDs for strict aicrush gender detection)
+- `FEMALE_ROLE_IDS=` (comma-separated role IDs for strict aicrush gender detection)
+- `MALE_ROLE_HINTS=` (optional extra keywords)
+- `FEMALE_ROLE_HINTS=` (optional extra keywords)
 - `VOICE_CONNECT_RETRIES=4`
 - `VOICE_CONNECT_TIMEOUT=25`
 - `VOICE_INTERNAL_RECONNECT=false`

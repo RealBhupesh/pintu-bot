@@ -5,6 +5,7 @@ import asyncio
 import time
 import shutil
 import random
+import unicodedata
 from typing import Literal
 from dataclasses import dataclass
 from collections import Counter, defaultdict, deque
@@ -57,6 +58,16 @@ def env_int(key: str, default: int, minimum: int) -> int:
         return default
 
 
+def env_float(key: str, default: float, minimum: float) -> float:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    try:
+        return max(float(raw), minimum)
+    except ValueError:
+        return default
+
+
 AUTO_MOD_ENABLED = env_bool("AUTOMOD_ENABLED", False)
 BLOCK_LINKS = env_bool("AUTOMOD_BLOCK_LINKS", True)
 SPAM_MSG_THRESHOLD = env_int("AUTOMOD_SPAM_MSG_THRESHOLD", 6, 2)
@@ -82,6 +93,19 @@ AI_MAX_HISTORY = env_int("AI_MAX_HISTORY", 4, 2)
 AI_MAX_TOKENS = env_int("AI_MAX_TOKENS", 260, 80)
 AI_SUMMARY_MAX_TOKENS = env_int("AI_SUMMARY_MAX_TOKENS", 320, 120)
 AI_TIMEOUT_SECONDS = env_int("AI_TIMEOUT_SECONDS", 45, 10)
+PSYCH_SESSION_TIMEOUT_MINUTES = env_int("PSYCH_SESSION_TIMEOUT_MINUTES", 1440, 30)
+PSYCH_MAX_TOKENS = env_int("PSYCH_MAX_TOKENS", 320, 120)
+PSYCH_MAX_NOTES_CHARS = env_int("PSYCH_MAX_NOTES_CHARS", 1200, 200)
+PSYCH_MAX_TURNS = env_int("PSYCH_MAX_TURNS", 60, 5)
+PSYCH_CRISIS_STRICT = env_bool("PSYCH_CRISIS_STRICT", True)
+PSYCH_LISTEN_WINDOW_SECONDS = env_float("PSYCH_LISTEN_WINDOW_SECONDS", 12.0, 2.0)
+PSYCH_SOLUTION_TRIGGER_MODE = os.getenv("PSYCH_SOLUTION_TRIGGER_MODE", "explicit").strip().lower()
+if PSYCH_SOLUTION_TRIGGER_MODE not in {"explicit"}:
+    PSYCH_SOLUTION_TRIGGER_MODE = "explicit"
+PSYCH_MAX_BUFFERED_MESSAGES = env_int("PSYCH_MAX_BUFFERED_MESSAGES", 25, 3)
+ARGUMENT_MODE_MAX_TURNS = env_int("ARGUMENT_MODE_MAX_TURNS", 14, 2)
+ARGUMENT_MODE_TIMEOUT_MINUTES = env_int("ARGUMENT_MODE_TIMEOUT_MINUTES", 45, 5)
+ARGUMENT_MODE_REPLY_TOKENS = env_int("ARGUMENT_MODE_REPLY_TOKENS", 180, 80)
 SYNC_SLASH_COMMANDS = env_bool("SYNC_SLASH_COMMANDS", True)
 VIBE_DEFAULT_MESSAGE_COUNT = env_int("VIBE_DEFAULT_MESSAGE_COUNT", 200, 20)
 VIBE_MAX_MESSAGE_COUNT = env_int("VIBE_MAX_MESSAGE_COUNT", 800, 50)
@@ -124,6 +148,50 @@ MEALDB_BASE_URL = os.getenv(
     "MEALDB_BASE_URL", "https://www.themealdb.com/api/json/v1/1"
 ).strip().rstrip("/")
 MEAL_CACHE_TTL_SECONDS = env_int("MEAL_CACHE_TTL_SECONDS", 1800, 60)
+AICRUSH_FULL_HISTORY_SCAN = env_bool("AICRUSH_FULL_HISTORY_SCAN", True)
+AICRUSH_SCAN_PER_CHANNEL = env_int("AICRUSH_SCAN_PER_CHANNEL", 450, 60)
+_AICRUSH_MAX_CHANNELS_RAW = os.getenv("AICRUSH_MAX_CHANNELS", "0").strip()
+if _AICRUSH_MAX_CHANNELS_RAW.isdigit():
+    AICRUSH_MAX_CHANNELS = max(0, int(_AICRUSH_MAX_CHANNELS_RAW))
+else:
+    AICRUSH_MAX_CHANNELS = 0
+AICRUSH_MAX_CONTEXT_CHARS = env_int("AICRUSH_MAX_CONTEXT_CHARS", 16000, 3000)
+AICRUSH_MAX_HISTORY_MESSAGES = env_int("AICRUSH_MAX_HISTORY_MESSAGES", 12000, 500)
+AICRUSH_SCAN_PAUSE_EVERY = env_int("AICRUSH_SCAN_PAUSE_EVERY", 260, 50)
+AICRUSH_SCAN_PAUSE_SECONDS = env_float("AICRUSH_SCAN_PAUSE_SECONDS", 0.12, 0.0)
+AICRUSH_CACHE_SECONDS = env_int("AICRUSH_CACHE_SECONDS", 900, 30)
+ROAST_FULL_HISTORY_SCAN = env_bool("ROAST_FULL_HISTORY_SCAN", True)
+ROAST_SCAN_PER_CHANNEL = env_int("ROAST_SCAN_PER_CHANNEL", 350, 40)
+_ROAST_MAX_CHANNELS_RAW = os.getenv("ROAST_MAX_CHANNELS", "0").strip()
+if _ROAST_MAX_CHANNELS_RAW.isdigit():
+    ROAST_MAX_CHANNELS = max(0, int(_ROAST_MAX_CHANNELS_RAW))
+else:
+    ROAST_MAX_CHANNELS = 0
+ROAST_MAX_HISTORY_MESSAGES = env_int("ROAST_MAX_HISTORY_MESSAGES", 8000, 500)
+ROAST_SCAN_PAUSE_EVERY = env_int("ROAST_SCAN_PAUSE_EVERY", 240, 40)
+ROAST_SCAN_PAUSE_SECONDS = env_float("ROAST_SCAN_PAUSE_SECONDS", 0.08, 0.0)
+ROAST_MAX_CONTEXT_CHARS = env_int("ROAST_MAX_CONTEXT_CHARS", 14000, 2000)
+ROAST_CACHE_SECONDS = env_int("ROAST_CACHE_SECONDS", 900, 30)
+MALE_ROLE_IDS = {
+    int(raw.strip())
+    for raw in os.getenv("MALE_ROLE_IDS", "").split(",")
+    if raw.strip().isdigit()
+}
+FEMALE_ROLE_IDS = {
+    int(raw.strip())
+    for raw in os.getenv("FEMALE_ROLE_IDS", "").split(",")
+    if raw.strip().isdigit()
+}
+EXTRA_MALE_ROLE_HINTS = {
+    item.strip().lower()
+    for item in os.getenv("MALE_ROLE_HINTS", "").split(",")
+    if item.strip()
+}
+EXTRA_FEMALE_ROLE_HINTS = {
+    item.strip().lower()
+    for item in os.getenv("FEMALE_ROLE_HINTS", "").split(",")
+    if item.strip()
+}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -147,10 +215,24 @@ SPAM_CACHE: dict[tuple[int, int], deque[float]] = defaultdict(lambda: deque(maxl
 BAD_WORDS: set[str] = set()
 SNIPE_CACHE: dict[int, dict[str, str]] = {}
 AI_CHAT_CACHE: dict[int, list[dict[str, str]]] = defaultdict(list)
+CONVERSATIONAL_AI_CACHE: dict[tuple[int, int], list[dict[str, str]]] = defaultdict(list)
+ARGUMENT_MODE_SESSIONS: dict[tuple[int, int], dict[str, object]] = {}
+PSYCH_SESSIONS: dict[tuple[int, int], dict[str, object]] = {}
+PSYCH_SESSION_LOCKS: dict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
+PSYCH_PENDING_TASKS: dict[tuple[int, int], asyncio.Task] = {}
 AI_SYSTEM_PROMPT = (
     "You are a helpful Discord assistant for a community server. "
     "Answer clearly in <=120 words unless the user asks for a long response, "
     "and avoid unsafe or illegal instructions."
+)
+PSYCH_SYSTEM_PROMPT = (
+    "You are Bell's Psych Support Mode: a supportive assistant, not a licensed psychologist, "
+    "and not a substitute for professional care. "
+    "Keep tone warm, calm, practical, and non-judgmental. "
+    "Do not diagnose conditions, prescribe medication, or make legal/medical claims. "
+    "Do not jump to conclusions; reason from what the user shared. "
+    "Use hedge language for uncertainty. "
+    "If self-harm/immediate danger appears, prioritize safety and emergency guidance."
 )
 VIBE_SYSTEM_PROMPT = (
     "You are generating a playful Discord 'vibe report' from chat messages. "
@@ -190,6 +272,21 @@ TIMEOUT_DURATION_RE = re.compile(
     r"\b(\d{1,4})\s*(m|min|mins|minute|minutes)\b",
     re.IGNORECASE,
 )
+PSYCH_ACTIONS = {"start", "stop", "reset", "status"}
+PSYCH_CRISIS_PATTERN = re.compile(
+    r"\b("
+    r"kill myself|suicide|suicidal|end my life|want to die|can't go on|"
+    r"hurt myself|self harm|self-harm|cut myself|overdose|harm myself"
+    r")\b",
+    re.IGNORECASE,
+)
+PSYCH_SOLUTION_PATTERN = re.compile(
+    r"\b("
+    r"what should i do|give advice|solution|need a plan|help me with a plan|"
+    r"give me a plan|next steps|enough info|now advise|advice please|what now"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -204,6 +301,10 @@ MUSIC_NOW_PLAYING: dict[int, MusicTrack] = {}
 MUSIC_TEXT_CHANNELS: dict[int, int] = {}
 MUSIC_LOCKS: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 APP_COMMANDS_SYNCED = False
+AICRUSH_LOCKS: dict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
+AICRUSH_RESULT_CACHE: dict[tuple[int, int], tuple[float, str]] = {}
+ROAST_LOCKS: dict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
+ROAST_RESULT_CACHE: dict[tuple[int, int, str], tuple[float, str]] = {}
 
 
 def resolve_ffmpeg_executable() -> str | None:
@@ -312,6 +413,51 @@ def set_guild_automod_enabled(guild_id: int, enabled: bool) -> None:
     guild_key = str(guild_id)
     config.setdefault(guild_key, {})
     config[guild_key]["automod_enabled"] = bool(enabled)
+    save_mod_config(config)
+
+
+def parse_role_id_list(raw_values: object) -> set[int]:
+    parsed: set[int] = set()
+    if isinstance(raw_values, list):
+        for raw in raw_values:
+            if isinstance(raw, int):
+                parsed.add(raw)
+            elif isinstance(raw, str) and raw.isdigit():
+                parsed.add(int(raw))
+    elif isinstance(raw_values, str):
+        for item in raw_values.split(","):
+            cleaned = item.strip()
+            if cleaned.isdigit():
+                parsed.add(int(cleaned))
+    return parsed
+
+
+def get_guild_gender_role_ids(guild_id: int) -> tuple[set[int], set[int]]:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    guild_male = parse_role_id_list(guild_config.get("male_role_ids"))
+    guild_female = parse_role_id_list(guild_config.get("female_role_ids"))
+    if guild_male or guild_female:
+        return guild_male, guild_female
+    return set(MALE_ROLE_IDS), set(FEMALE_ROLE_IDS)
+
+
+def set_guild_gender_role_ids(guild_id: int, male_role_ids: list[int], female_role_ids: list[int]) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["male_role_ids"] = sorted(set(male_role_ids))
+    config[guild_key]["female_role_ids"] = sorted(set(female_role_ids))
+    save_mod_config(config)
+
+
+def clear_guild_gender_role_ids(guild_id: int) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    if guild_key not in config:
+        return
+    config[guild_key].pop("male_role_ids", None)
+    config[guild_key].pop("female_role_ids", None)
     save_mod_config(config)
 
 
@@ -546,6 +692,543 @@ def is_moderator(member: discord.Member) -> bool:
     )
 
 
+MALE_ROLE_HINTS = {
+    "male",
+    "man",
+    "boy",
+    "he/him",
+    "he him",
+    "hehim",
+    "gentleman",
+    "king",
+    "men",
+    "masc",
+    "masculine",
+    "guy",
+    "guys",
+    "bro",
+    "bros",
+    "prince",
+    "mr",
+    "sir",
+    "him",
+}
+FEMALE_ROLE_HINTS = {
+    "female",
+    "woman",
+    "girl",
+    "she/her",
+    "she her",
+    "sheher",
+    "lady",
+    "queen",
+    "women",
+    "fem",
+    "femme",
+    "feminine",
+    "princess",
+    "miss",
+    "ms",
+    "madam",
+    "her",
+    "sis",
+    "girlie",
+    "girly",
+}
+
+
+def normalize_role_name_for_gender(name: str) -> str:
+    lowered = name.lower().strip()
+    normalized = unicodedata.normalize("NFKD", lowered)
+    without_marks = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    cleaned = re.sub(r"[^a-z0-9/+\s]", " ", without_marks)
+    compact = re.sub(r"\s+", " ", cleaned).strip()
+    return compact
+
+
+def hint_present_in_role_name(role_name: str, hint: str) -> bool:
+    normalized_hint = normalize_role_name_for_gender(hint)
+    if not normalized_hint:
+        return False
+    if " " in normalized_hint or "/" in normalized_hint:
+        return normalized_hint in role_name
+    tokens = set(role_name.split())
+    return normalized_hint in tokens
+
+
+def role_gender_hint(role: discord.Role, guild_id: int) -> str | None:
+    guild_male_ids, guild_female_ids = get_guild_gender_role_ids(guild_id)
+    if role.id in guild_male_ids:
+        return "male"
+    if role.id in guild_female_ids:
+        return "female"
+
+    role_name_raw = role.name.lower().strip()
+    role_name = normalize_role_name_for_gender(role.name)
+
+    female_symbols = ("♀", "🚺", "👧", "👩", "🩷", "🎀", "💖")
+    male_symbols = ("♂", "🚹", "👦", "👨", "💙")
+
+    if any(sym in role_name_raw for sym in female_symbols):
+        return "female"
+    if any(sym in role_name_raw for sym in male_symbols):
+        return "male"
+
+    female_hints = FEMALE_ROLE_HINTS | EXTRA_FEMALE_ROLE_HINTS
+    male_hints = MALE_ROLE_HINTS | EXTRA_MALE_ROLE_HINTS
+
+    female_hit = any(hint_present_in_role_name(role_name, hint) for hint in female_hints)
+    male_hit = any(hint_present_in_role_name(role_name, hint) for hint in male_hints)
+    if female_hit and not male_hit:
+        return "female"
+    if male_hit and not female_hit:
+        return "male"
+    return None
+
+
+def detect_member_gender_from_roles(member: discord.Member) -> str | None:
+    guild_male_ids, guild_female_ids = get_guild_gender_role_ids(member.guild.id)
+    has_male_id = any(role.id in guild_male_ids for role in member.roles)
+    has_female_id = any(role.id in guild_female_ids for role in member.roles)
+    if has_male_id and not has_female_id:
+        return "male"
+    if has_female_id and not has_male_id:
+        return "female"
+    if has_male_id and has_female_id:
+        return None
+
+    sorted_roles = sorted(member.roles, key=lambda role: role.position, reverse=True)
+    guild_id = member.guild.id
+    for role in sorted_roles:
+        if role.is_default():
+            continue
+        hint = role_gender_hint(role, guild_id)
+        if hint is not None:
+            return hint
+    return None
+
+
+def append_with_char_budget(bucket: list[str], text: str, current_chars: int, max_chars: int) -> int:
+    if max_chars <= 0:
+        return current_chars
+    cleaned = " ".join(text.split()).strip()
+    if not cleaned:
+        return current_chars
+    remaining = max_chars - current_chars
+    if remaining <= 0:
+        return current_chars
+    if len(cleaned) > remaining:
+        cleaned = cleaned[: max(0, remaining - 3)].rstrip()
+        if cleaned:
+            cleaned += "..."
+    if cleaned:
+        bucket.append(cleaned)
+        return current_chars + len(cleaned) + 1
+    return current_chars
+
+
+def lines_to_paragraph(lines: list[str], max_chars: int) -> str:
+    merged = " ".join(line.strip() for line in lines if line and line.strip())
+    if len(merged) > max_chars:
+        merged = merged[: max(0, max_chars - 3)].rstrip() + "..."
+    return merged
+
+
+@dataclass
+class RoastContext:
+    message_count: int
+    replies_count: int
+    scanned_messages: int
+    user_lines: list[str]
+    reply_lines: list[str]
+    top_words: list[str]
+    top_phrases: list[str]
+    avg_len: float
+    question_ratio: float
+    exclaim_ratio: float
+    emoji_per_msg: float
+
+
+ROAST_STOP_WORDS = {
+    "the", "and", "for", "that", "with", "this", "you", "are", "was", "have", "not", "but",
+    "just", "your", "from", "what", "when", "where", "will", "would", "they", "them", "their",
+    "about", "there", "then", "than", "into", "also", "been", "can", "could", "should", "like",
+    "im", "its", "dont", "cant", "didnt", "wont", "aint", "ive", "ill",
+}
+
+
+def extract_roast_term_stats(messages: list[str]) -> tuple[list[str], list[str]]:
+    words: list[str] = []
+    for message in messages:
+        for token in WORD_PATTERN.findall(message.lower()):
+            cleaned = token.strip("'")
+            if len(cleaned) <= 2 or cleaned in ROAST_STOP_WORDS:
+                continue
+            words.append(cleaned)
+
+    top_words = [word for word, _ in Counter(words).most_common(8)]
+
+    bigrams: list[str] = []
+    for first, second in zip(words, words[1:]):
+        if first == second:
+            continue
+        bigrams.append(f"{first} {second}")
+    top_phrases = [phrase for phrase, _ in Counter(bigrams).most_common(6)]
+    return top_words, top_phrases
+
+
+def roast_reply_tone(reply_lines: list[str]) -> str:
+    if not reply_lines:
+        return "limited reply context"
+    reply_text = " ".join(reply_lines).lower()
+    positive_hits = sum(
+        reply_text.count(word)
+        for word in ("lol", "lmao", "haha", "thanks", "nice", "great", "bro", "love")
+    )
+    negative_hits = sum(
+        reply_text.count(word)
+        for word in ("stupid", "idiot", "trash", "annoying", "hate", "shut", "noob")
+    )
+    if positive_hits > negative_hits * 1.4:
+        return "mostly playful-positive reactions"
+    if negative_hits > positive_hits * 1.4:
+        return "frequent pushback/teasing reactions"
+    return "mixed reactions"
+
+
+def roast_behavior_labels(context: RoastContext) -> list[str]:
+    labels: list[str] = []
+    if context.question_ratio >= 0.35:
+        labels.append("asks a lot of questions")
+    elif context.question_ratio >= 0.2:
+        labels.append("keeps probing conversations")
+    if context.exclaim_ratio >= 0.3:
+        labels.append("high-energy texter")
+    elif context.exclaim_ratio <= 0.08:
+        labels.append("dry delivery style")
+    if context.emoji_per_msg >= 1.2:
+        labels.append("emoji-heavy speaker")
+    elif context.emoji_per_msg >= 0.4:
+        labels.append("sprinkles emojis often")
+    if context.avg_len >= 110:
+        labels.append("drops paragraph-sized takes")
+    elif context.avg_len <= 28:
+        labels.append("rapid one-liner style")
+    labels.append(roast_reply_tone(context.reply_lines))
+    return labels[:5]
+
+
+async def collect_roast_context(guild: discord.Guild, target_user_id: int) -> RoastContext:
+    me = guild.me
+    if me is None:
+        return RoastContext(0, 0, 0, [], [], [], [], 0.0, 0.0, 0.0, 0.0)
+
+    channels = [
+        channel
+        for channel in guild.text_channels
+        if channel.permissions_for(me).view_channel and channel.permissions_for(me).read_message_history
+    ]
+    if ROAST_MAX_CHANNELS > 0:
+        channels = channels[:ROAST_MAX_CHANNELS]
+
+    user_lines: list[str] = []
+    reply_lines: list[str] = []
+    scanned_messages = 0
+    message_count = 0
+    replies_count = 0
+    user_chars = 0
+    reply_chars = 0
+    total_len = 0
+    question_messages = 0
+    exclaim_messages = 0
+    emoji_count = 0
+    user_budget = int(ROAST_MAX_CONTEXT_CHARS * 0.72)
+    reply_budget = ROAST_MAX_CONTEXT_CHARS - user_budget
+
+    for channel in channels:
+        if scanned_messages >= ROAST_MAX_HISTORY_MESSAGES:
+            break
+
+        if ROAST_FULL_HISTORY_SCAN:
+            history_kwargs: dict[str, object] = {"limit": None, "oldest_first": True}
+        else:
+            history_kwargs = {"limit": ROAST_SCAN_PER_CHANNEL, "oldest_first": True}
+
+        target_message_ids: set[int] = set()
+        try:
+            async for msg in channel.history(**history_kwargs):
+                scanned_messages += 1
+                if (
+                    ROAST_SCAN_PAUSE_EVERY > 0
+                    and ROAST_SCAN_PAUSE_SECONDS > 0
+                    and scanned_messages % ROAST_SCAN_PAUSE_EVERY == 0
+                ):
+                    await asyncio.sleep(ROAST_SCAN_PAUSE_SECONDS)
+                if scanned_messages >= ROAST_MAX_HISTORY_MESSAGES:
+                    break
+
+                if msg.author.bot:
+                    continue
+                content = msg.clean_content.strip()
+                if not content:
+                    continue
+                cleaned = " ".join(content.split()).strip()[:320]
+                if not cleaned:
+                    continue
+
+                if msg.author.id == target_user_id:
+                    target_message_ids.add(msg.id)
+                    message_count += 1
+                    total_len += len(cleaned)
+                    if "?" in cleaned:
+                        question_messages += 1
+                    if "!" in cleaned:
+                        exclaim_messages += 1
+                    emoji_count += len(EMOJI_PATTERN.findall(cleaned))
+                    user_chars = append_with_char_budget(
+                        user_lines, cleaned, user_chars, user_budget
+                    )
+                    continue
+
+                is_reply_to_target = False
+                if msg.reference and msg.reference.message_id in target_message_ids:
+                    is_reply_to_target = True
+                elif any(mentioned.id == target_user_id for mentioned in msg.mentions):
+                    is_reply_to_target = True
+
+                if is_reply_to_target:
+                    replies_count += 1
+                    reply_chars = append_with_char_budget(
+                        reply_lines, cleaned, reply_chars, reply_budget
+                    )
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+
+    top_words, top_phrases = extract_roast_term_stats(user_lines)
+    divisor = max(1, message_count)
+    return RoastContext(
+        message_count=message_count,
+        replies_count=replies_count,
+        scanned_messages=scanned_messages,
+        user_lines=user_lines,
+        reply_lines=reply_lines,
+        top_words=top_words,
+        top_phrases=top_phrases,
+        avg_len=total_len / divisor,
+        question_ratio=question_messages / divisor,
+        exclaim_ratio=exclaim_messages / divisor,
+        emoji_per_msg=emoji_count / divisor,
+    )
+
+
+def build_personal_roast_prompt(
+    member: discord.Member, style: Literal["soft", "friendly", "brutal"], context: RoastContext
+) -> str:
+    style_instruction = {
+        "soft": "Keep it gentle and light teasing only.",
+        "friendly": "Use medium spice with witty jabs and playful tone.",
+        "brutal": "Use high-intensity roast energy, but remain policy-safe and non-hateful.",
+    }[style]
+    behavior_bits = ", ".join(roast_behavior_labels(context)) or "general chat presence"
+    top_words = ", ".join(context.top_words[:6]) or "none"
+    top_phrases = ", ".join(context.top_phrases[:5]) or "none"
+    reply_tone = roast_reply_tone(context.reply_lines)
+
+    return (
+        f"Create a {style} personal roast for a Discord member.\n"
+        "Rules:\n"
+        "1) No slurs, hate speech, threats, doxxing, sexual content, or protected-trait insults.\n"
+        "2) Do NOT quote or reproduce exact user messages.\n"
+        "3) Roast only on observable chat patterns/habits.\n"
+        "4) Keep it playful and fun-only.\n"
+        f"5) {style_instruction}\n"
+        "6) Output exactly 5-9 short roast lines.\n"
+        "7) Final line must start with `Closer:` and end positively.\n\n"
+        f"Target username: {member.name}\n"
+        f"Target display name: {member.display_name}\n"
+        f"Message count analyzed: {context.message_count}\n"
+        f"Replies/mentions analyzed: {context.replies_count}\n"
+        f"Average message length: {context.avg_len:.1f}\n"
+        f"Question ratio: {context.question_ratio * 100:.0f}%\n"
+        f"Exclaim ratio: {context.exclaim_ratio * 100:.0f}%\n"
+        f"Emoji per message: {context.emoji_per_msg:.2f}\n"
+        f"Dominant behavior labels: {behavior_bits}\n"
+        f"Frequent words: {top_words}\n"
+        f"Frequent phrase patterns: {top_phrases}\n"
+        f"How others react overall: {reply_tone}\n"
+    )
+
+
+def generate_personal_roast_local(
+    member: discord.Member, style: Literal["soft", "friendly", "brutal"], context: RoastContext
+) -> str:
+    intensity_tag = {
+        "soft": "low heat",
+        "friendly": "mid heat",
+        "brutal": "max heat",
+    }[style]
+    roast_level_line = {
+        "soft": "You are roastable, but in a wholesome way.",
+        "friendly": "You walk into chat like your opinion already has a soundtrack.",
+        "brutal": "Your chat energy arrives before facts do, and still demands applause.",
+    }[style]
+    top_word = context.top_words[0] if context.top_words else "bro"
+    backup_word = context.top_words[1] if len(context.top_words) > 1 else "literally"
+    top_phrase = context.top_phrases[0] if context.top_phrases else "late-night chaos"
+
+    lines = [
+        f"{member.display_name}, this is a {intensity_tag} personalized roast.",
+        roast_level_line,
+        f"You mention `{top_word}` and `{backup_word}` so often your keyboard probably auto-completes drama.",
+        f"Signature pattern spotted: {top_phrase}. Even your typo history has a storyline.",
+    ]
+
+    if context.question_ratio >= 0.3:
+        lines.append("You ask so many questions that even your statements sound like interrogations.")
+    elif context.question_ratio <= 0.08:
+        lines.append("You drop takes with zero question marks, like every line is final patch notes.")
+    else:
+        lines.append("You balance questions and takes like you are moderating your own talk show.")
+
+    if context.exclaim_ratio >= 0.28:
+        lines.append("Your exclamation marks are doing cardio every night.")
+    elif context.exclaim_ratio <= 0.07:
+        lines.append("Your punctuation is so calm it could lower server ping.")
+    else:
+        lines.append("Your punctuation swings between diplomat and chaos goblin.")
+
+    lines.append(
+        f"People react with {roast_reply_tone(context.reply_lines)}, which means you are definitely impossible to ignore."
+    )
+    lines.append("Closer: all jokes, still elite presence in chat.")
+    return "\n".join(lines[:9])
+
+
+async def collect_aicrush_interactions(
+    guild: discord.Guild, target_user_id: int
+) -> tuple[int, Counter[int], list[str], dict[int, list[str]]]:
+    me = guild.me
+    if me is None:
+        return 0, Counter(), [], {}
+
+    channels = [
+        ch
+        for ch in guild.text_channels
+        if ch.permissions_for(me).view_channel and ch.permissions_for(me).read_message_history
+    ]
+    if AICRUSH_MAX_CHANNELS > 0:
+        channels = channels[:AICRUSH_MAX_CHANNELS]
+
+    total_user_messages = 0
+    interaction_points: Counter[int] = Counter()
+    target_lines: list[str] = []
+    candidate_lines: dict[int, list[str]] = defaultdict(list)
+    target_chars = 0
+    candidate_chars: dict[int, int] = defaultdict(int)
+    scanned_messages = 0
+    max_target_chars = int(AICRUSH_MAX_CONTEXT_CHARS * 0.66)
+    max_candidate_chars = int(AICRUSH_MAX_CONTEXT_CHARS * 0.34)
+    for channel in channels:
+        if scanned_messages >= AICRUSH_MAX_HISTORY_MESSAGES:
+            break
+        history_kwargs: dict[str, object]
+        if AICRUSH_FULL_HISTORY_SCAN:
+            history_kwargs = {"limit": None, "oldest_first": True}
+        else:
+            history_kwargs = {"limit": AICRUSH_SCAN_PER_CHANNEL, "oldest_first": True}
+        target_message_ids: set[int] = set()
+        try:
+            async for msg in channel.history(**history_kwargs):
+                scanned_messages += 1
+                if (
+                    AICRUSH_SCAN_PAUSE_EVERY > 0
+                    and AICRUSH_SCAN_PAUSE_SECONDS > 0
+                    and scanned_messages % AICRUSH_SCAN_PAUSE_EVERY == 0
+                ):
+                    await asyncio.sleep(AICRUSH_SCAN_PAUSE_SECONDS)
+                if scanned_messages >= AICRUSH_MAX_HISTORY_MESSAGES:
+                    break
+
+                if msg.author.bot:
+                    continue
+
+                content = msg.clean_content.strip()
+                author_id = msg.author.id
+                if author_id == target_user_id:
+                    total_user_messages += 1
+                    target_message_ids.add(msg.id)
+                    target_chars = append_with_char_budget(
+                        target_lines, content, target_chars, max_target_chars
+                    )
+
+                    seen_ids: set[int] = set()
+                    for mentioned in msg.mentions:
+                        if mentioned.bot or mentioned.id == target_user_id:
+                            continue
+                        if mentioned.id not in seen_ids:
+                            interaction_points[mentioned.id] += 2
+                            seen_ids.add(mentioned.id)
+
+                    ref = msg.reference
+                    resolved = ref.resolved if ref else None
+                    if isinstance(resolved, discord.Message):
+                        ref_author = resolved.author
+                        if (
+                            isinstance(ref_author, (discord.Member, discord.User))
+                            and not ref_author.bot
+                            and ref_author.id != target_user_id
+                            and ref_author.id not in seen_ids
+                        ):
+                            interaction_points[ref_author.id] += 3
+                            seen_ids.add(ref_author.id)
+                    continue
+
+                if author_id == target_user_id:
+                    continue
+                is_reply_to_target = False
+                if msg.reference and msg.reference.message_id in target_message_ids:
+                    is_reply_to_target = True
+                elif any(m.id == target_user_id for m in msg.mentions):
+                    is_reply_to_target = True
+
+                if is_reply_to_target:
+                    interaction_points[author_id] += 2
+                    existing = candidate_chars[author_id]
+                    candidate_chars[author_id] = append_with_char_budget(
+                        candidate_lines[author_id], content, existing, max_candidate_chars
+                    )
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+    return total_user_messages, interaction_points, target_lines, dict(candidate_lines)
+
+
+async def find_best_opposite_gender_match(
+    guild: discord.Guild,
+    target_member: discord.Member,
+    interaction_points: Counter[int],
+) -> tuple[discord.Member | None, str | None, int]:
+    target_gender = detect_member_gender_from_roles(target_member)
+    if target_gender is None:
+        return None, None, 0
+
+    required_gender = "female" if target_gender == "male" else "male"
+    for user_id, points in interaction_points.most_common():
+        if user_id == target_member.id:
+            continue
+        candidate = guild.get_member(user_id)
+        if candidate is None:
+            try:
+                candidate = await guild.fetch_member(user_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                continue
+        if candidate.bot:
+            continue
+        candidate_gender = detect_member_gender_from_roles(candidate)
+        if candidate_gender == required_gender:
+            return candidate, target_gender, points
+    return None, target_gender, 0
+
+
 def strip_bot_address_prefix(message: discord.Message) -> str | None:
     if bot.user is None:
         return None
@@ -573,6 +1256,694 @@ def strip_bot_address_prefix(message: discord.Message) -> str | None:
             remainder = name_match.group(1).strip()
             return remainder if remainder else None
     return None
+
+
+def parse_conversation_summary_count(text: str) -> int | None:
+    lowered = text.lower()
+    if re.search(r"\b(summarise|summarize|summary)\b", lowered) is None:
+        return None
+
+    count_match = re.search(r"\b(\d{1,4})\s*(?:msgs?|messages?)\b", lowered)
+    if count_match is None:
+        count_match = re.search(r"\b(?:of|for|last|past)\s+(\d{1,4})\b", lowered)
+    if count_match is None:
+        count_match = re.search(
+            r"\b(?:summarise|summarize|summary)\b.*?\b(\d{1,4})\b", lowered
+        )
+
+    if count_match is not None:
+        return int(count_match.group(1))
+    return 100
+
+
+def parse_psych_action_and_seed(raw: str | None) -> tuple[str, str | None]:
+    content = (raw or "").strip()
+    if not content:
+        return "start", None
+
+    parts = content.split(maxsplit=1)
+    action = parts[0].lower()
+    if action in PSYCH_ACTIONS:
+        seed = parts[1].strip() if len(parts) > 1 else None
+        return action, (seed if seed else None)
+    return "start", content
+
+
+def parse_psych_alias_request(text: str) -> tuple[str | None, str | None]:
+    match = re.match(r"^\s*psych(?:ologist)?\b\s*(.*)$", text, flags=re.IGNORECASE)
+    if not match:
+        return None, None
+    return parse_psych_action_and_seed(match.group(1))
+
+
+def detect_crisis_risk(text: str) -> bool:
+    return bool(PSYCH_CRISIS_PATTERN.search(text))
+
+
+def is_psych_solution_request(text: str) -> bool:
+    normalized = " ".join(text.lower().split())
+    if not normalized:
+        return False
+    if normalized in {"enough", "thats enough", "that's enough"}:
+        return True
+    return bool(PSYCH_SOLUTION_PATTERN.search(normalized))
+
+
+def psych_session_key(channel_id: int, user_id: int) -> tuple[int, int]:
+    return channel_id, user_id
+
+
+def get_user_display_name(user: discord.abc.User) -> str:
+    return getattr(user, "display_name", getattr(user, "name", "User"))
+
+
+def _psych_ttl_seconds() -> int:
+    return max(60, PSYCH_SESSION_TIMEOUT_MINUTES * 60)
+
+
+def cancel_psych_flush(channel_id: int, user_id: int) -> None:
+    key = psych_session_key(channel_id, user_id)
+    task = PSYCH_PENDING_TASKS.pop(key, None)
+    current_task = asyncio.current_task()
+    if task is not None and not task.done() and task is not current_task:
+        task.cancel()
+
+
+def get_psych_session(channel_id: int, user_id: int) -> dict[str, object] | None:
+    key = psych_session_key(channel_id, user_id)
+    session = PSYCH_SESSIONS.get(key)
+    if session is None:
+        return None
+    last_activity = float(session.get("last_activity", 0.0))
+    if time.monotonic() - last_activity > _psych_ttl_seconds():
+        cancel_psych_flush(channel_id, user_id)
+        PSYCH_SESSIONS.pop(key, None)
+        PSYCH_SESSION_LOCKS.pop(key, None)
+        return None
+    return session
+
+
+def start_psych_session(channel_id: int, user_id: int) -> dict[str, object]:
+    key = psych_session_key(channel_id, user_id)
+    now = time.monotonic()
+    session = {
+        "created_at": now,
+        "last_activity": now,
+        "turns": 0,
+        "history": [],
+        "notes": "",
+        "phase": "assessment",
+        "buffer": [],
+        "buffer_started_at": None,
+        "question_count": 0,
+        "last_solution_at": None,
+        "listening": True,
+    }
+    PSYCH_SESSIONS[key] = session
+    return session
+
+
+def stop_psych_session(channel_id: int, user_id: int) -> None:
+    cancel_psych_flush(channel_id, user_id)
+    key = psych_session_key(channel_id, user_id)
+    PSYCH_SESSIONS.pop(key, None)
+    PSYCH_SESSION_LOCKS.pop(key, None)
+
+
+def reset_psych_session(channel_id: int, user_id: int) -> bool:
+    session = get_psych_session(channel_id, user_id)
+    if session is None:
+        return False
+    cancel_psych_flush(channel_id, user_id)
+    session["history"] = []
+    session["notes"] = ""
+    session["turns"] = 0
+    session["phase"] = "assessment"
+    session["buffer"] = []
+    session["buffer_started_at"] = None
+    session["question_count"] = 0
+    session["last_solution_at"] = None
+    session["listening"] = True
+    session["last_activity"] = time.monotonic()
+    return True
+
+
+def append_psych_buffer(channel_id: int, user_id: int, message_text: str) -> bool:
+    session = get_psych_session(channel_id, user_id)
+    if session is None:
+        return False
+
+    normalized = " ".join(message_text.split()).strip()
+    if not normalized:
+        return False
+    normalized = normalized[:900]
+
+    buffer = session.get("buffer")
+    if not isinstance(buffer, list):
+        buffer = []
+        session["buffer"] = buffer
+
+    if not buffer:
+        session["buffer_started_at"] = time.monotonic()
+    buffer.append(normalized)
+    if len(buffer) > PSYCH_MAX_BUFFERED_MESSAGES:
+        del buffer[: len(buffer) - PSYCH_MAX_BUFFERED_MESSAGES]
+
+    session["last_activity"] = time.monotonic()
+    return True
+
+
+def _format_remaining_ttl(seconds: int) -> str:
+    remaining = max(0, seconds)
+    minutes = remaining // 60
+    hours, mins = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
+def _get_psych_status_text(channel_id: int, user_id: int, display_name: str) -> str:
+    session = get_psych_session(channel_id, user_id)
+    if session is None:
+        return (
+            f"Psych support mode for **{display_name}** is currently **inactive**.\n"
+            f"Start with `{PREFIX}psych start <how you feel>` or `bell psych start ...`."
+        )
+
+    ttl_seconds = _psych_ttl_seconds() - int(time.monotonic() - float(session.get("last_activity", 0.0)))
+    turns = int(session.get("turns", 0))
+    notes = str(session.get("notes", "")).strip()
+    phase = str(session.get("phase", "assessment")).strip() or "assessment"
+    buffered = session.get("buffer")
+    buffered_count = len(buffered) if isinstance(buffered, list) else 0
+    focus = notes.split(".")[0].strip() if notes else "getting to know your situation"
+    focus = focus[:180]
+    return (
+        f"Psych support mode for **{display_name}** is **active**.\n"
+        f"Phase: `{phase}`\n"
+        f"Session TTL: `{_format_remaining_ttl(ttl_seconds)}`\n"
+        f"Turns used: `{turns}/{PSYCH_MAX_TURNS}`\n"
+        f"Buffered messages: `{buffered_count}/{PSYCH_MAX_BUFFERED_MESSAGES}`\n"
+        f"Current focus: {focus}"
+    )
+
+
+def _build_crisis_psych_reply() -> str:
+    return (
+        "I am really glad you told me this. Your safety matters most right now.\n"
+        "Please contact your local emergency services now, or go to the nearest emergency department immediately.\n"
+        "Can you contact a trusted person right now and ask them to stay with you?\n"
+        "While you do that, place both feet on the floor, take 5 slow breaths, and name 5 things you can see."
+    )
+
+
+def _parse_psych_ai_payload(raw_text: str, current_notes: str) -> tuple[str, str]:
+    text = raw_text.strip()
+    parsed_reply = ""
+    parsed_notes = current_notes
+
+    match = re.search(
+        r"REPLY:\s*(.*?)\s*UPDATED_NOTES:\s*(.*)$",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match:
+        parsed_reply = match.group(1).strip()
+        parsed_notes = match.group(2).strip()
+    else:
+        parsed_reply = re.sub(r"^REPLY:\s*", "", text, flags=re.IGNORECASE).strip()
+
+    if not parsed_reply:
+        parsed_reply = (
+            "Thanks for sharing that with me.\n"
+            "Try 2 gentle steps now: drink some water and take a 5-minute pause away from noise.\n"
+            "What feels hardest for you right now?"
+        )
+
+    normalized_notes = " ".join(parsed_notes.split()).strip()
+    if len(normalized_notes) > PSYCH_MAX_NOTES_CHARS:
+        normalized_notes = normalized_notes[: PSYCH_MAX_NOTES_CHARS - 3].rstrip() + "..."
+
+    return parsed_reply, normalized_notes
+
+
+def _apply_psych_turn_update(
+    session: dict[str, object],
+    *,
+    user_input: str,
+    assistant_reply: str,
+    updated_notes: str,
+    asked_question: bool = False,
+    solution_mode: bool = False,
+) -> None:
+    history = session.get("history")
+    if not isinstance(history, list):
+        history = []
+        session["history"] = history
+    history_context = history[-(AI_MAX_HISTORY * 2) :]
+    session["history"] = [
+        *history_context,
+        {"role": "user", "content": user_input},
+        {"role": "assistant", "content": assistant_reply},
+    ]
+    session["notes"] = updated_notes
+    session["turns"] = int(session.get("turns", 0)) + 1
+    if asked_question:
+        session["question_count"] = int(session.get("question_count", 0)) + 1
+    if solution_mode:
+        session["last_solution_at"] = time.monotonic()
+        session["phase"] = "solution"
+    else:
+        session["phase"] = "assessment"
+    session["last_activity"] = time.monotonic()
+
+
+def apply_psych_crisis_reply(session: dict[str, object], user_input: str) -> str:
+    current_notes = str(session.get("notes", "")).strip()
+    reply = _build_crisis_psych_reply()
+    updated_notes = (
+        f"{current_notes} Crisis risk language detected; advised immediate emergency and trusted-person support."
+    ).strip()[:PSYCH_MAX_NOTES_CHARS]
+    _apply_psych_turn_update(
+        session,
+        user_input=user_input,
+        assistant_reply=reply,
+        updated_notes=updated_notes,
+        asked_question=True,
+        solution_mode=False,
+    )
+    return reply
+
+
+async def _build_psych_phase_reply(
+    session: dict[str, object],
+    *,
+    user_display_name: str,
+    user_input: str,
+    phase: Literal["assessment", "solution"],
+) -> str:
+    history = session.get("history")
+    if not isinstance(history, list):
+        history = []
+        session["history"] = history
+    history_context = history[-(AI_MAX_HISTORY * 2) :]
+    current_notes = str(session.get("notes", "")).strip()
+
+    if phase == "solution":
+        phase_instructions = (
+            "MODE: SOLUTION.\n"
+            "The user explicitly asked for advice/plan.\n"
+            "Provide practical non-medical guidance.\n"
+            "Output exactly:\n"
+            "Line 1: short reflection + key factors summary.\n"
+            "Line 2: 3-5 concrete steps (short and actionable).\n"
+            "Line 3: one check-in question.\n"
+            "No diagnosis. No medication advice."
+        )
+    else:
+        phase_instructions = (
+            "MODE: ASSESSMENT.\n"
+            "Listen first and collect context.\n"
+            "Do not give full solution yet.\n"
+            "Output exactly:\n"
+            "Line 1: reflective acknowledgement.\n"
+            "Line 2: concise summary of what you understood + at most one light stabilizing tip.\n"
+            "Line 3: one focused follow-up question.\n"
+            "Do not jump to conclusions."
+        )
+
+    prompt = (
+        f"User display name: {user_display_name}\n"
+        f"Session phase: {phase}\n"
+        f"Current personalization notes: {current_notes or '(none)'}\n"
+        f"Latest user turn (possibly multiple messages merged): {user_input[:2200]}\n\n"
+        f"{phase_instructions}\n\n"
+        "Return exactly this envelope:\n"
+        "REPLY:\n"
+        "<exactly 3 lines>\n"
+        "UPDATED_NOTES:\n"
+        "<max 4 short sentences capturing stressors/goals/routines/preferences; no diagnosis>"
+    )
+    messages = [
+        {"role": "system", "content": PSYCH_SYSTEM_PROMPT},
+        *history_context,
+        {"role": "user", "content": prompt},
+    ]
+    raw = await request_ai_completion(
+        messages,
+        max_tokens=PSYCH_MAX_TOKENS,
+        temperature=0.35,
+    )
+    reply, updated_notes = _parse_psych_ai_payload(raw, current_notes)
+    _apply_psych_turn_update(
+        session,
+        user_input=user_input,
+        assistant_reply=reply,
+        updated_notes=updated_notes,
+        asked_question=True,
+        solution_mode=(phase == "solution"),
+    )
+    return reply
+
+
+async def build_psych_assessment_reply(
+    session: dict[str, object],
+    *,
+    user_display_name: str,
+    user_input: str,
+) -> str:
+    return await _build_psych_phase_reply(
+        session,
+        user_display_name=user_display_name,
+        user_input=user_input,
+        phase="assessment",
+    )
+
+
+async def build_psych_solution_reply(
+    session: dict[str, object],
+    *,
+    user_display_name: str,
+    user_input: str,
+) -> str:
+    return await _build_psych_phase_reply(
+        session,
+        user_display_name=user_display_name,
+        user_input=user_input,
+        phase="solution",
+    )
+
+
+def schedule_psych_flush(
+    channel_id: int,
+    user_id: int,
+    channel: discord.abc.Messageable,
+    user_display_name: str,
+) -> None:
+    cancel_psych_flush(channel_id, user_id)
+    key = psych_session_key(channel_id, user_id)
+
+    async def _runner() -> None:
+        try:
+            await asyncio.sleep(PSYCH_LISTEN_WINDOW_SECONDS)
+            await flush_psych_buffer(
+                channel_id=channel_id,
+                user_id=user_id,
+                channel=channel,
+                user_display_name=user_display_name,
+            )
+        except asyncio.CancelledError:
+            return
+        finally:
+            active = PSYCH_PENDING_TASKS.get(key)
+            if active is asyncio.current_task():
+                PSYCH_PENDING_TASKS.pop(key, None)
+
+    PSYCH_PENDING_TASKS[key] = asyncio.create_task(_runner())
+
+
+async def flush_psych_buffer(
+    *,
+    channel_id: int,
+    user_id: int,
+    channel: discord.abc.Messageable,
+    user_display_name: str,
+) -> None:
+    key = psych_session_key(channel_id, user_id)
+    reply_to_send: str | None = None
+    auto_stop = False
+
+    lock = PSYCH_SESSION_LOCKS[key]
+    async with lock:
+        session = get_psych_session(channel_id, user_id)
+        if session is None:
+            return
+
+        buffered = session.get("buffer")
+        if not isinstance(buffered, list) or not buffered:
+            return
+
+        combined_user_turn = "\n".join(str(item) for item in buffered if str(item).strip()).strip()
+        session["buffer"] = []
+        session["buffer_started_at"] = None
+        session["last_activity"] = time.monotonic()
+        if not combined_user_turn:
+            return
+
+        if PSYCH_CRISIS_STRICT and detect_crisis_risk(combined_user_turn):
+            reply_to_send = apply_psych_crisis_reply(session, combined_user_turn)
+        else:
+            wants_solution = (
+                PSYCH_SOLUTION_TRIGGER_MODE == "explicit"
+                and is_psych_solution_request(combined_user_turn)
+            )
+            try:
+                if wants_solution:
+                    reply_to_send = await build_psych_solution_reply(
+                        session,
+                        user_display_name=user_display_name,
+                        user_input=combined_user_turn,
+                    )
+                else:
+                    reply_to_send = await build_psych_assessment_reply(
+                        session,
+                        user_display_name=user_display_name,
+                        user_input=combined_user_turn,
+                    )
+            except Exception as error:
+                print(f"[PSYCH MODE FLUSH ERROR] {error}")
+                reply_to_send = friendly_ai_error(error)
+
+        auto_stop = int(session.get("turns", 0)) >= PSYCH_MAX_TURNS
+        if auto_stop:
+            stop_psych_session(channel_id, user_id)
+
+    if not reply_to_send:
+        return
+
+    if auto_stop:
+        await send_chunked(
+            channel,
+            (
+                f"{reply_to_send}\n\n"
+                f"_Psych session auto-stopped after `{PSYCH_MAX_TURNS}` turns. "
+                "Use `&psych start` to continue._"
+            ),
+        )
+        return
+
+    await send_chunked(channel, reply_to_send)
+
+
+async def run_psych_action_for_user(
+    channel: discord.abc.Messageable,
+    *,
+    channel_id: int,
+    user_id: int,
+    user_display_name: str,
+    action: str,
+    seed_text: str | None,
+) -> None:
+    key = psych_session_key(channel_id, user_id)
+    normalized_action = action.lower()
+
+    if normalized_action == "status":
+        await channel.send(_get_psych_status_text(channel_id, user_id, user_display_name))
+        return
+
+    if normalized_action == "stop":
+        if get_psych_session(channel_id, user_id) is None:
+            await channel.send("Psych support mode is not active for you in this channel.")
+            return
+        stop_psych_session(channel_id, user_id)
+        await channel.send("Psych support mode stopped. Start again anytime with `&psych start`.")
+        return
+
+    if normalized_action == "reset":
+        if not reset_psych_session(channel_id, user_id):
+            await channel.send("No active psych session found to reset in this channel.")
+            return
+        await channel.send("Psych session memory reset. We can start fresh from here.")
+        return
+
+    if not is_ai_configured():
+        await channel.send(ai_setup_message())
+        return
+
+    if get_argument_session(channel_id, user_id) is not None:
+        stop_argument_session(channel_id, user_id)
+
+    session = get_psych_session(channel_id, user_id)
+    if session is None:
+        session = start_psych_session(channel_id, user_id)
+    else:
+        session["last_activity"] = time.monotonic()
+
+    opener = (
+        "Psych support mode is active. I am your supportive assistant, not a substitute for professional care.\n"
+        f"I will listen first and reply after `{int(PSYCH_LISTEN_WINDOW_SECONDS)}`s of silence."
+    )
+    if not seed_text:
+        await channel.send(
+            f"{opener}\n"
+            "Share freely, and when you want advice say: `give advice` / `what should I do`."
+        )
+        return
+
+    append_psych_buffer(channel_id, user_id, seed_text)
+    schedule_psych_flush(channel_id, user_id, channel, user_display_name)
+    await channel.send(
+        f"{opener}\nI am listening. Keep going; I will respond once you pause."
+    )
+
+
+async def handle_active_psych_session_turn(message: discord.Message) -> bool:
+    session = get_psych_session(message.channel.id, message.author.id)
+    if session is None:
+        return False
+
+    addressed = strip_bot_address_prefix(message)
+    if addressed:
+        psych_action, psych_seed = parse_psych_alias_request(addressed)
+        if psych_action is not None:
+            await run_psych_action_for_user(
+                message.channel,
+                channel_id=message.channel.id,
+                user_id=message.author.id,
+                user_display_name=get_user_display_name(message.author),
+                action=psych_action,
+                seed_text=psych_seed,
+            )
+            return True
+        if parse_argument_topic(addressed) is not None:
+            stop_psych_session(message.channel.id, message.author.id)
+            return False
+
+    user_text = message.content.strip()
+    if not user_text:
+        return False
+
+    if PSYCH_CRISIS_STRICT and detect_crisis_risk(user_text):
+        key = psych_session_key(message.channel.id, message.author.id)
+        cancel_psych_flush(message.channel.id, message.author.id)
+        lock = PSYCH_SESSION_LOCKS[key]
+        async with lock:
+            current_session = get_psych_session(message.channel.id, message.author.id)
+            if current_session is None:
+                return False
+            buffered = current_session.get("buffer")
+            buffered_lines = buffered if isinstance(buffered, list) else []
+            combined = "\n".join([*buffered_lines, user_text]).strip()
+            current_session["buffer"] = []
+            current_session["buffer_started_at"] = None
+            reply = apply_psych_crisis_reply(current_session, combined or user_text)
+            auto_stop = int(current_session.get("turns", 0)) >= PSYCH_MAX_TURNS
+            if auto_stop:
+                stop_psych_session(message.channel.id, message.author.id)
+        if auto_stop:
+            await send_chunked(
+                message.channel,
+                (
+                    f"{reply}\n\n"
+                    f"_Psych session auto-stopped after `{PSYCH_MAX_TURNS}` turns. "
+                    "Use `&psych start` to continue._"
+                ),
+            )
+            return True
+        await send_chunked(message.channel, reply)
+        return True
+
+    if append_psych_buffer(message.channel.id, message.author.id, user_text):
+        schedule_psych_flush(
+            message.channel.id,
+            message.author.id,
+            message.channel,
+            get_user_display_name(message.author),
+        )
+        return True
+
+    return True
+
+
+def parse_argument_topic(text: str) -> str | None:
+    match = re.search(
+        r"\b(?:argument|argue|debate)\b(?:\s+(?:about|on|over))?\s+(.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    topic = match.group(1).strip(" .!?")
+    topic = re.sub(r"^(with me|against me)\s+", "", topic, flags=re.IGNORECASE).strip()
+    if len(topic) < 3:
+        return None
+    return topic
+
+
+def argument_stop_requested(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        re.search(r"\b(stop|end|cancel|quit|enough)\b", lowered) is not None
+        and re.search(r"\b(argument|argue|debate|mode)\b", lowered) is not None
+    ) or lowered.strip() in {"stop", "stop it", "to stop", "please stop"}
+
+
+def get_argument_session(channel_id: int, user_id: int) -> dict[str, object] | None:
+    key = (channel_id, user_id)
+    session = ARGUMENT_MODE_SESSIONS.get(key)
+    if session is None:
+        return None
+
+    last_activity = float(session.get("last_activity", 0.0))
+    if time.monotonic() - last_activity > ARGUMENT_MODE_TIMEOUT_MINUTES * 60:
+        ARGUMENT_MODE_SESSIONS.pop(key, None)
+        return None
+    return session
+
+
+def start_argument_session(channel_id: int, user_id: int, topic: str, side: str) -> None:
+    ARGUMENT_MODE_SESSIONS[(channel_id, user_id)] = {
+        "topic": topic[:260],
+        "side": side,
+        "turns": 0,
+        "history": [],
+        "last_activity": time.monotonic(),
+    }
+
+
+def stop_argument_session(channel_id: int, user_id: int) -> None:
+    ARGUMENT_MODE_SESSIONS.pop((channel_id, user_id), None)
+
+
+def append_conversation_history(
+    cache: dict[tuple[int, int], list[dict[str, str]]],
+    key: tuple[int, int],
+    user_prompt: str,
+    assistant_reply: str,
+) -> None:
+    history = cache[key]
+    history.append({"role": "user", "content": user_prompt})
+    history.append({"role": "assistant", "content": assistant_reply})
+    max_entries = max(2, AI_MAX_HISTORY * 2)
+    if len(history) > max_entries:
+        cache[key] = history[-max_entries:]
+
+
+async def is_reply_to_bot_message(message: discord.Message) -> bool:
+    if bot.user is None or message.reference is None or message.reference.message_id is None:
+        return False
+
+    resolved = message.reference.resolved
+    if isinstance(resolved, discord.Message):
+        return resolved.author.id == bot.user.id
+
+    if not isinstance(message.channel, discord.TextChannel):
+        return False
+    try:
+        referenced = await message.channel.fetch_message(message.reference.message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return False
+    return referenced.author.id == bot.user.id
 
 
 def find_member_by_name(guild: discord.Guild, query: str) -> discord.Member | None:
@@ -701,15 +2072,109 @@ async def purge_recent_bot_webhook_messages(
     return len(deleted_messages)
 
 
+async def generate_argument_opening(topic: str, side: Literal["PRO", "ANTI"]) -> str:
+    prompt = (
+        "Argue aggressively but playfully for a Discord debate topic.\n"
+        "No hate speech or threats.\n"
+        "Output: a short opening statement + 4 bullet arguments + one savage closer.\n\n"
+        f"Topic: {topic}\n"
+        f"Side: {side}"
+    )
+    return await request_fun_ai(prompt, max_tokens=260, temperature=0.85)
+
+
+async def handle_active_argument_mode_turn(message: discord.Message) -> bool:
+    if message.guild is None or not isinstance(message.author, discord.Member):
+        return False
+    if not isinstance(message.channel, discord.TextChannel):
+        return False
+
+    session = get_argument_session(message.channel.id, message.author.id)
+    if session is None:
+        return False
+
+    addressed_text = strip_bot_address_prefix(message)
+    if addressed_text and argument_stop_requested(addressed_text):
+        stop_argument_session(message.channel.id, message.author.id)
+        await message.channel.send("Argument mode stopped. Say `bell argument <topic>` to start again.")
+        return True
+
+    user_point = message.content.strip()
+    if not user_point:
+        return False
+
+    topic = str(session.get("topic", "the topic"))
+    side = str(session.get("side", "PRO"))
+    history = session.get("history")
+    if not isinstance(history, list):
+        history = []
+        session["history"] = history
+
+    history_text = "\n".join(str(line)[:260] for line in history[-8:])
+    prompt = (
+        "You are in an ongoing Discord argument mode.\n"
+        "Counter the user's latest point directly.\n"
+        "Tone: sharp, witty, non-hateful, no slurs, no threats.\n"
+        "Output: one compact rebuttal paragraph + 2 quick bullet counters.\n\n"
+        f"Topic: {topic}\n"
+        f"Your side: {side}\n"
+        f"User latest point: {user_point[:420]}\n"
+        f"Recent debate context:\n{history_text or '(none yet)'}"
+    )
+
+    async with message.channel.typing():
+        try:
+            reply = await request_fun_ai(
+                prompt,
+                max_tokens=ARGUMENT_MODE_REPLY_TOKENS,
+                temperature=0.82,
+            )
+        except Exception as error:
+            print(f"[ARGUMENT MODE TURN ERROR] {error}")
+            await message.channel.send(friendly_ai_error(error))
+            return True
+
+    history.append(f"User: {user_point[:220]}")
+    history.append(f"Bell: {reply[:220]}")
+    session["turns"] = int(session.get("turns", 0)) + 1
+    session["last_activity"] = time.monotonic()
+
+    if int(session["turns"]) >= ARGUMENT_MODE_MAX_TURNS:
+        stop_argument_session(message.channel.id, message.author.id)
+        await send_chunked(
+            message.channel,
+            f"{reply}\n\n_(Argument mode auto-stopped after `{ARGUMENT_MODE_MAX_TURNS}` turns. "
+            "Say `bell argument <topic>` to restart.)_",
+        )
+        return True
+
+    await send_chunked(message.channel, reply)
+    return True
+
+
 async def handle_conversational_request(message: discord.Message) -> bool:
     if message.guild is None or not isinstance(message.author, discord.Member):
         return False
 
     text = strip_bot_address_prefix(message)
+    if not text and await is_reply_to_bot_message(message):
+        text = message.content.strip()
     if not text:
         return False
 
     lowered = text.lower()
+
+    psych_action, psych_seed = parse_psych_alias_request(text)
+    if psych_action is not None:
+        await run_psych_action_for_user(
+            message.channel,
+            channel_id=message.channel.id,
+            user_id=message.author.id,
+            user_display_name=message.author.display_name,
+            action=psych_action,
+            seed_text=psych_seed,
+        )
+        return True
 
     if re.search(r"\bcats?\b", lowered):
         await send_random_cat_image(message.channel)
@@ -717,6 +2182,84 @@ async def handle_conversational_request(message: discord.Message) -> bool:
 
     if re.search(r"\bfood\b", lowered):
         await send_random_indian_veg_food(message.channel)
+        return True
+
+    if argument_stop_requested(text):
+        if get_argument_session(message.channel.id, message.author.id) is None:
+            await message.channel.send("You don't have an active argument mode in this channel.")
+            return True
+        stop_argument_session(message.channel.id, message.author.id)
+        await message.channel.send("Argument mode stopped.")
+        return True
+
+    argument_topic = parse_argument_topic(text)
+    if argument_topic is not None:
+        if not is_ai_configured():
+            await message.channel.send(ai_setup_message())
+            return True
+        side: Literal["PRO", "ANTI"] = random.choice(["PRO", "ANTI"])
+        async with message.channel.typing():
+            try:
+                opening = await generate_argument_opening(argument_topic, side)
+            except Exception as error:
+                print(f"[CONVERSATIONAL ARGUMENT START ERROR] {error}")
+                await message.channel.send(friendly_ai_error(error))
+                return True
+        stop_psych_session(message.channel.id, message.author.id)
+        start_argument_session(message.channel.id, message.author.id, argument_topic, side)
+        await send_chunked(
+            message.channel,
+            f"⚔️ **Argument Mode** ({side}) on **{argument_topic}**\n"
+            f"{opening}\n\n"
+            "Reply with your points normally in this channel and I'll counter each one. "
+            "Say `bell stop argument` to end.",
+        )
+        return True
+
+    summary_count = parse_conversation_summary_count(text)
+    if summary_count is not None:
+        if not is_ai_configured():
+            await message.channel.send(ai_setup_message())
+            return True
+        if summary_count < 5 or summary_count > 100:
+            await message.channel.send("Summary count must be between `5` and `100`.")
+            return True
+
+        transcript = await collect_recent_channel_transcript(
+            message.channel,
+            summary_count,
+            exclude_message_ids={message.id},
+        )
+        if not transcript:
+            await message.channel.send("Not enough recent user messages to summarize.")
+            return True
+
+        summary_prompt = (
+            "Summarize this Discord chat in short bullet points.\n"
+            "Include: key topics, decisions, and any action items.\n\n"
+            + "\n".join(transcript)
+        )
+        ai_messages = [
+            {"role": "system", "content": AI_SYSTEM_PROMPT},
+            {"role": "user", "content": summary_prompt},
+        ]
+
+        async with message.channel.typing():
+            try:
+                summary = await request_ai_completion(
+                    ai_messages,
+                    max_tokens=AI_SUMMARY_MAX_TOKENS,
+                    temperature=0.2,
+                )
+            except Exception as error:
+                print(f"[CONVERSATIONAL SUMMARY ERROR] {error}")
+                await message.channel.send(friendly_ai_error(error))
+                return True
+
+        await send_chunked(
+            message.channel,
+            f"Summary of last `{len(transcript)}` messages:\n{summary}",
+        )
         return True
 
     if "automod" in lowered:
@@ -888,7 +2431,8 @@ async def handle_conversational_request(message: discord.Message) -> bool:
         await message.channel.send(ai_setup_message())
         return True
 
-    history = AI_CHAT_CACHE.get(message.channel.id, [])[-(AI_MAX_HISTORY * 2) :]
+    chat_key = (message.channel.id, message.author.id)
+    history = CONVERSATIONAL_AI_CACHE.get(chat_key, [])[-(AI_MAX_HISTORY * 2) :]
     ai_messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}, *history]
     ai_messages.append({"role": "user", "content": text})
     async with message.channel.typing():
@@ -903,7 +2447,7 @@ async def handle_conversational_request(message: discord.Message) -> bool:
             await message.channel.send(friendly_ai_error(error))
             return True
 
-    append_ai_history(message.channel.id, text, reply)
+    append_conversation_history(CONVERSATIONAL_AI_CACHE, chat_key, text, reply)
     await send_chunked(message.channel, reply)
     return True
 
@@ -1353,9 +2897,20 @@ def split_message(content: str, max_len: int = 1900) -> list[str]:
     return parts
 
 
-async def send_chunked(channel: discord.abc.Messageable, content: str) -> None:
-    for chunk in split_message(content):
-        await channel.send(chunk)
+async def send_chunked(
+    target: discord.abc.Messageable | commands.Context, content: str
+) -> None:
+    chunks = split_message(content)
+    if isinstance(target, commands.Context):
+        for index, chunk in enumerate(chunks):
+            if index == 0:
+                await target.send(chunk)
+            else:
+                await target.channel.send(chunk)
+        return
+
+    for chunk in chunks:
+        await target.send(chunk)
 
 
 async def fetch_openrouter_models(session: aiohttp.ClientSession) -> set[str]:
@@ -1905,10 +3460,15 @@ async def generate_vibecheck_report(
 
 
 async def collect_recent_channel_transcript(
-    channel: discord.TextChannel, limit: int
+    channel: discord.TextChannel,
+    limit: int,
+    *,
+    exclude_message_ids: set[int] | None = None,
 ) -> list[str]:
     lines: list[str] = []
     async for msg in channel.history(limit=limit):
+        if exclude_message_ids and msg.id in exclude_message_ids:
+            continue
         if msg.author.bot:
             continue
         content = msg.clean_content.strip()
@@ -2152,12 +3712,52 @@ async def on_message(message: discord.Message) -> None:
             else:
                 await message.channel.send("You do not currently have an active timeout.")
             return
+
+        if message.content.startswith(PREFIX):
+            await bot.process_commands(message)
+            return
+
+        try:
+            if await handle_active_psych_session_turn(message):
+                return
+        except Exception as error:
+            print(f"[PSYCH MODE DM ERROR] {error}")
+
+        try:
+            addressed_text = strip_bot_address_prefix(message)
+            if addressed_text:
+                psych_action, psych_seed = parse_psych_alias_request(addressed_text)
+                if psych_action is not None:
+                    await run_psych_action_for_user(
+                        message.channel,
+                        channel_id=message.channel.id,
+                        user_id=message.author.id,
+                        user_display_name=get_user_display_name(message.author),
+                        action=psych_action,
+                        seed_text=psych_seed,
+                    )
+                    return
+        except Exception as error:
+            print(f"[PSYCH MODE DM ALIAS ERROR] {error}")
+
         await bot.process_commands(message)
         return
 
     if message.content.startswith(PREFIX):
         await bot.process_commands(message)
         return
+
+    try:
+        if await handle_active_psych_session_turn(message):
+            return
+    except Exception as error:
+        print(f"[PSYCH MODE ERROR] {error}")
+
+    try:
+        if await handle_active_argument_mode_turn(message):
+            return
+    except Exception as error:
+        print(f"[ARGUMENT MODE ERROR] {error}")
 
     try:
         if await handle_conversational_request(message):
@@ -2252,6 +3852,8 @@ async def help_command(ctx: commands.Context) -> None:
         f"`{PREFIX}clearwarns <@member>`\n"
         f"`{PREFIX}setmodlog [#channel]` - Set mod-log channel (defaults to current channel).\n"
         f"`{PREFIX}clearmodlog` - Disable mod-log for this server.\n"
+        f"`{PREFIX}setgenderroles <@male_role> <@female_role>` - Set role mapping for `aicrush`.\n"
+        f"`{PREFIX}genderroles` / `{PREFIX}cleargenderroles`\n"
         f"`{PREFIX}automod <on|off|toggle|status>` - Enable or disable AutoMod in this server.\n"
         f"`{PREFIX}reloadbadwords` - Reload `data/bad_words.txt`.\n"
         f"`{PREFIX}say <message>` - Moderator echo command (deletes your command message).\n"
@@ -2272,11 +3874,13 @@ async def help_command(ctx: commands.Context) -> None:
         f"`{PREFIX}aimodel` - Show active AI provider/model.\n"
         f"`{PREFIX}aimodels [limit]` - List currently available models from active provider.\n"
         f"`{PREFIX}aisummary [count]` - Summarize recent channel messages.\n"
-        f"`{PREFIX}roast <@user> [soft|friendly|brutal]`\n"
+        f"`{PREFIX}psych [start|stop|reset|status] [message]` - Listen-first psych mode (replies after pause, asks before advice).\n"
+        f"`{PREFIX}roast <@user> [soft|friendly|brutal]` - Personal roast from server-wide chat patterns.\n"
         f"`{PREFIX}serverlore`, `{PREFIX}aicrush <@user>`, `{PREFIX}analyze <@user>`\n"
         f"`{PREFIX}lie_detector <@user> <message>`, `{PREFIX}futureme`\n"
         f"`{PREFIX}rizzcoach [smooth|funny|mysterious] <message>`\n"
-        f"`{PREFIX}argument <topic>`, `{PREFIX}debate <@user> <topic>`\n"
+        f"`{PREFIX}argument <topic>` - starts persistent argument mode (`bell stop argument` to end).\n"
+        f"`{PREFIX}debate <@user> <topic>`\n"
         "\n"
         "**Vibe Commands**\n"
         f"`{PREFIX}myvibe [count]` - Analyze your own recent messages in this channel.\n"
@@ -2289,7 +3893,7 @@ async def help_command(ctx: commands.Context) -> None:
         f"`{PREFIX}skip`, `{PREFIX}pause`, `{PREFIX}resume`, `{PREFIX}stop`\n"
         f"`{PREFIX}queue`, `{PREFIX}nowplaying`\n"
     )
-    await send_chunked(ctx.channel, text)
+    await send_chunked(ctx, text)
 
 
 @bot.command(name="setmodlog")
@@ -2323,6 +3927,44 @@ async def clear_modlog_channel(ctx: commands.Context) -> None:
         del config[guild_key]["mod_log_channel_id"]
         save_mod_config(config)
     await ctx.send("Mod-log channel disabled for this server.")
+
+
+@bot.command(name="setgenderroles")
+@commands.has_permissions(manage_guild=True)
+async def set_gender_roles(
+    ctx: commands.Context, male_role: discord.Role, female_role: discord.Role
+) -> None:
+    if male_role.id == female_role.id:
+        await ctx.send("Male and female roles must be different.")
+        return
+    set_guild_gender_role_ids(ctx.guild.id, [male_role.id], [female_role.id])
+    await ctx.send(
+        f"Gender roles configured for this server.\n"
+        f"Male role: {male_role.mention}\n"
+        f"Female role: {female_role.mention}"
+    )
+
+
+@bot.command(name="genderroles")
+@commands.has_permissions(manage_guild=True)
+async def gender_roles_status(ctx: commands.Context) -> None:
+    male_ids, female_ids = get_guild_gender_role_ids(ctx.guild.id)
+    male_roles = [ctx.guild.get_role(role_id) for role_id in sorted(male_ids)]
+    female_roles = [ctx.guild.get_role(role_id) for role_id in sorted(female_ids)]
+    male_text = ", ".join(role.mention for role in male_roles if role) or "(not set)"
+    female_text = ", ".join(role.mention for role in female_roles if role) or "(not set)"
+    await ctx.send(
+        f"Configured gender role mapping:\n"
+        f"Male: {male_text}\n"
+        f"Female: {female_text}"
+    )
+
+
+@bot.command(name="cleargenderroles")
+@commands.has_permissions(manage_guild=True)
+async def clear_gender_roles(ctx: commands.Context) -> None:
+    clear_guild_gender_role_ids(ctx.guild.id)
+    await ctx.send("Cleared server-specific gender role mapping.")
 
 
 @bot.command(name="reloadbadwords")
@@ -2738,13 +4380,35 @@ async def aimodels_command(ctx: commands.Context, limit: int = 15) -> None:
     text = f"Available {provider_label} models:\n" + "\n".join(f"- `{model}`" for model in shown)
     if len(listed) > limit:
         text += f"\n...and `{len(listed) - limit}` more."
-    await send_chunked(ctx.channel, text)
+    await send_chunked(ctx, text)
 
 
 @bot.command(name="aireset")
 async def aireset_command(ctx: commands.Context) -> None:
     AI_CHAT_CACHE.pop(ctx.channel.id, None)
+    for key in list(CONVERSATIONAL_AI_CACHE.keys()):
+        if key[0] == ctx.channel.id:
+            CONVERSATIONAL_AI_CACHE.pop(key, None)
+    for key in list(PSYCH_SESSIONS.keys()):
+        if key[0] == ctx.channel.id:
+            stop_psych_session(key[0], key[1])
+    for key in list(PSYCH_PENDING_TASKS.keys()):
+        if key[0] == ctx.channel.id:
+            cancel_psych_flush(key[0], key[1])
     await ctx.send("AI memory has been cleared for this channel.", delete_after=6)
+
+
+@bot.command(name="psych")
+async def psych_command(ctx: commands.Context, *, input_text: str | None = None) -> None:
+    action, seed = parse_psych_action_and_seed(input_text)
+    await run_psych_action_for_user(
+        ctx.channel,
+        channel_id=ctx.channel.id,
+        user_id=ctx.author.id,
+        user_display_name=get_user_display_name(ctx.author),
+        action=action,
+        seed_text=seed,
+    )
 
 
 @bot.command(name="myvibe")
@@ -2778,7 +4442,7 @@ async def my_vibe_command(ctx: commands.Context, count: int = VIBE_DEFAULT_MESSA
             )
 
     await send_chunked(
-        ctx.channel,
+        ctx,
         (
             f"**Vibe Report for {ctx.author.display_name}**\n"
             f"(Fun feature, may be inaccurate. Based on `{len(user_messages)}` user messages "
@@ -2825,7 +4489,7 @@ async def vibe_command(
             )
 
     await send_chunked(
-        ctx.channel,
+        ctx,
         (
             f"**Vibe Report for {member.display_name}**\n"
             f"(Fun feature, may be inaccurate. Based on `{len(user_messages)}` user messages "
@@ -2863,7 +4527,7 @@ async def vibecheck_command(ctx: commands.Context, member: discord.Member) -> No
             report = generate_vibecheck_local(user_messages, replies_received)
             report = normalize_vibecheck_output(report)
 
-    await send_chunked(ctx.channel, report)
+    await send_chunked(ctx, report)
 
 
 @bot.hybrid_command(name="roast")
@@ -2881,32 +4545,48 @@ async def roast_command(
         await ctx.send(ai_setup_message())
         return
 
-    async with ctx.typing():
-        user_messages, replies_received = await collect_vibe_context(ctx.channel, member.id, 140)
-        if not user_messages:
-            await ctx.send(f"I need some recent messages from {member.mention} in this channel first.")
-            return
-        prompt = (
-            f"Create a {style} playful roast for this Discord user.\n"
-            "Use only playful humor. No slurs, no hate speech, no protected-trait insults, no real harm.\n"
-            "Output 4-8 short lines, punchy and readable.\n\n"
-            f"Username: {member.name}\n"
-            f"Display name: {member.display_name}\n"
-            f"Avatar URL: {member.display_avatar.url}\n"
-            f"Recent messages sample:\n" + "\n".join(f"- {m}" for m in user_messages[-20:]) + "\n\n"
-            f"How others replied sample:\n" + "\n".join(f"- {m}" for m in replies_received[-12:])
-        )
-        try:
-            roast = await request_fun_ai(prompt, max_tokens=220, temperature=0.9)
-        except Exception as error:
-            print(f"[ROAST ERROR] {error}")
-            await ctx.send(friendly_ai_error(error))
-            return
+    cache_key = (ctx.guild.id, member.id, style)
+    now = time.monotonic()
+    cached = ROAST_RESULT_CACHE.get(cache_key)
+    if cached and now - cached[0] < ROAST_CACHE_SECONDS:
+        await send_chunked(ctx, cached[1] + "\n\n_(Cached result to reduce API load)_")
+        return
 
-    await send_chunked(
-        ctx.channel,
-        f"🔥 Roast mode: **{style}** for {member.mention}\n{roast}\n\n⚠️ For fun only.",
-    )
+    scan_lock = ROAST_LOCKS[(ctx.guild.id, member.id)]
+    if scan_lock.locked():
+        await ctx.send("Personal roast scan already running for that user. Try again in a few seconds.")
+        return
+
+    async with ctx.typing():
+        async with scan_lock:
+            fresh_cached = ROAST_RESULT_CACHE.get(cache_key)
+            if fresh_cached and time.monotonic() - fresh_cached[0] < ROAST_CACHE_SECONDS:
+                await send_chunked(ctx, fresh_cached[1] + "\n\n_(Cached result to reduce API load)_")
+                return
+
+            context = await collect_roast_context(ctx.guild, member.id)
+            if context.message_count < 6:
+                await ctx.send(
+                    f"Not enough visible history for {member.mention}. I need a few more messages across readable channels."
+                )
+                return
+
+            prompt = build_personal_roast_prompt(member, style, context)
+            try:
+                roast = await request_fun_ai(prompt, max_tokens=240, temperature=0.9)
+            except Exception as error:
+                print(f"[ROAST ERROR] {error}")
+                roast = generate_personal_roast_local(member, style, context)
+
+            result = (
+                f"🔥 Roast mode: **{style}** for {member.mention}\n"
+                f"{roast}\n\n"
+                f"Based on `{context.message_count}` messages across readable channels.\n"
+                "⚠️ For fun only."
+            )
+            ROAST_RESULT_CACHE[cache_key] = (time.monotonic(), result)
+
+    await send_chunked(ctx, result)
 
 
 @bot.hybrid_command(name="serverlore")
@@ -2936,7 +4616,7 @@ async def serverlore_command(ctx: commands.Context) -> None:
             print(f"[SERVERLORE ERROR] {error}")
             await ctx.send(friendly_ai_error(error))
             return
-    await send_chunked(ctx.channel, f"📜 **Server Lore**\n{lore}\n\n⚠️ For fun only.")
+    await send_chunked(ctx, f"📜 **Server Lore**\n{lore}\n\n⚠️ For fun only.")
 
 
 @bot.hybrid_command(name="aicrush")
@@ -2946,36 +4626,98 @@ async def aicrush_command(ctx: commands.Context, member: discord.Member) -> None
     if member.bot:
         await ctx.send("This command is for server members only.")
         return
-    if not is_ai_configured():
-        await ctx.send(ai_setup_message())
+
+    cache_key = (ctx.guild.id, member.id)
+    now = time.monotonic()
+    cached = AICRUSH_RESULT_CACHE.get(cache_key)
+    if cached and now - cached[0] < AICRUSH_CACHE_SECONDS:
+        await send_chunked(ctx, cached[1] + "\n\n_(Cached result to avoid rate limits)_")
+        return
+
+    scan_lock = AICRUSH_LOCKS[cache_key]
+    if scan_lock.locked():
+        await ctx.send("`aicrush` scan already running for that user. Please wait a few seconds.")
         return
 
     async with ctx.typing():
-        user_messages, replies_received = await collect_vibe_context(ctx.channel, member.id, 120)
-        if len(user_messages) < 15:
-            await ctx.send(f"Need more recent messages from {member.mention} in this channel.")
-            return
-        prompt = (
-            "Create a playful 'AI Crush Prediction' for a Discord user.\n"
-            "No real accusations, no doxxing, no sexual content. Keep it funny and safe.\n"
-            "Output exactly:\n"
-            "AI Crush Guess: <name-like hint or archetype>\n"
-            "Love Compatibility: <0-100>%\n"
-            "Drama Rating: <0-10>/10\n"
-            "Reason: <1 short paragraph>\n\n"
-            f"Target user: {member.display_name}\n"
-            "Recent user messages:\n"
-            + "\n".join(f"- {m}" for m in user_messages[-22:])
-            + "\n\nRecent replies:\n"
-            + "\n".join(f"- {m}" for m in replies_received[-16:])
-        )
-        try:
-            result = await request_fun_ai(prompt, max_tokens=220, temperature=0.9)
-        except Exception as error:
-            print(f"[AICRUSH ERROR] {error}")
-            await ctx.send(friendly_ai_error(error))
-            return
-    await send_chunked(ctx.channel, f"💘 **AI Crush for {member.display_name}**\n{result}\n\n⚠️ For fun only.")
+        async with scan_lock:
+            total_messages, interaction_points, target_lines, candidate_lines = await collect_aicrush_interactions(
+                ctx.guild, member.id
+            )
+            if total_messages < 1:
+                await ctx.send(
+                    f"I could not find any visible messages from {member.mention} in accessible channels."
+                )
+                return
+            if not interaction_points:
+                await ctx.send(
+                    f"I could not detect enough direct interactions for {member.mention} yet."
+                )
+                return
+
+            match_member, target_gender, top_points = await find_best_opposite_gender_match(
+                ctx.guild, member, interaction_points
+            )
+            if target_gender is None:
+                await ctx.send(
+                    f"I could not detect a clear Male/Female role for {member.mention}. "
+                    "Set a gender role first, then try again."
+                )
+                return
+            if match_member is None:
+                expected_role = "Female" if target_gender == "male" else "Male"
+                await ctx.send(
+                    f"I found interactions, but no opposite-gender match with detectable `{expected_role}` role."
+                )
+                return
+
+            total_points = max(1, sum(interaction_points.values()))
+            dominance = top_points / total_points
+            compatibility = int(max(55, min(97, 54 + dominance * 40 + min(10, top_points * 0.8))))
+            drama_rating = int(max(2, min(10, 3 + (1 - dominance) * 5 + (1 if top_points < 6 else 0))))
+
+            reason = (
+                f"{member.display_name} interacts most with {match_member.display_name}, "
+                f"with `{top_points}` strong interaction points out of `{total_points}` tracked."
+            )
+            if is_ai_configured():
+                user_para = lines_to_paragraph(target_lines, int(AICRUSH_MAX_CONTEXT_CHARS * 0.66))
+                match_para = lines_to_paragraph(
+                    candidate_lines.get(match_member.id, []),
+                    int(AICRUSH_MAX_CONTEXT_CHARS * 0.34),
+                )
+                prompt = (
+                    "Generate one short, playful ship explanation for a Discord AI crush feature.\n"
+                    "No explicit content, no doxxing, no serious claims.\n"
+                    "Keep it to 1-2 lines.\n\n"
+                    f"User A: {member.display_name}\n"
+                    f"User B: {match_member.display_name}\n"
+                    f"User A gender: {target_gender}\n"
+                    f"User B gender: {'female' if target_gender == 'male' else 'male'}\n"
+                    f"Messages found for User A: {total_messages}\n"
+                    f"Interaction dominance: {dominance:.2f}\n"
+                    f"Compatibility score: {compatibility}\n"
+                    f"Drama rating: {drama_rating}/10\n"
+                    "User A all-message paragraph:\n"
+                    f"{user_para}\n\n"
+                    "User B interaction paragraph:\n"
+                    f"{match_para or '(limited interaction text)'}"
+                )
+                try:
+                    reason = await request_fun_ai(prompt, max_tokens=110, temperature=0.8)
+                except Exception as error:
+                    print(f"[AICRUSH AI REASON ERROR] {error}")
+
+    result = (
+        f"💘 **AI Crush for {member.display_name}**\n"
+        f"Secret crush guess: {match_member.mention}\n"
+        f"Love compatibility: `{compatibility}%`\n"
+        f"Drama rating: `{drama_rating}/10`\n"
+        f"Reason: {reason}\n\n"
+        "⚠️ For fun only."
+    )
+    AICRUSH_RESULT_CACHE[cache_key] = (time.monotonic(), result)
+    await send_chunked(ctx, result)
 
 
 @bot.hybrid_command(name="analyze")
@@ -3019,7 +4761,7 @@ async def analyze_command(ctx: commands.Context, member: discord.Member) -> None
             print(f"[ANALYZE ERROR] {error}")
             await ctx.send(friendly_ai_error(error))
             return
-    await send_chunked(ctx.channel, f"🧠 **Analysis for {member.display_name}**\n{result}\n\n⚠️ For fun only.")
+    await send_chunked(ctx, f"🧠 **Analysis for {member.display_name}**\n{result}\n\n⚠️ For fun only.")
 
 
 @bot.hybrid_command(name="lie_detector")
@@ -3053,7 +4795,7 @@ async def lie_detector_command(
             print(f"[LIE_DETECTOR ERROR] {error}")
             await ctx.send(friendly_ai_error(error))
             return
-    await send_chunked(ctx.channel, f"🕵️ **Lie Detector for {member.display_name}**\n{result}\n\n⚠️ For fun only.")
+    await send_chunked(ctx, f"🕵️ **Lie Detector for {member.display_name}**\n{result}\n\n⚠️ For fun only.")
 
 
 @bot.hybrid_command(name="futureme")
@@ -3084,7 +4826,7 @@ async def futureme_command(ctx: commands.Context) -> None:
             print(f"[FUTUREME ERROR] {error}")
             await ctx.send(friendly_ai_error(error))
             return
-    await send_chunked(ctx.channel, f"🔮 **FutureMe for {ctx.author.display_name}**\n{result}\n\n⚠️ For fun only.")
+    await send_chunked(ctx, f"🔮 **FutureMe for {ctx.author.display_name}**\n{result}\n\n⚠️ For fun only.")
 
 
 @bot.hybrid_command(name="rizzcoach")
@@ -3133,7 +4875,7 @@ async def rizzcoach_command(
             print(f"[RIZZCOACH ERROR] {error}")
             await ctx.send(friendly_ai_error(error))
             return
-    await send_chunked(ctx.channel, f"💬 **RizzCoach ({normalized_style})**\n{result}")
+    await send_chunked(ctx, f"💬 **RizzCoach ({normalized_style})**\n{result}")
 
 
 @bot.hybrid_command(name="argument")
@@ -3148,22 +4890,23 @@ async def argument_command(ctx: commands.Context, *, topic: str) -> None:
         await ctx.send(f"Usage: `{PREFIX}argument <topic>`")
         return
 
-    side = random.choice(["PRO", "ANTI"])
+    side: Literal["PRO", "ANTI"] = random.choice(["PRO", "ANTI"])
     async with ctx.typing():
-        prompt = (
-            "Argue aggressively but playfully for a Discord debate topic.\n"
-            "No hate speech or threats.\n"
-            "Output: a short opening statement + 4 bullet arguments + one savage closer.\n\n"
-            f"Topic: {topic}\n"
-            f"Side: {side}"
-        )
         try:
-            result = await request_fun_ai(prompt, max_tokens=260, temperature=0.85)
+            result = await generate_argument_opening(topic, side)
         except Exception as error:
             print(f"[ARGUMENT ERROR] {error}")
             await ctx.send(friendly_ai_error(error))
             return
-    await send_chunked(ctx.channel, f"⚔️ **Argument Mode** ({side}) on **{topic}**\n{result}")
+    stop_psych_session(ctx.channel.id, ctx.author.id)
+    start_argument_session(ctx.channel.id, ctx.author.id, topic, side)
+    await send_chunked(
+        ctx,
+        f"⚔️ **Argument Mode** ({side}) on **{topic}**\n"
+        f"{result}\n\n"
+        "Reply with your points normally in this channel and I'll counter each one. "
+        "Say `bell stop argument` to end.",
+    )
 
 
 @bot.hybrid_command(name="debate")
@@ -3207,7 +4950,7 @@ async def debate_command(ctx: commands.Context, member: discord.Member, *, topic
             await ctx.send(friendly_ai_error(error))
             return
     await send_chunked(
-        ctx.channel,
+        ctx,
         f"🏛️ **Debate Arena**: {ctx.author.mention} vs {member.mention}\nTopic: **{topic}**\n\n{result}",
     )
 
@@ -3241,7 +4984,7 @@ async def ai_command(ctx: commands.Context, *, prompt: str | None = None) -> Non
             return
 
     append_ai_history(ctx.channel.id, prompt, reply)
-    await send_chunked(ctx.channel, reply)
+    await send_chunked(ctx, reply)
 
 
 @bot.command(name="aisummary", aliases=["aisummarise", "summary"])
@@ -3291,7 +5034,7 @@ async def aisummary_command(ctx: commands.Context, count: int = 25) -> None:
             await ctx.send(friendly_ai_error(error))
             return
 
-    await send_chunked(ctx.channel, f"Summary of last `{len(transcript)}` messages:\n{summary}")
+    await send_chunked(ctx, f"Summary of last `{len(transcript)}` messages:\n{summary}")
 
 
 @bot.command(name="pb")
