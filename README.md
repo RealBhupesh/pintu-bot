@@ -36,6 +36,9 @@ Discord moderation bot with prefix commands (default: `&`).
 - AI commands:
   - `&ai <prompt>` or `&ask <prompt>`
   - `&aisummary [count]`
+  - `&catchup [hours]`
+  - `&catchupchannel <#channel> [hours]`
+  - `&serverinsights [hours]` (Manage Server permission required)
   - `&aireset`
   - `&aimodel`
   - `&aimodels [limit]`
@@ -48,6 +51,20 @@ Discord moderation bot with prefix commands (default: `&`).
   - `&rizzcoach [smooth|funny|mysterious] <message>`
   - `&argument <topic>`
   - `&debate @user <topic>`
+- Business Empire commands:
+  - `&balance`, `&dailyclaim`, `&portfolio`, `&networth`
+  - `&stocks`, `&market [symbol]`, `&buy <symbol> <qty>`, `&sell <symbol> <qty>`
+  - `&commodities`, `&buycommodity <symbol> <qty>`, `&sellcommodity <symbol> <qty>`
+  - `&crypto`, `&buycrypto <symbol> <qty>`, `&sellcrypto <symbol> <qty>`
+  - `&plots`, `&buyplot <plot_id>`, `&upgrade <property_id>`, `&properties`
+  - `&sellproperty <id> <price>`, `&buyproperty <id>`
+  - `&loan`, `&takeloan <amount>`, `&repay <amount>`, `&debts`
+  - `&startbiz <type> <name>`, `&mybiz`, `&bizhire <id> <count>`, `&bizfire <id> <count>`, `&bizexpand <id>`
+  - `&salary`, `&taxes`, `&filetax [amount]`, `&credit`, `&markethalt`, `&economystatus`
+  - `&trade ...`, `&trade_accept <id>`, `&trade_decline <id>`
+  - `&auction_start ...`, `&bid <auction_id> <amount>`, `&auctions`
+  - `&bizleaderboard [cash|networth|income]`, `&bizprofile [@user]`, `&marketnews`, `&ledger [@user]`
+  - `&bizadmin ...` (moderator-only economy controls)
 - Vibe commands:
   - `&myvibe [count]`
   - `&vibe @user [count]`
@@ -113,6 +130,8 @@ Most new AI fun commands are hybrid, so you can use both prefix (`&...`) and sla
 - `AI_MAX_HISTORY=4`
 - `AI_MAX_TOKENS=260`
 - `AI_SUMMARY_MAX_TOKENS=320`
+- `AI_CATCHUP_MAX_TOKENS=360`
+- `AI_INSIGHTS_MAX_TOKENS=420`
 - `AI_TIMEOUT_SECONDS=45`
 - `SYNC_SLASH_COMMANDS=true`
 - `VIBE_DEFAULT_MESSAGE_COUNT=200`
@@ -128,6 +147,45 @@ Most new AI fun commands are hybrid, so you can use both prefix (`&...`) and sla
 - `AICRUSH_SCAN_PAUSE_EVERY=260` (small pacing interval)
 - `AICRUSH_SCAN_PAUSE_SECONDS=0.12` (sleep duration for pacing)
 - `AICRUSH_CACHE_SECONDS=900` (reuse recent result to avoid repeated scans)
+- `BUSINESS_ENABLED=true`
+- `BUSINESS_STATE_FLUSH_SECONDS=30`
+- `BUSINESS_GLOBAL_MODE=true`
+- `BUSINESS_STARTER_CASH=10000`
+- `BUSINESS_DAILY_CLAIM=1500`
+- `BUSINESS_DAILY_CLAIM_STREAK_BONUS=250`
+- `BUSINESS_HOURLY_INTEREST_RATE=0.0012`
+- `BUSINESS_LOAN_GRACE_HOURS=24`
+- `BUSINESS_MAX_DEBT_TO_NETWORTH=1.8`
+- `BUSINESS_STOCK_COUNT=16`
+- `BUSINESS_MARKET_EVENT_CHANCE=0.18`
+- `BUSINESS_TRANSACTION_FEE_RATE=0.01`
+- `BUSINESS_PROPERTY_MAINTENANCE_RATE=0.004`
+- `BUSINESS_PROPERTY_TAX_RATE=0.006`
+- `BUSINESS_AUCTION_SNIPING_WINDOW_SECONDS=30`
+- `BUSINESS_AUCTION_SNIPING_EXTEND_SECONDS=60`
+- `BUSINESS_MAX_OPEN_TRADES=5`
+- `BUSINESS_MAX_OPEN_AUCTIONS=3`
+- `BUSINESS_COMMAND_COOLDOWN_SECONDS=3`
+- `BUSINESS_LEDGER_MAX_ENTRIES=50000`
+- `BUSINESS_AI_PERSONALIZATION_ENABLED=true`
+- `BUSINESS_AI_TUNING_ENABLED=true`
+- `BUSINESS_AI_MAX_TOKENS=140`
+- `BUSINESS_AI_PERSONALIZATION_CACHE_SECONDS=900`
+- `BUSINESS_AI_DIRECTOR_INTERVAL_HOURS=3`
+- `BUSINESS_SCHEMA_VERSION=2`
+- `BUSINESS_MARKET_TICK_MINUTES=15`
+- `BUSINESS_WORLD_EVENT_INTERVAL_MINUTES=120`
+- `BUSINESS_WEEKLY_CYCLE_DAYS=7`
+- `BUSINESS_EVENT_MAX_PER_DAY=6`
+- `BUSINESS_ENABLE_COMMODITIES=true`
+- `BUSINESS_ENABLE_CRYPTO=true`
+- `BUSINESS_ENABLE_PRIVATE_BUSINESSES=true`
+- `BUSINESS_CIRCUIT_BREAKER_DROP_PCT=25`
+- `BUSINESS_MARKET_HALT_DROP_PCT=15`
+- `BUSINESS_CAPITAL_GAINS_SHORT_RATE=0.15`
+- `BUSINESS_CAPITAL_GAINS_LONG_RATE=0.10`
+- `BUSINESS_CAPITAL_GAINS_LONG_HOLD_DAYS=7`
+- `BUSINESS_INCOME_TAX_ENABLED=true`
 - `MALE_ROLE_IDS=` (comma-separated role IDs for strict aicrush gender detection)
 - `FEMALE_ROLE_IDS=` (comma-separated role IDs for strict aicrush gender detection)
 - `MALE_ROLE_HINTS=` (optional extra keywords)
@@ -135,6 +193,21 @@ Most new AI fun commands are hybrid, so you can use both prefix (`&...`) and sla
 - `VOICE_CONNECT_RETRIES=4`
 - `VOICE_CONNECT_TIMEOUT=25`
 - `VOICE_INTERNAL_RECONNECT=false`
+- `WELCOME_DM_ENABLED=true`
+- `WELCOME_MAX_CHANNEL_SUGGESTIONS=5`
+- `CATCHUP_DEFAULT_HOURS=24`
+- `CATCHUP_MAX_HOURS=168`
+- `CATCHUP_MAX_MESSAGES=180`
+- `INSIGHTS_DEFAULT_HOURS=48`
+- `INSIGHTS_MAX_HOURS=168`
+- `INSIGHTS_MAX_CHANNELS=10`
+- `INSIGHTS_MAX_MESSAGES_PER_CHANNEL=350`
+- `INSIGHTS_CHANNEL_SCAN_LIMIT=30`
+- `ROAST_CONTEXT_TARGET_MESSAGES=220`
+- `ROAST_CONTEXT_MIN_MESSAGES=35`
+- `ROAST_CHANNEL_SCAN_LIMIT=14`
+- `ROAST_HISTORY_PER_CHANNEL=280`
+- `ROAST_CACHE_MAX_MESSAGES=1400`
 - `OPENROUTER_FALLBACK_MODELS=google/gemma-3-4b-it:free,qwen/qwen3-4b:free,deepseek/deepseek-r1-0528:free`
 - `GROQ_FALLBACK_MODELS=llama-3.1-8b-instant,gemma2-9b-it`
 - `FFMPEG_PATH=ffmpeg`
@@ -166,4 +239,14 @@ Depending on which commands you use:
 - Vibe reports are fun-only and may be inaccurate.
 - Vibe output is paragraph-style and considers both the user’s messages and replies they receive (in the same channel window).
 - Vibe analysis reads recent messages on-demand in the current channel; it does not store long-term message archives.
+- New members can receive an optional AI onboarding DM with channel suggestions.
+- `&catchup` summarizes missed conversation from recent hours without scanning full history.
+- `&serverinsights` generates channel-level engagement insights for moderators.
+- Roast now uses cached + bounded guild-wide message context for faster, more specific results.
+- Business economy is persisted in `data/business_state.json` and shared globally across servers where the bot is present.
+- Economy uses fast buckets: market tick every 15 minutes, world event tick every 2 hours, and weekly settlement cycle every 7 days.
+- Stocks + commodities + crypto now share risk controls (cost basis, gains tax, temporary asset halts, market-wide halts).
+- Private businesses settle in weekly cycles with payroll/maintenance/debt pressure and controlled liquidation on prolonged stress.
+- Optional LLM market director can safely nudge economy values (market bias, event chance, small tax/fee shifts) within bounded ranges.
+- Optional LLM advisor adds personalized one-line strategy tips in business commands with cache to avoid lag.
 - If vibe AI times out, the bot falls back to a local heuristic narrative summary.

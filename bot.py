@@ -1,3 +1,5 @@
+﻿from __future__ import annotations
+
 import json
 import os
 import re
@@ -5,16 +7,20 @@ import asyncio
 import time
 import shutil
 import random
+import hashlib
+import copy
 import unicodedata
-from typing import Literal
+import difflib
+from typing import Any, Literal
 from dataclasses import dataclass
 from collections import Counter, defaultdict, deque
-from datetime import timedelta
+from datetime import timedelta, datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 try:
@@ -40,6 +46,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 PREFIX = os.getenv("BOT_PREFIX", "&")
 BOT_ACTIVITY_TEXT = os.getenv("BOT_ACTIVITY_TEXT", "with your crush").strip()
+STATE_BACKEND = "disk"
 
 def env_bool(key: str, default: bool) -> bool:
     value = os.getenv(key)
@@ -93,6 +100,15 @@ AI_MAX_HISTORY = env_int("AI_MAX_HISTORY", 4, 2)
 AI_MAX_TOKENS = env_int("AI_MAX_TOKENS", 260, 80)
 AI_SUMMARY_MAX_TOKENS = env_int("AI_SUMMARY_MAX_TOKENS", 320, 120)
 AI_TIMEOUT_SECONDS = env_int("AI_TIMEOUT_SECONDS", 45, 10)
+AI_MAX_INFLIGHT = env_int("AI_MAX_INFLIGHT", 3, 1)
+AI_RETRY_BACKOFF_SECONDS = env_float("AI_RETRY_BACKOFF_SECONDS", 1.2, 0.1)
+AI_CIRCUIT_BREAK_SECONDS = env_int("AI_CIRCUIT_BREAK_SECONDS", 45, 5)
+AI_MOD_ENABLED_DEFAULT = env_bool("AI_MOD_ENABLED", False)
+AI_MOD_FAST_MODEL = os.getenv("AI_MOD_FAST_MODEL", "").strip()
+AI_MOD_JUDGE_MODEL = os.getenv("AI_MOD_JUDGE_MODEL", "").strip()
+AI_MOD_SHADOW_DAYS = env_int("AI_MOD_SHADOW_DAYS", 7, 0)
+AI_MOD_RETENTION_DAYS = env_int("AI_MOD_RETENTION_DAYS", 30, 7)
+AI_MOD_MAX_CASES = env_int("AI_MOD_MAX_CASES", 6000, 200)
 PSYCH_SESSION_TIMEOUT_MINUTES = env_int("PSYCH_SESSION_TIMEOUT_MINUTES", 1440, 30)
 PSYCH_MAX_TOKENS = env_int("PSYCH_MAX_TOKENS", 320, 120)
 PSYCH_MAX_NOTES_CHARS = env_int("PSYCH_MAX_NOTES_CHARS", 1200, 200)
@@ -160,6 +176,99 @@ AICRUSH_MAX_HISTORY_MESSAGES = env_int("AICRUSH_MAX_HISTORY_MESSAGES", 12000, 50
 AICRUSH_SCAN_PAUSE_EVERY = env_int("AICRUSH_SCAN_PAUSE_EVERY", 260, 50)
 AICRUSH_SCAN_PAUSE_SECONDS = env_float("AICRUSH_SCAN_PAUSE_SECONDS", 0.12, 0.0)
 AICRUSH_CACHE_SECONDS = env_int("AICRUSH_CACHE_SECONDS", 900, 30)
+AICRUSH_MATCH_COOLDOWN_HOURS = env_int("AICRUSH_MATCH_COOLDOWN_HOURS", 24, 1)
+AICRUSH_STATE_FLUSH_SECONDS = env_int("AICRUSH_STATE_FLUSH_SECONDS", 30, 10)
+AICRUSH_BACKFILL_MESSAGE_BUDGET = env_int("AICRUSH_BACKFILL_MESSAGE_BUDGET", 3500, 200)
+AICRUSH_BACKFILL_TIME_BUDGET_SECONDS = env_float(
+    "AICRUSH_BACKFILL_TIME_BUDGET_SECONDS", 10.0, 1.0
+)
+AICRUSH_COMMAND_MAX_BACKFILL_MESSAGES = env_int(
+    "AICRUSH_COMMAND_MAX_BACKFILL_MESSAGES", 14000, 1000
+)
+AICRUSH_COMMAND_MAX_BACKFILL_SECONDS = env_float(
+    "AICRUSH_COMMAND_MAX_BACKFILL_SECONDS", 32.0, 5.0
+)
+AICRUSH_CHANNEL_RECENT_WINDOW_SECONDS = env_int(
+    "AICRUSH_CHANNEL_RECENT_WINDOW_SECONDS", 21600, 300
+)
+AICRUSH_STATE_STALE_SECONDS = env_int("AICRUSH_STATE_STALE_SECONDS", 1800, 60)
+AICRUSH_RANK_MODEL = os.getenv("AICRUSH_RANK_MODEL", "openai/gpt-oss-120b").strip()
+AICRUSH_EXPLAIN_MODEL = os.getenv(
+    "AICRUSH_EXPLAIN_MODEL", "llama-3.3-70b-versatile"
+).strip()
+AICRUSH_FALLBACK_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "AICRUSH_FALLBACK_MODELS",
+        "llama-3.3-70b-versatile,openai/gpt-oss-20b",
+    ).split(",")
+    if model.strip()
+]
+ALTFINDER_STATE_FLUSH_SECONDS = env_int("ALTFINDER_STATE_FLUSH_SECONDS", 30, 10)
+ALTFINDER_BACKFILL_MESSAGE_BUDGET = env_int(
+    "ALTFINDER_BACKFILL_MESSAGE_BUDGET", 3200, 200
+)
+ALTFINDER_BACKFILL_TIME_BUDGET_SECONDS = env_float(
+    "ALTFINDER_BACKFILL_TIME_BUDGET_SECONDS", 10.0, 1.0
+)
+ALTFINDER_COMMAND_MAX_BACKFILL_MESSAGES = env_int(
+    "ALTFINDER_COMMAND_MAX_BACKFILL_MESSAGES", 14000, 1000
+)
+ALTFINDER_COMMAND_MAX_BACKFILL_SECONDS = env_float(
+    "ALTFINDER_COMMAND_MAX_BACKFILL_SECONDS", 32.0, 5.0
+)
+ALTFINDER_CACHE_SECONDS = env_int("ALTFINDER_CACHE_SECONDS", 900, 30)
+ALTFINDER_MAX_RESULTS = env_int("ALTFINDER_MAX_RESULTS", 5, 1)
+ALTFINDER_MAX_SUSPECTS = 3
+ALTFINDER_RANK_MODEL = os.getenv("ALTFINDER_RANK_MODEL", "openai/gpt-oss-120b").strip()
+ALTFINDER_EXPLAIN_MODEL = os.getenv(
+    "ALTFINDER_EXPLAIN_MODEL", "openai/gpt-oss-120b"
+).strip()
+ALTFINDER_FALLBACK_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "ALTFINDER_FALLBACK_MODELS",
+        "moonshotai/kimi-k2-instruct-0905,llama-3.3-70b-versatile,openai/gpt-oss-20b",
+    ).split(",")
+    if model.strip()
+]
+SOCIALINTEL_STATE_FLUSH_SECONDS = env_int("SOCIALINTEL_STATE_FLUSH_SECONDS", 30, 10)
+SOCIALINTEL_BACKFILL_MESSAGE_BUDGET = env_int(
+    "SOCIALINTEL_BACKFILL_MESSAGE_BUDGET", 3200, 200
+)
+SOCIALINTEL_BACKFILL_TIME_BUDGET_SECONDS = env_float(
+    "SOCIALINTEL_BACKFILL_TIME_BUDGET_SECONDS", 10.0, 1.0
+)
+SOCIALINTEL_COMMAND_MAX_BACKFILL_MESSAGES = env_int(
+    "SOCIALINTEL_COMMAND_MAX_BACKFILL_MESSAGES", 14000, 1000
+)
+SOCIALINTEL_COMMAND_MAX_BACKFILL_SECONDS = env_float(
+    "SOCIALINTEL_COMMAND_MAX_BACKFILL_SECONDS", 32.0, 5.0
+)
+SOCIALINTEL_CACHE_SECONDS = env_int("SOCIALINTEL_CACHE_SECONDS", 900, 30)
+SOCIALINTEL_MAX_RESULTS = env_int("SOCIALINTEL_MAX_RESULTS", 5, 1)
+SOCIALINTEL_RANK_MODEL = os.getenv(
+    "SOCIALINTEL_RANK_MODEL", "openai/gpt-oss-120b"
+).strip()
+SOCIALINTEL_EXPLAIN_MODEL = os.getenv(
+    "SOCIALINTEL_EXPLAIN_MODEL", "llama-3.3-70b-versatile"
+).strip()
+SOCIALINTEL_FALLBACK_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "SOCIALINTEL_FALLBACK_MODELS",
+        "moonshotai/kimi-k2-instruct-0905,openai/gpt-oss-20b,llama-3.3-70b-versatile",
+    ).split(",")
+    if model.strip()
+]
+THREADREVIVE_PROACTIVE_ENABLED = env_bool("THREADREVIVE_PROACTIVE_ENABLED", False)
+THREADREVIVE_PROACTIVE_MIN_IDLE_MINUTES = env_int(
+    "THREADREVIVE_PROACTIVE_MIN_IDLE_MINUTES", 180, 15
+)
+THREADREVIVE_PROACTIVE_COOLDOWN_SECONDS = env_int(
+    "THREADREVIVE_PROACTIVE_COOLDOWN_SECONDS", 21600, 300
+)
+DISCORD_ENABLE_PRESENCE_INTENT = env_bool("DISCORD_ENABLE_PRESENCE_INTENT", False)
 ROAST_FULL_HISTORY_SCAN = env_bool("ROAST_FULL_HISTORY_SCAN", True)
 ROAST_SCAN_PER_CHANNEL = env_int("ROAST_SCAN_PER_CHANNEL", 350, 40)
 _ROAST_MAX_CHANNELS_RAW = os.getenv("ROAST_MAX_CHANNELS", "0").strip()
@@ -172,6 +281,82 @@ ROAST_SCAN_PAUSE_EVERY = env_int("ROAST_SCAN_PAUSE_EVERY", 240, 40)
 ROAST_SCAN_PAUSE_SECONDS = env_float("ROAST_SCAN_PAUSE_SECONDS", 0.08, 0.0)
 ROAST_MAX_CONTEXT_CHARS = env_int("ROAST_MAX_CONTEXT_CHARS", 14000, 2000)
 ROAST_CACHE_SECONDS = env_int("ROAST_CACHE_SECONDS", 900, 30)
+ROAST_REPEAT_COOLDOWN_HOURS = env_int("ROAST_REPEAT_COOLDOWN_HOURS", 12, 1)
+ANALYZE_CACHE_SECONDS = env_int("ANALYZE_CACHE_SECONDS", 300, 30)
+CATCHUP_MAX_HOURS = env_int("CATCHUP_MAX_HOURS", 168, 1)
+CATCHUP_MAX_MESSAGES = env_int("CATCHUP_MAX_MESSAGES", 1200, 80)
+CATCHUP_SCAN_LIMIT = env_int("CATCHUP_SCAN_LIMIT", 2500, 200)
+CATCHUP_CACHE_SECONDS = env_int("CATCHUP_CACHE_SECONDS", 120, 15)
+CATCHUP_MAX_PROMPT_CHARS = env_int("CATCHUP_MAX_PROMPT_CHARS", 12000, 2000)
+INSIGHTS_MAX_HOURS = env_int("INSIGHTS_MAX_HOURS", 336, 6)
+INSIGHTS_MAX_CHANNELS = env_int("INSIGHTS_MAX_CHANNELS", 40, 1)
+INSIGHTS_MAX_MESSAGES = env_int("INSIGHTS_MAX_MESSAGES", 12000, 500)
+INSIGHTS_SCAN_PER_CHANNEL = env_int("INSIGHTS_SCAN_PER_CHANNEL", 900, 100)
+INSIGHTS_CACHE_SECONDS = env_int("INSIGHTS_CACHE_SECONDS", 600, 30)
+FUN_USER_RATE_WINDOW_SECONDS = env_int("FUN_USER_RATE_WINDOW_SECONDS", 45, 5)
+FUN_USER_RATE_MAX_CALLS = env_int("FUN_USER_RATE_MAX_CALLS", 3, 1)
+FUN_CHANNEL_RATE_WINDOW_SECONDS = env_int("FUN_CHANNEL_RATE_WINDOW_SECONDS", 20, 5)
+FUN_CHANNEL_RATE_MAX_CALLS = env_int("FUN_CHANNEL_RATE_MAX_CALLS", 4, 1)
+ENGAGEMENT_ENABLED = env_bool("ENGAGEMENT_ENABLED", True)
+ENGAGEMENT_STATE_FLUSH_SECONDS = env_int("ENGAGEMENT_STATE_FLUSH_SECONDS", 30, 10)
+XP_MIN_MESSAGE_CHARS = env_int("XP_MIN_MESSAGE_CHARS", 15, 2)
+XP_MESSAGE_COOLDOWN_SECONDS = env_int("XP_MESSAGE_COOLDOWN_SECONDS", 45, 5)
+XP_DAILY_CAP = env_int("XP_DAILY_CAP", 220, 30)
+STREAK_GRACE_HOURS = env_int("STREAK_GRACE_HOURS", 36, 12)
+QUEST_DAILY_COUNT = env_int("QUEST_DAILY_COUNT", 3, 1)
+AUTO_LOOPS_ENABLED = env_bool("AUTO_LOOPS_ENABLED", False)
+AUTO_LOOP_MAX_POSTS_PER_HOUR = env_int("AUTO_LOOP_MAX_POSTS_PER_HOUR", 3, 1)
+AUTO_LOOP_HUB_CHANNEL_ONLY = env_bool("AUTO_LOOP_HUB_CHANNEL_ONLY", True)
+EVENT_DEFAULT_DURATION_MINUTES = env_int("EVENT_DEFAULT_DURATION_MINUTES", 10, 3)
+STRIKE_DECAY_DAYS = env_int("STRIKE_DECAY_DAYS", 7, 1)
+MOD_HEAT_THRESHOLD = env_float("MOD_HEAT_THRESHOLD", 0.72, 0.1)
+MOD_HEAT_SLOWMODE_SECONDS = env_int("MOD_HEAT_SLOWMODE_SECONDS", 20, 5)
+NL_ENGAGEMENT_TRIGGERS = env_bool("NL_ENGAGEMENT_TRIGGERS", True)
+WELCOME_CONCIERGE_ENABLED = env_bool("WELCOME_CONCIERGE_ENABLED", True)
+WELCOME_DM_TIMEOUT_MINUTES = env_int("WELCOME_DM_TIMEOUT_MINUTES", 1440, 10)
+WELCOME_RECOMMENDATION_COUNT = env_int("WELCOME_RECOMMENDATION_COUNT", 5, 1)
+WELCOME_INTEREST_MAX_CHARS = env_int("WELCOME_INTEREST_MAX_CHARS", 240, 40)
+BUSINESS_ENABLED = env_bool("BUSINESS_ENABLED", True)
+BUSINESS_STATE_FLUSH_SECONDS = env_int("BUSINESS_STATE_FLUSH_SECONDS", 30, 10)
+BUSINESS_GLOBAL_MODE = env_bool("BUSINESS_GLOBAL_MODE", True)
+BUSINESS_STARTER_CASH = env_int("BUSINESS_STARTER_CASH", 10000, 100)
+BUSINESS_DAILY_CLAIM = env_int("BUSINESS_DAILY_CLAIM", 1500, 10)
+BUSINESS_DAILY_CLAIM_STREAK_BONUS = env_int("BUSINESS_DAILY_CLAIM_STREAK_BONUS", 250, 0)
+BUSINESS_HOURLY_INTEREST_RATE = env_float("BUSINESS_HOURLY_INTEREST_RATE", 0.0012, 0.0)
+BUSINESS_LOAN_GRACE_HOURS = env_int("BUSINESS_LOAN_GRACE_HOURS", 24, 1)
+BUSINESS_MAX_DEBT_TO_NETWORTH = env_float("BUSINESS_MAX_DEBT_TO_NETWORTH", 1.8, 0.1)
+BUSINESS_STOCK_COUNT = env_int("BUSINESS_STOCK_COUNT", 16, 6)
+BUSINESS_MARKET_EVENT_CHANCE = env_float("BUSINESS_MARKET_EVENT_CHANCE", 0.18, 0.0)
+BUSINESS_TRANSACTION_FEE_RATE = env_float("BUSINESS_TRANSACTION_FEE_RATE", 0.01, 0.0)
+BUSINESS_PROPERTY_MAINTENANCE_RATE = env_float("BUSINESS_PROPERTY_MAINTENANCE_RATE", 0.004, 0.0)
+BUSINESS_PROPERTY_TAX_RATE = env_float("BUSINESS_PROPERTY_TAX_RATE", 0.006, 0.0)
+BUSINESS_AUCTION_SNIPING_WINDOW_SECONDS = env_int("BUSINESS_AUCTION_SNIPING_WINDOW_SECONDS", 30, 5)
+BUSINESS_AUCTION_SNIPING_EXTEND_SECONDS = env_int("BUSINESS_AUCTION_SNIPING_EXTEND_SECONDS", 60, 10)
+BUSINESS_MAX_OPEN_TRADES = env_int("BUSINESS_MAX_OPEN_TRADES", 5, 1)
+BUSINESS_MAX_OPEN_AUCTIONS = env_int("BUSINESS_MAX_OPEN_AUCTIONS", 3, 1)
+BUSINESS_COMMAND_COOLDOWN_SECONDS = env_int("BUSINESS_COMMAND_COOLDOWN_SECONDS", 3, 1)
+BUSINESS_LEDGER_MAX_ENTRIES = env_int("BUSINESS_LEDGER_MAX_ENTRIES", 50000, 1000)
+BUSINESS_AI_PERSONALIZATION_ENABLED = env_bool("BUSINESS_AI_PERSONALIZATION_ENABLED", True)
+BUSINESS_AI_TUNING_ENABLED = env_bool("BUSINESS_AI_TUNING_ENABLED", True)
+BUSINESS_AI_MAX_TOKENS = env_int("BUSINESS_AI_MAX_TOKENS", 140, 60)
+BUSINESS_AI_PERSONALIZATION_CACHE_SECONDS = env_int(
+    "BUSINESS_AI_PERSONALIZATION_CACHE_SECONDS", 900, 60
+)
+BUSINESS_AI_DIRECTOR_INTERVAL_HOURS = env_int("BUSINESS_AI_DIRECTOR_INTERVAL_HOURS", 3, 1)
+BUSINESS_SCHEMA_VERSION = env_int("BUSINESS_SCHEMA_VERSION", 2, 2)
+BUSINESS_MARKET_TICK_MINUTES = env_int("BUSINESS_MARKET_TICK_MINUTES", 15, 5)
+BUSINESS_WORLD_EVENT_INTERVAL_MINUTES = env_int("BUSINESS_WORLD_EVENT_INTERVAL_MINUTES", 120, 30)
+BUSINESS_WEEKLY_CYCLE_DAYS = env_int("BUSINESS_WEEKLY_CYCLE_DAYS", 7, 1)
+BUSINESS_EVENT_MAX_PER_DAY = env_int("BUSINESS_EVENT_MAX_PER_DAY", 6, 1)
+BUSINESS_ENABLE_COMMODITIES = env_bool("BUSINESS_ENABLE_COMMODITIES", True)
+BUSINESS_ENABLE_CRYPTO = env_bool("BUSINESS_ENABLE_CRYPTO", True)
+BUSINESS_ENABLE_PRIVATE_BUSINESSES = env_bool("BUSINESS_ENABLE_PRIVATE_BUSINESSES", True)
+BUSINESS_CIRCUIT_BREAKER_DROP_PCT = env_float("BUSINESS_CIRCUIT_BREAKER_DROP_PCT", 25.0, 5.0)
+BUSINESS_MARKET_HALT_DROP_PCT = env_float("BUSINESS_MARKET_HALT_DROP_PCT", 15.0, 5.0)
+BUSINESS_CAPITAL_GAINS_SHORT_RATE = env_float("BUSINESS_CAPITAL_GAINS_SHORT_RATE", 0.15, 0.0)
+BUSINESS_CAPITAL_GAINS_LONG_RATE = env_float("BUSINESS_CAPITAL_GAINS_LONG_RATE", 0.10, 0.0)
+BUSINESS_CAPITAL_GAINS_LONG_HOLD_DAYS = env_int("BUSINESS_CAPITAL_GAINS_LONG_HOLD_DAYS", 7, 1)
+BUSINESS_INCOME_TAX_ENABLED = env_bool("BUSINESS_INCOME_TAX_ENABLED", True)
 MALE_ROLE_IDS = {
     int(raw.strip())
     for raw in os.getenv("MALE_ROLE_IDS", "").split(",")
@@ -197,18 +382,32 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.guilds = True
+intents.presences = DISCORD_ENABLE_PRESENCE_INTENT
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
 DATA_DIR = Path("data")
 WARNINGS_FILE = DATA_DIR / "warnings.json"
 MOD_CONFIG_FILE = DATA_DIR / "mod_config.json"
+AI_MOD_STATE_FILE = DATA_DIR / "ai_mod_state.json"
+CAPABILITIES_OVERRIDES_FILE = DATA_DIR / "capabilities_overrides.json"
+CAPABILITIES_CATALOG_FILE = DATA_DIR / "capabilities_catalog.json"
 BAD_WORDS_FILE = DATA_DIR / "bad_words.txt"
+ENGAGEMENT_STATE_FILE = DATA_DIR / "engagement_state.json"
+BUSINESS_STATE_FILE = DATA_DIR / "business_state.json"
+AICRUSH_STATE_FILE = DATA_DIR / "aicrush_state.json"
+ALTFINDER_STATE_FILE = DATA_DIR / "altfinder_state.json"
+SOCIALINTEL_STATE_FILE = DATA_DIR / "socialintel_state.json"
+PERSISTENCE_ERROR_LAST_TS: dict[str, float] = {}
 
 LINK_PATTERN = re.compile(r"(https?://|www\.|discord\.gg/)", re.IGNORECASE)
 WORD_PATTERN = re.compile(r"\b[\w']+\b")
 EMOJI_PATTERN = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]")
-POLL_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+DISCORD_MESSAGE_LINK_RE = re.compile(
+    r"https?://(?:canary\.)?discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)",
+    re.IGNORECASE,
+)
+POLL_EMOJIS = ["1ï¸âƒ£", "2ï¸âƒ£", "3ï¸âƒ£", "4ï¸âƒ£", "5ï¸âƒ£", "6ï¸âƒ£", "7ï¸âƒ£", "8ï¸âƒ£", "9ï¸âƒ£", "ðŸ”Ÿ"]
 
 # (guild_id, user_id) -> message timestamps for spam detection.
 SPAM_CACHE: dict[tuple[int, int], deque[float]] = defaultdict(lambda: deque(maxlen=20))
@@ -224,6 +423,23 @@ AI_SYSTEM_PROMPT = (
     "You are a helpful Discord assistant for a community server. "
     "Answer clearly in <=120 words unless the user asks for a long response, "
     "and avoid unsafe or illegal instructions."
+)
+AI_MOD_FAST_SYSTEM_PROMPT = (
+    "You are Bell's moderation fast classifier for Discord messages. "
+    "Classify policy risk for English + Hinglish text. "
+    "Return STRICT JSON only with keys: category, risk_score, confidence, rationale_tags, suggested_action, "
+    "language_mix, is_raid_suspected, is_scam_suspected. "
+    "Categories: safe, spam_flood, harassment_toxic, scam_phishing, raid_behavior. "
+    "risk_score and confidence are 0..1 floats. rationale_tags is an array of <=6 short strings. "
+    "suggested_action: none|warn|delete|timeout|kick|ban. "
+    "If uncertain, prefer safer/lower risk."
+)
+AI_MOD_JUDGE_SYSTEM_PROMPT = (
+    "You are Bell's moderation judge model. "
+    "Given classifier output + message context, produce a stricter final decision for enforceable moderation. "
+    "Return STRICT JSON only with keys: category, risk_score, confidence, rationale_tags, suggested_action, "
+    "explanation, language_mix, is_raid_suspected, is_scam_suspected. "
+    "Use conservative, auditable reasoning and avoid over-enforcement."
 )
 PSYCH_SYSTEM_PROMPT = (
     "You are Bell's Psych Support Mode: a supportive assistant, not a licensed psychologist, "
@@ -243,6 +459,140 @@ VIBE_SYSTEM_PROMPT = (
 MODEL_CACHE: set[str] = set()
 MODEL_CACHE_TS = 0.0
 MODEL_CACHE_TTL_SECONDS = 600
+AI_REQUEST_SEMAPHORE = asyncio.Semaphore(AI_MAX_INFLIGHT)
+AI_CIRCUIT_OPEN_UNTIL: dict[str, float] = {}
+AI_MOD_STATE: dict[str, Any] = {}
+AI_MOD_STATE_DIRTY = False
+AI_MOD_STATE_LOCK = asyncio.Lock()
+AI_MOD_REPORT_LAST_TS: dict[int, float] = {}
+AI_MOD_RECENT_LINK_EVENTS: dict[tuple[int, str], deque[float]] = defaultdict(
+    lambda: deque(maxlen=180)
+)
+AI_MOD_RECENT_FINGERPRINT_EVENTS: dict[tuple[int, str], deque[tuple[float, int, int]]] = defaultdict(
+    lambda: deque(maxlen=220)
+)
+AI_MOD_RECENT_NEW_ACCOUNT_EVENTS: dict[int, deque[tuple[float, int]]] = defaultdict(
+    lambda: deque(maxlen=220)
+)
+AI_MOD_RECENT_ACTIONS: dict[tuple[int, int], deque[float]] = defaultdict(
+    lambda: deque(maxlen=35)
+)
+AI_MOD_CATEGORIES = {
+    "safe",
+    "spam_flood",
+    "harassment_toxic",
+    "scam_phishing",
+    "raid_behavior",
+}
+AI_MOD_ACTIONS = {"none", "warn", "delete", "timeout", "kick", "ban"}
+AI_MOD_ACTION_ORDER = ("warn", "delete", "timeout", "kick", "ban")
+AI_MOD_STAGE_A_CATEGORIES = ", ".join(sorted(AI_MOD_CATEGORIES))
+AI_MOD_STAGE_B_TRIGGER_BY_STRICTNESS = {
+    "moderate": 0.76,
+    "moderate_strict": 0.63,
+    "strict": 0.56,
+}
+AI_MOD_THRESHOLDS_BY_STRICTNESS: dict[str, dict[str, float]] = {
+    "moderate": {"high": 0.78, "very_high": 0.90, "extreme": 0.97},
+    "moderate_strict": {"high": 0.72, "very_high": 0.86, "extreme": 0.95},
+    "strict": {"high": 0.68, "very_high": 0.82, "extreme": 0.93},
+}
+AI_MOD_HINGLISH_NORMALIZE_MAP: dict[str, str] = {
+    "chutiya": "abuse",
+    "chutya": "abuse",
+    "madarchod": "abuse",
+    "mc": "abuse",
+    "bhenchod": "abuse",
+    "bc": "abuse",
+    "gandu": "abuse",
+    "bakchod": "abusive",
+    "bakchodi": "abusive",
+    "randi": "abuse",
+    "saale": "insult",
+    "sala": "insult",
+    "bewakoof": "idiot",
+    "bewkuf": "idiot",
+    "kutte": "insult",
+    "paisa": "money",
+    "paise": "money",
+    "bhej": "send",
+    "bhejo": "send",
+    "bhejna": "send",
+    "otp": "otp",
+    "kyc": "kyc",
+    "verify": "verify",
+    "verification": "verify",
+    "upar": "upi",
+    "upi": "upi",
+}
+AI_MOD_SPAM_HINTS = {
+    "dm me",
+    "join now",
+    "limited offer",
+    "click now",
+    "free nitro",
+    "airdrop",
+    "giveaway",
+}
+AI_MOD_SCAM_HINTS = {
+    "otp",
+    "kyc",
+    "wallet",
+    "seed phrase",
+    "verify account",
+    "bank alert",
+    "suspended account",
+    "login now",
+    "claim reward",
+    "upi",
+    "send money",
+    "crypto transfer",
+}
+AI_MOD_ABUSE_HINTS = {
+    "idiot",
+    "stupid",
+    "loser",
+    "moron",
+    "abuse",
+    "kill yourself",
+    "kys",
+}
+AI_MOD_DOMAIN_RE = re.compile(r"(?:https?://|www\.)([a-z0-9\.\-]+\.[a-z]{2,})(?::\d+)?", re.IGNORECASE)
+AI_MOD_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+CAPABILITY_DOMAINS = {
+    "moderation",
+    "ai",
+    "business",
+    "utility",
+    "fun",
+    "music",
+    "engagement",
+}
+CAPABILITY_QUERY_DOMAIN_TERMS: dict[str, set[str]] = {
+    "moderation": {"moderation", "mod", "automod", "timeout", "mute", "ban", "kick", "warn", "slowmode"},
+    "ai": {"ai", "assistant", "model", "summary", "psych", "argument", "debate", "translate", "translation", "hinglish"},
+    "business": {"business", "economy", "market", "stock", "loan", "tax", "portfolio", "networth"},
+    "utility": {"utility", "avatar", "userinfo", "serverinfo", "poll", "remind", "snipe"},
+    "fun": {"fun", "roast", "aicrush", "vibe", "futureme", "rizz", "serverlore"},
+    "music": {"music", "play", "queue", "join", "leave", "skip", "pause", "resume", "spotify", "youtube"},
+    "engagement": {"xp", "rank", "leaderboard", "streak", "daily", "quests", "event", "catchup", "insights"},
+}
+CAPABILITY_INTENT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bwhat can you do\b", re.IGNORECASE),
+    re.compile(r"\bcapabilit(?:y|ies)\b", re.IGNORECASE),
+    re.compile(r"\bwhich commands?\b", re.IGNORECASE),
+    re.compile(r"\bwhat commands?\b", re.IGNORECASE),
+    re.compile(r"\bhow can (?:you|bell)\b", re.IGNORECASE),
+    re.compile(r"\bhelp me (?:with|in)\b", re.IGNORECASE),
+    re.compile(r"\bhow (?:do|to) (?:i|we)\b", re.IGNORECASE),
+)
+CAPABILITIES_OVERRIDES_CACHE: dict[str, Any] | None = None
+CAPABILITIES_OVERRIDES_CACHE_TS = 0.0
+CAPABILITIES_OVERRIDES_CACHE_MTIME = 0.0
+CAPABILITIES_CATALOG_CACHE: dict[str, Any] | None = None
+CAPABILITIES_CATALOG_CACHE_TS = 0.0
+CAPABILITIES_CATALOG_CACHE_MTIME = 0.0
+CAPABILITIES_CACHE_TTL_SECONDS = 600.0
 SPOTIFY_CLIENT = None
 FFMPEG_EXECUTABLE: str | None = None
 INDIAN_VEG_MEALS_CACHE: list[dict[str, str]] = []
@@ -273,6 +623,7 @@ TIMEOUT_DURATION_RE = re.compile(
     re.IGNORECASE,
 )
 PSYCH_ACTIONS = {"start", "stop", "reset", "status"}
+NATURAL_COMMAND_BLOCKLIST = {"ban", "kick"}
 PSYCH_CRISIS_PATTERN = re.compile(
     r"\b("
     r"kill myself|suicide|suicidal|end my life|want to die|can't go on|"
@@ -287,6 +638,107 @@ PSYCH_SOLUTION_PATTERN = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+TRANSLATION_LOCAL_PHRASES: tuple[tuple[str, str], ...] = (
+    ("hinglish sikhao use", "teach them Hinglish"),
+    ("hinglish sikhao usse", "teach them Hinglish"),
+    ("hinglish sikhao usko", "teach them Hinglish"),
+    ("kya haal hai", "how are you"),
+    ("kese ho", "how are you"),
+    ("kaise ho", "how are you"),
+    ("kya kar rahe ho", "what are you doing"),
+    ("kya kar rha hai", "what are you doing"),
+    ("kya kar rahi ho", "what are you doing"),
+    ("main theek hoon", "I am fine"),
+    ("mai theek hoon", "I am fine"),
+    ("sab theek", "everything is fine"),
+    ("theek hai", "okay"),
+    ("thik hai", "okay"),
+    ("nahi yaar", "no friend"),
+    ("haan yaar", "yes friend"),
+)
+TRANSLATION_LOCAL_WORDS: dict[str, str] = {
+    "bhai": "brother",
+    "bhaiya": "brother",
+    "bro": "brother",
+    "behen": "sister",
+    "didi": "sister",
+    "yaar": "friend",
+    "yar": "friend",
+    "acha": "okay",
+    "accha": "okay",
+    "achha": "okay",
+    "theek": "fine",
+    "thik": "fine",
+    "haan": "yes",
+    "han": "yes",
+    "nahi": "no",
+    "nah": "no",
+    "kaise": "how",
+    "kese": "how",
+    "kaisa": "how",
+    "kya": "what",
+    "kaun": "who",
+    "kab": "when",
+    "kaha": "where",
+    "kahan": "where",
+    "ho": "are",
+    "hu": "am",
+    "hun": "am",
+    "main": "I",
+    "mai": "I",
+    "mera": "my",
+    "meri": "my",
+    "mere": "my",
+    "tera": "your",
+    "teri": "your",
+    "tere": "your",
+    "tum": "you",
+    "tu": "you",
+    "aap": "you",
+    "mujhe": "to me",
+    "mujhko": "to me",
+    "tujhe": "to you",
+    "tumhe": "to you",
+    "hum": "we",
+    "ham": "we",
+    "sab": "everyone",
+    "kaam": "work",
+    "ghar": "home",
+    "jaldi": "quickly",
+    "abhi": "right now",
+    "kal": "tomorrow",
+    "aaj": "today",
+    "kyun": "why",
+    "kyo": "why",
+    "kyon": "why",
+    "bolo": "tell me",
+    "bol": "say",
+    "sikhao": "teach",
+    "sikha": "teach",
+    "sikhado": "teach",
+    "sikha do": "teach",
+    "naam": "name",
+    "kiya": "did",
+    "ki": "did",
+    "firse": "again",
+    "phirse": "again",
+    "isse": "this person",
+    "isko": "this person",
+    "usse": "them",
+    "use": "them",
+    "usko": "them",
+    "mat": "don't",
+    "kar": "do",
+    "karo": "do",
+    "kr": "do",
+    "krna": "do",
+    "sun": "listen",
+    "sunna": "listen",
+    "chalo": "let's go",
+    "chal": "go",
+    "milte": "meet",
+    "baad": "later",
+}
 
 
 @dataclass
@@ -303,8 +755,159 @@ MUSIC_LOCKS: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 APP_COMMANDS_SYNCED = False
 AICRUSH_LOCKS: dict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
 AICRUSH_RESULT_CACHE: dict[tuple[int, int], tuple[float, str]] = {}
+AICRUSH_ALIAS_CACHE: dict[int, tuple[float, dict[str, Any]]] = {}
+AICRUSH_CHANNEL_RECENT_AUTHORS: dict[tuple[int, int], deque[tuple[float, int]]] = defaultdict(
+    lambda: deque(maxlen=80)
+)
+AICRUSH_MESSAGE_AUTHOR_CACHE: dict[int, tuple[int, float]] = {}
+ALTFINDER_LOCKS: dict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
+ALTFINDER_RESULT_CACHE: dict[tuple[int, int], tuple[float, str]] = {}
+ALTFINDER_CHANNEL_RECENT_AUTHORS: dict[tuple[int, int], deque[tuple[float, int]]] = defaultdict(
+    lambda: deque(maxlen=80)
+)
+SOCIALINTEL_LOCKS: dict[tuple[Any, ...], asyncio.Lock] = defaultdict(asyncio.Lock)
+SOCIALINTEL_RESULT_CACHE: dict[tuple[Any, ...], tuple[float, str]] = {}
+SOCIALINTEL_CHANNEL_RECENT_AUTHORS: dict[tuple[int, int], deque[tuple[float, int]]] = defaultdict(
+    lambda: deque(maxlen=80)
+)
 ROAST_LOCKS: dict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
 ROAST_RESULT_CACHE: dict[tuple[int, int, str], tuple[float, str]] = {}
+CATCHUP_LOCKS: dict[tuple[int, int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
+CATCHUP_CACHE: dict[tuple[int, int, int], tuple[float, str]] = {}
+INSIGHTS_LOCKS: dict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
+INSIGHTS_CACHE: dict[tuple[int, int], tuple[float, str]] = {}
+ANALYZE_LOCKS: dict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
+ANALYZE_CACHE: dict[tuple[int, int], tuple[float, str]] = {}
+MESSAGE_WINDOW_CACHE: dict[tuple, tuple[float, list["WindowMessage"]]] = {}
+MESSAGE_WINDOW_LOCKS: dict[tuple, asyncio.Lock] = defaultdict(asyncio.Lock)
+MESSAGE_WINDOW_CACHE_MAX_ENTRIES = 90
+FUN_USER_RATE_CACHE: dict[tuple[int, int], deque[float]] = defaultdict(lambda: deque(maxlen=40))
+FUN_CHANNEL_RATE_CACHE: dict[tuple[int, int], deque[float]] = defaultdict(lambda: deque(maxlen=60))
+AICRUSH_LAST_MATCHES: dict[tuple[int, int], tuple[int, float]] = {}
+ROAST_RECENT_OUTPUTS: dict[tuple[int, int, str], deque[tuple[float, str]]] = defaultdict(
+    lambda: deque(maxlen=8)
+)
+AUTOMOD_STRIKE_CACHE: dict[tuple[int, int], deque[float]] = defaultdict(lambda: deque(maxlen=12))
+WELCOME_ONBOARDING_SESSIONS: dict[tuple[int, int], dict[str, object]] = {}
+ENGAGEMENT_STATE: dict[str, object] = {"guilds": {}}
+ENGAGEMENT_STATE_DIRTY = False
+ENGAGEMENT_STATE_LOCK = asyncio.Lock()
+AICRUSH_STATE: dict[str, Any] = {}
+AICRUSH_STATE_DIRTY = False
+AICRUSH_STATE_LOCK = asyncio.Lock()
+ALTFINDER_STATE: dict[str, Any] = {}
+ALTFINDER_STATE_DIRTY = False
+ALTFINDER_STATE_LOCK = asyncio.Lock()
+SOCIALINTEL_STATE: dict[str, Any] = {}
+SOCIALINTEL_STATE_DIRTY = False
+SOCIALINTEL_STATE_LOCK = asyncio.Lock()
+BUSINESS_STATE: dict[str, Any] = {}
+BUSINESS_STATE_DIRTY = False
+BUSINESS_STATE_LOCK = asyncio.Lock()
+BUSINESS_TICK_LOCK = asyncio.Lock()
+BUSINESS_LAST_COMMAND_TS: dict[int, float] = {}
+BUSINESS_TX_ROLLBACK_CACHE: dict[str, dict[str, Any]] = {}
+BUSINESS_AI_TEXT_CACHE: dict[tuple[str, int, int], tuple[float, str]] = {}
+BUSINESS_WORLD_EVENT_CACHE: dict[str, Any] = {"ts": 0.0, "event": None}
+BUSINESS_SYMBOL_POOL: list[tuple[str, str, str]] = [
+    ("ASTR", "Aster Dynamics", "tech"),
+    ("NOVA", "Nova Retail", "consumer"),
+    ("SURY", "Surya Energy", "energy"),
+    ("KRFT", "KraftMinds", "tech"),
+    ("VAAN", "Vaan Logistics", "industrial"),
+    ("PRSM", "Prism Media", "media"),
+    ("ANVL", "Anvil Manufacturing", "industrial"),
+    ("GLDN", "Golden Harvest Foods", "consumer"),
+    ("VEDA", "Veda Health", "health"),
+    ("RIVR", "Riverline Infra", "infra"),
+    ("BOLT", "Bolt Mobility", "auto"),
+    ("NEON", "Neon Telecom", "telecom"),
+    ("MINT", "Mint Finserv", "finance"),
+    ("ORBT", "Orbit Aerospace", "aero"),
+    ("TARA", "Tara Textiles", "consumer"),
+    ("KITE", "Kite Cloud", "tech"),
+    ("RAGA", "Raga Entertainment", "media"),
+    ("FERN", "Fern Biotech", "health"),
+    ("SPRK", "Spark Utilities", "energy"),
+    ("BANY", "Banyan Realty", "realty"),
+]
+BUSINESS_COMMODITY_POOL: list[tuple[str, str, str, float, float]] = [
+    ("GOLD", "Gold Bullion", "metals", 6600.0, 0.012),
+    ("OIL", "Crude Oil", "energy", 6200.0, 0.020),
+    ("WHEAT", "Wheat", "agri", 1800.0, 0.018),
+    ("STEEL", "Steel", "metals", 2600.0, 0.016),
+    ("LITH", "Lithium", "battery", 5200.0, 0.024),
+    ("COFFEE", "Coffee Beans", "agri", 2300.0, 0.022),
+    ("URAN", "Uranium", "energy", 4700.0, 0.026),
+]
+BUSINESS_CRYPTO_POOL: list[tuple[str, str, float, float]] = [
+    ("BITV", "BitVault", 92000.0, 0.055),
+    ("NEOX", "NeonX", 6200.0, 0.070),
+    ("AUR", "AuroraChain", 1100.0, 0.082),
+    ("SPRKX", "SparkX", 380.0, 0.095),
+    ("MEMZ", "MemeZ", 42.0, 0.130),
+]
+ENGAGEMENT_LAST_MESSAGE_CACHE: dict[tuple[int, int], tuple[float, str]] = {}
+AUTO_LOOP_POST_HISTORY: dict[int, deque[float]] = defaultdict(lambda: deque(maxlen=80))
+CHANNEL_HEAT_EVENTS: dict[tuple[int, int], deque[tuple[float, float]]] = defaultdict(
+    lambda: deque(maxlen=80)
+)
+CHANNEL_HEAT_SLOWMODE_STATE: dict[tuple[int, int], dict[str, float]] = {}
+EVENT_MESSAGE_COOLDOWNS: dict[tuple[int, int], float] = {}
+EVENT_SESSIONS: dict[int, dict[str, object]] = {}
+
+QUEST_LIBRARY: list[dict[str, object]] = [
+    {"id": "chat_5", "name": "Keep Chat Alive", "type": "messages", "target": 5, "reward": 32},
+    {"id": "reply_3", "name": "Reply Chain", "type": "replies", "target": 3, "reward": 28},
+    {"id": "mention_2", "name": "Tag Teammates", "type": "mentions", "target": 2, "reward": 26},
+    {"id": "thread_2", "name": "Thread Builder", "type": "threads", "target": 2, "reward": 34},
+    {"id": "long_2", "name": "Deep Thoughts", "type": "long_msgs", "target": 2, "reward": 30},
+]
+
+ICEBREAKER_PROMPTS = [
+    "What is one tiny win you had today?",
+    "Drop your current top 1 song and why it is stuck in your head.",
+    "If today had a title, what would it be?",
+    "What is one take you would defend in voice chat for 10 minutes?",
+    "What is one thing you learned this week that others can use?",
+]
+DAILY_CHALLENGES = [
+    "Share one productivity trick and react to someone else's tip.",
+    "Post a screenshot/photo of something that made your day better.",
+    "Drop one unpopular opinion and keep it respectful.",
+    "Recommend one movie/show and give it a one-line pitch.",
+    "Share one goal for today and report back later.",
+]
+THREAD_REVIVE_PROMPTS = [
+    "Quick revive: what changed since this thread was active last time?",
+    "Thread reboot: what is your current stance in one line?",
+    "One follow-up question to restart this thread: what is the practical next step here?",
+]
+TRIVIA_PACK = [
+    {
+        "prompt": "Trivia: Which planet is known as the Red Planet?",
+        "answers": {"mars"},
+    },
+    {
+        "prompt": "Trivia: What is the capital city of Japan?",
+        "answers": {"tokyo"},
+    },
+    {
+        "prompt": "Trivia: Who wrote Romeo and Juliet?",
+        "answers": {"william shakespeare", "shakespeare"},
+    },
+]
+HOTTAKE_TOPICS = [
+    "Pineapple belongs on pizza.",
+    "Phone calls are better than texting.",
+    "Short-form content ruins attention span.",
+    "Night shifts are better than morning routines.",
+]
+CAPTION_PROMPTS = [
+    "Caption challenge: describe your current mood as a movie title.",
+    "Caption challenge: write the funniest one-line server ad.",
+    "Caption challenge: one-liner for a chaotic group photo.",
+]
 
 
 def resolve_ffmpeg_executable() -> str | None:
@@ -328,30 +931,311 @@ def resolve_ffmpeg_executable() -> str | None:
     return None
 
 
+def _default_capabilities_overrides_payload() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "commands": {
+            "automod": {
+                "domain": "moderation",
+                "summary": "Enable or disable first-line automatic moderation.",
+                "mod_only": True,
+                "examples": [f"{PREFIX}automod status", f"{PREFIX}automod on"],
+                "nl_triggers": ["automod", "auto moderation", "moderation settings"],
+            },
+            "aiguard": {
+                "domain": "moderation",
+                "summary": "Configure AI Guard layers and rollout mode.",
+                "mod_only": True,
+                "examples": [f"{PREFIX}aiguard status", f"{PREFIX}aiguard layer 3"],
+                "nl_triggers": ["ai guard", "ai moderation", "moderation capabilities"],
+            },
+            "aimodmode": {
+                "domain": "moderation",
+                "summary": "Switch AI moderation between shadow and enforce modes.",
+                "mod_only": True,
+                "examples": [f"{PREFIX}aimodmode shadow", f"{PREFIX}aimodmode enforce"],
+                "nl_triggers": ["shadow mode", "enforce mode", "rollout mode"],
+            },
+            "mute": {
+                "domain": "moderation",
+                "summary": "Apply a temporary timeout to a member.",
+                "mod_only": True,
+                "examples": [f"{PREFIX}mute @user 10 spam"],
+                "nl_triggers": ["timeout user", "mute user", "temporarily mute"],
+            },
+            "ban": {
+                "domain": "moderation",
+                "summary": "Ban a member from the server.",
+                "mod_only": True,
+                "examples": [f"{PREFIX}ban @user repeated abuse"],
+                "nl_triggers": ["ban user", "remove permanently", "block member"],
+            },
+            "help": {
+                "domain": "utility",
+                "summary": "Show a complete command index grouped by features.",
+                "mod_only": False,
+                "examples": [f"{PREFIX}help"],
+                "nl_triggers": ["commands list", "what commands", "show commands"],
+            },
+            "ai": {
+                "domain": "ai",
+                "summary": "Ask Bell a direct AI question with channel memory.",
+                "mod_only": False,
+                "examples": [f"{PREFIX}ai summarize this topic"],
+                "nl_triggers": ["ask ai", "chat with bell", "assistant"],
+            },
+            "translate": {
+                "domain": "ai",
+                "summary": "Translate mixed-language or Hinglish text into natural English.",
+                "mod_only": False,
+                "examples": [f"{PREFIX}translate hello bhai kese ho", f"{PREFIX}translate <message link>"],
+                "nl_triggers": ["translate this", "convert to english", "hinglish translation"],
+            },
+        },
+        "system_capabilities": [
+            {
+                "id": "moderation_stack",
+                "domain": "moderation",
+                "summary": "Bell supports rule-based AutoMod and AI Guard with audit cases, queue review, and appeals.",
+                "mod_only": False,
+                "examples": ["Ask: bell what are your moderation capabilities"],
+                "nl_triggers": ["moderation capabilities", "safety features", "how bell moderates"],
+            },
+            {
+                "id": "capability_assistant",
+                "domain": "ai",
+                "summary": "Bell can explain commands in natural language and suggest the right next command for a task.",
+                "mod_only": False,
+                "examples": ["Ask: bell how do I timeout a user", "Ask: bell which command do I use for server insights"],
+                "nl_triggers": ["how do i use", "which command", "what can you do"],
+            },
+        ],
+    }
+
+
+def _default_capabilities_catalog_payload() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "generated_at": 0.0,
+        "commands": {},
+        "system_capabilities": [],
+    }
+
+
+def _sanitize_capabilities_overrides_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    base = _default_capabilities_overrides_payload()
+    result: dict[str, Any] = {
+        "schema_version": int(payload.get("schema_version", base["schema_version"]) or base["schema_version"]),
+        "commands": {},
+        "system_capabilities": [],
+    }
+    raw_commands = payload.get("commands")
+    if not isinstance(raw_commands, dict):
+        raw_commands = {}
+    for cmd_name, row in raw_commands.items():
+        if not isinstance(row, dict):
+            continue
+        name = str(cmd_name).strip().lower()
+        if not name:
+            continue
+        domain = str(row.get("domain", "utility")).strip().lower()
+        if domain not in CAPABILITY_DOMAINS:
+            domain = "utility"
+        examples = row.get("examples", [])
+        if not isinstance(examples, list):
+            examples = []
+        triggers = row.get("nl_triggers", [])
+        if not isinstance(triggers, list):
+            triggers = []
+        result["commands"][name] = {
+            "domain": domain,
+            "summary": str(row.get("summary", "")).strip()[:280],
+            "mod_only": bool(row.get("mod_only", False)),
+            "examples": [str(item).strip()[:120] for item in examples if str(item).strip()][:5],
+            "nl_triggers": [str(item).strip().lower()[:50] for item in triggers if str(item).strip()][:10],
+        }
+    raw_system = payload.get("system_capabilities")
+    if not isinstance(raw_system, list):
+        raw_system = []
+    for row in raw_system:
+        if not isinstance(row, dict):
+            continue
+        capability_id = str(row.get("id", "")).strip().lower()
+        if not capability_id:
+            continue
+        domain = str(row.get("domain", "utility")).strip().lower()
+        if domain not in CAPABILITY_DOMAINS:
+            domain = "utility"
+        examples = row.get("examples", [])
+        if not isinstance(examples, list):
+            examples = []
+        triggers = row.get("nl_triggers", [])
+        if not isinstance(triggers, list):
+            triggers = []
+        result["system_capabilities"].append(
+            {
+                "id": capability_id,
+                "domain": domain,
+                "summary": str(row.get("summary", "")).strip()[:280],
+                "mod_only": bool(row.get("mod_only", False)),
+                "examples": [str(item).strip()[:120] for item in examples if str(item).strip()][:5],
+                "nl_triggers": [str(item).strip().lower()[:50] for item in triggers if str(item).strip()][:10],
+            }
+        )
+    if not result["commands"] and not result["system_capabilities"]:
+        return base
+    return result
+
+
+def _safe_file_mtime(path: Path) -> float:
+    try:
+        return float(path.stat().st_mtime)
+    except OSError:
+        return 0.0
+
+
+def _clone_json_dict(payload: dict) -> dict:
+    try:
+        cloned = json.loads(json.dumps(payload))
+    except (TypeError, ValueError):
+        cloned = dict(payload)
+    return cloned if isinstance(cloned, dict) else {}
+
+
+def _json_backup_path(path: Path) -> Path:
+    return path.with_suffix(f"{path.suffix}.bak")
+
+
+def _read_json_file(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _log_persistence_error(path: Path, action: str, error: OSError) -> None:
+    now = time.monotonic()
+    key = f"{action}:{path}:{getattr(error, 'errno', 'unknown')}"
+    last_ts = PERSISTENCE_ERROR_LAST_TS.get(key, 0.0)
+    if now - last_ts < 25.0:
+        return
+    PERSISTENCE_ERROR_LAST_TS[key] = now
+    print(
+        f"[PERSISTENCE ERROR] action={action} path=`{path}` "
+        f"errno=`{getattr(error, 'errno', 'unknown')}` detail=`{error}`"
+    )
+
+
+def _write_text_atomic(path: Path, text: str) -> tuple[bool, OSError | None]:
+    temp_name = f"{path.name}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
+    temp_path = path.with_name(temp_name)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.write_text(text, encoding="utf-8")
+        os.replace(temp_path, path)
+        return True, None
+    except OSError as error:
+        _log_persistence_error(path, "atomic_replace", error)
+        # Fallback for platforms/filesystems where atomic replace can fail.
+        try:
+            path.write_text(text, encoding="utf-8")
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except OSError:
+                pass
+            return True, None
+        except OSError as fallback_error:
+            _log_persistence_error(path, "direct_write", fallback_error)
+            error = fallback_error
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError as cleanup_error:
+            _log_persistence_error(path, "temp_cleanup", cleanup_error)
+            pass
+        return False, error
+
+
 def ensure_data_files() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not WARNINGS_FILE.exists():
         WARNINGS_FILE.write_text("{}", encoding="utf-8")
     if not MOD_CONFIG_FILE.exists():
         MOD_CONFIG_FILE.write_text("{}", encoding="utf-8")
+    if not AI_MOD_STATE_FILE.exists():
+        AI_MOD_STATE_FILE.write_text("{}", encoding="utf-8")
+    if not CAPABILITIES_OVERRIDES_FILE.exists():
+        CAPABILITIES_OVERRIDES_FILE.write_text(
+            json.dumps(_default_capabilities_overrides_payload(), indent=2),
+            encoding="utf-8",
+        )
+    if not CAPABILITIES_CATALOG_FILE.exists():
+        CAPABILITIES_CATALOG_FILE.write_text(
+            json.dumps(_default_capabilities_catalog_payload(), indent=2),
+            encoding="utf-8",
+        )
     if not BAD_WORDS_FILE.exists():
         BAD_WORDS_FILE.write_text(
             "# Add one blocked word per line.\n# Lines starting with # are ignored.\n",
             encoding="utf-8",
         )
+    if not ENGAGEMENT_STATE_FILE.exists():
+        ENGAGEMENT_STATE_FILE.write_text('{"guilds": {}}', encoding="utf-8")
+    if not BUSINESS_STATE_FILE.exists():
+        BUSINESS_STATE_FILE.write_text("{}", encoding="utf-8")
+    if not AICRUSH_STATE_FILE.exists():
+        AICRUSH_STATE_FILE.write_text('{"schema_version": 1, "guilds": {}}', encoding="utf-8")
+    if not ALTFINDER_STATE_FILE.exists():
+        ALTFINDER_STATE_FILE.write_text('{"schema_version": 1, "guilds": {}}', encoding="utf-8")
+    if not SOCIALINTEL_STATE_FILE.exists():
+        SOCIALINTEL_STATE_FILE.write_text('{"schema_version": 1, "guilds": {}}', encoding="utf-8")
 
 
 def read_json(path: Path) -> dict:
     ensure_data_files()
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
+    payload = _read_json_file(path)
+    if payload:
+        return payload
+    backup_payload = _read_json_file(_json_backup_path(path))
+    if backup_payload:
+        return backup_payload
+    return {}
 
 
-def write_json(path: Path, payload: dict) -> None:
+def write_json(path: Path, payload: dict) -> bool:
+    cloned = _clone_json_dict(payload)
+
     ensure_data_files()
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    try:
+        serialized = json.dumps(cloned, indent=2)
+    except (TypeError, ValueError):
+        print(f"[JSON SERIALIZE ERROR] Could not serialize payload for `{path}`.")
+        return False
+    ok, primary_error = _write_text_atomic(path, serialized)
+    if not ok:
+        if primary_error is not None:
+            print(
+                f"[JSON WRITE ERROR] Could not write `{path}` "
+                f"(errno={getattr(primary_error, 'errno', 'unknown')}: {primary_error})."
+            )
+        else:
+            print(f"[JSON WRITE ERROR] Could not write `{path}`.")
+        return False
+    backup_path = _json_backup_path(path)
+    backup_ok, backup_error = _write_text_atomic(backup_path, serialized)
+    if not backup_ok:
+        if backup_error is not None:
+            print(
+                f"[JSON BACKUP WRITE ERROR] Could not write `{backup_path}` "
+                f"(errno={getattr(backup_error, 'errno', 'unknown')}: {backup_error})."
+            )
+        else:
+            print(f"[JSON BACKUP WRITE ERROR] Could not write `{backup_path}`.")
+    return True
 
 
 def load_warnings() -> dict:
@@ -362,19 +1246,1250 @@ def save_warnings(payload: dict) -> None:
     write_json(WARNINGS_FILE, payload)
 
 
+MOD_CONFIG_CACHE: dict | None = None
+MOD_CONFIG_CACHE_TS = 0.0
+MOD_CONFIG_CACHE_TTL_SECONDS = 6
+
+
 def load_mod_config() -> dict:
-    return read_json(MOD_CONFIG_FILE)
+    global MOD_CONFIG_CACHE, MOD_CONFIG_CACHE_TS
+    now = time.monotonic()
+    if MOD_CONFIG_CACHE is not None and now - MOD_CONFIG_CACHE_TS < MOD_CONFIG_CACHE_TTL_SECONDS:
+        return MOD_CONFIG_CACHE
+    config = read_json(MOD_CONFIG_FILE)
+    MOD_CONFIG_CACHE = config
+    MOD_CONFIG_CACHE_TS = now
+    return config
 
 
 def save_mod_config(payload: dict) -> None:
+    global MOD_CONFIG_CACHE, MOD_CONFIG_CACHE_TS
     write_json(MOD_CONFIG_FILE, payload)
+    MOD_CONFIG_CACHE = payload
+    MOD_CONFIG_CACHE_TS = time.monotonic()
+
+
+def _default_ai_mod_state() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "cases": {},
+        "appeals": {},
+        "review_actions": [],
+        "user_risk": {},
+        "metrics": {
+            "evaluated": 0,
+            "cases_created": 0,
+            "enforced": 0,
+            "overrides": 0,
+            "appeals": 0,
+        },
+        "meta": {
+            "next_case": 1,
+            "next_appeal": 1,
+            "last_prune_ts": 0.0,
+        },
+    }
+
+
+def _sanitize_ai_mod_state(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    base = _default_ai_mod_state()
+    for key in ("schema_version", "cases", "appeals", "review_actions", "user_risk", "metrics", "meta"):
+        if key not in payload:
+            payload[key] = base[key]
+    if not isinstance(payload["cases"], dict):
+        payload["cases"] = {}
+    if not isinstance(payload["appeals"], dict):
+        payload["appeals"] = {}
+    if not isinstance(payload["review_actions"], list):
+        payload["review_actions"] = []
+    if not isinstance(payload["user_risk"], dict):
+        payload["user_risk"] = {}
+    if not isinstance(payload["metrics"], dict):
+        payload["metrics"] = dict(base["metrics"])
+    if not isinstance(payload["meta"], dict):
+        payload["meta"] = dict(base["meta"])
+    payload["meta"]["next_case"] = max(1, int(payload["meta"].get("next_case", 1) or 1))
+    payload["meta"]["next_appeal"] = max(1, int(payload["meta"].get("next_appeal", 1) or 1))
+    payload["meta"]["last_prune_ts"] = float(payload["meta"].get("last_prune_ts", 0.0) or 0.0)
+    for key, default_value in base["metrics"].items():
+        payload["metrics"][key] = int(payload["metrics"].get(key, default_value) or default_value)
+    return payload
+
+
+def load_ai_mod_state() -> None:
+    global AI_MOD_STATE, AI_MOD_STATE_DIRTY
+    payload = read_json(AI_MOD_STATE_FILE)
+    AI_MOD_STATE = _sanitize_ai_mod_state(payload)
+    AI_MOD_STATE_DIRTY = False
+
+
+def get_ai_mod_state() -> dict[str, Any]:
+    global AI_MOD_STATE
+    if not AI_MOD_STATE:
+        AI_MOD_STATE = _default_ai_mod_state()
+        _mark_ai_mod_dirty()
+    AI_MOD_STATE = _sanitize_ai_mod_state(AI_MOD_STATE)
+    return AI_MOD_STATE
+
+
+def _mark_ai_mod_dirty() -> None:
+    global AI_MOD_STATE_DIRTY
+    AI_MOD_STATE_DIRTY = True
+
+
+async def flush_ai_mod_state(force: bool = False) -> None:
+    global AI_MOD_STATE_DIRTY
+    if not force and not AI_MOD_STATE_DIRTY:
+        return
+    async with AI_MOD_STATE_LOCK:
+        if not force and not AI_MOD_STATE_DIRTY:
+            return
+        try:
+            persisted = write_json(AI_MOD_STATE_FILE, AI_MOD_STATE)
+            if persisted:
+                AI_MOD_STATE_DIRTY = False
+        except Exception:
+            pass
+
+
+def _ai_mod_next_case_id() -> str:
+    state = get_ai_mod_state()
+    current = int(state["meta"].get("next_case", 1) or 1)
+    state["meta"]["next_case"] = current + 1
+    _mark_ai_mod_dirty()
+    return f"CASE-{current:06d}"
+
+
+def _ai_mod_next_appeal_id() -> str:
+    state = get_ai_mod_state()
+    current = int(state["meta"].get("next_appeal", 1) or 1)
+    state["meta"]["next_appeal"] = current + 1
+    _mark_ai_mod_dirty()
+    return f"APL-{current:06d}"
+
+
+def _ai_mod_increment_metric(metric: str, amount: int = 1) -> None:
+    if amount == 0:
+        return
+    state = get_ai_mod_state()
+    metrics = state.setdefault("metrics", {})
+    if not isinstance(metrics, dict):
+        metrics = {}
+        state["metrics"] = metrics
+    metrics[metric] = int(metrics.get(metric, 0) or 0) + int(amount)
+    _mark_ai_mod_dirty()
+
+
+def _ai_mod_normalize_category(raw: object) -> str:
+    text = str(raw or "").strip().lower()
+    aliases = {
+        "safe_other": "safe",
+        "safe/other": "safe",
+        "safe": "safe",
+        "none": "safe",
+        "spam": "spam_flood",
+        "flood": "spam_flood",
+        "spam_flood": "spam_flood",
+        "harassment": "harassment_toxic",
+        "toxicity": "harassment_toxic",
+        "toxic": "harassment_toxic",
+        "harassment_toxic": "harassment_toxic",
+        "scam": "scam_phishing",
+        "phishing": "scam_phishing",
+        "fraud": "scam_phishing",
+        "scam_phishing": "scam_phishing",
+        "raid": "raid_behavior",
+        "raid_behavior": "raid_behavior",
+    }
+    normalized = aliases.get(text, text)
+    if normalized not in AI_MOD_CATEGORIES:
+        return "safe"
+    return normalized
+
+
+def _ai_mod_normalize_action(raw: object) -> str:
+    text = str(raw or "").strip().lower()
+    if text not in AI_MOD_ACTIONS:
+        return "none"
+    return text
+
+
+def _ai_mod_risk_score(raw: object) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, value))
+
+
+def _ai_mod_confidence_band(score: float) -> str:
+    if score >= 0.95:
+        return "extreme"
+    if score >= 0.86:
+        return "very_high"
+    if score >= 0.72:
+        return "high"
+    if score >= 0.56:
+        return "medium"
+    return "low"
+
+
+def _ai_mod_get_thresholds(strictness: str) -> dict[str, float]:
+    normalized = strictness.strip().lower()
+    if normalized not in AI_MOD_THRESHOLDS_BY_STRICTNESS:
+        normalized = "moderate_strict"
+    return dict(AI_MOD_THRESHOLDS_BY_STRICTNESS[normalized])
+
+
+def _ai_mod_stage_b_threshold(strictness: str) -> float:
+    normalized = strictness.strip().lower()
+    if normalized not in AI_MOD_STAGE_B_TRIGGER_BY_STRICTNESS:
+        normalized = "moderate_strict"
+    return float(AI_MOD_STAGE_B_TRIGGER_BY_STRICTNESS.get(normalized, 0.63))
+
+
+def _ai_mod_effective_mode(guild_id: int) -> tuple[str, bool]:
+    configured = get_guild_ai_guard_mode(guild_id)
+    enabled_since = get_guild_ai_guard_enabled_since(guild_id)
+    if configured == "enforce" and enabled_since > 0 and AI_MOD_SHADOW_DAYS > 0:
+        age = time.time() - enabled_since
+        if age < (AI_MOD_SHADOW_DAYS * 86400):
+            return "shadow", True
+    return configured, False
+
+
+def _ai_mod_trim_timestamps(queue: deque[float], window_seconds: float) -> None:
+    now = time.monotonic()
+    while queue and now - queue[0] > window_seconds:
+        queue.popleft()
+
+
+def _ai_mod_extract_domains(text: str) -> list[str]:
+    found: set[str] = set()
+    for match in AI_MOD_DOMAIN_RE.finditer(text):
+        domain = (match.group(1) or "").strip().lower()
+        if not domain:
+            continue
+        if domain.startswith("www."):
+            domain = domain[4:]
+        found.add(domain)
+    return sorted(found)
+
+
+def _ai_mod_message_fingerprint(text: str) -> str:
+    lowered = text.lower()
+    lowered = AI_MOD_URL_RE.sub(" ", lowered)
+    lowered = re.sub(r"<@!?\d+>", " @user ", lowered)
+    lowered = re.sub(r"<#\d+>", " #channel ", lowered)
+    lowered = re.sub(r"[^a-z0-9\s]", " ", lowered)
+    lowered = re.sub(r"\d", "0", lowered)
+    tokens = [tok for tok in WORD_PATTERN.findall(lowered) if len(tok) >= 2]
+    basis = " ".join(tokens[:28]) if tokens else lowered.strip()[:140]
+    if not basis:
+        basis = "empty"
+    return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def _ai_mod_normalize_hinglish(content: str) -> tuple[str, list[str]]:
+    tokens = WORD_PATTERN.findall(content.lower())
+    normalized: list[str] = []
+    tags: list[str] = []
+    for token in tokens:
+        mapped = AI_MOD_HINGLISH_NORMALIZE_MAP.get(token, token)
+        normalized.append(mapped)
+        if mapped != token and len(tags) < 8:
+            tags.append(f"hinglish:{token}->{mapped}")
+    return " ".join(normalized), tags
+
+
+def _ai_mod_heuristic_payload(
+    content: str,
+    normalized_text: str,
+    *,
+    corroborators: dict[str, Any],
+) -> dict[str, Any]:
+    lowered = content.lower()
+    normalized = normalized_text.lower()
+    tags: list[str] = []
+    category = "safe"
+    score = 0.05
+    suggested = "none"
+
+    scam_hits = sum(1 for hint in AI_MOD_SCAM_HINTS if hint in lowered or hint in normalized)
+    abuse_hits = sum(1 for hint in AI_MOD_ABUSE_HINTS if hint in lowered or hint in normalized)
+    spam_hits = sum(1 for hint in AI_MOD_SPAM_HINTS if hint in lowered or hint in normalized)
+    has_link = bool(LINK_PATTERN.search(content))
+    has_many_mentions = len(re.findall(r"<@!?\d+>", content)) >= 4
+    repeated_chars = bool(re.search(r"(.)\1{6,}", content))
+    upper_ratio = (sum(1 for ch in content if ch.isupper()) / max(1, len(content))) if content else 0.0
+
+    if has_link and scam_hits >= 1:
+        category = "scam_phishing"
+        score = 0.78 + min(0.20, scam_hits * 0.05)
+        tags.extend(["link_present", "scam_pattern"])
+    elif abuse_hits >= 2 or "kill yourself" in lowered:
+        category = "harassment_toxic"
+        score = 0.72 + min(0.18, abuse_hits * 0.04)
+        tags.append("abusive_pattern")
+    elif spam_hits >= 2 or has_many_mentions or repeated_chars or upper_ratio > 0.75:
+        category = "spam_flood"
+        score = 0.68 + min(0.15, spam_hits * 0.03)
+        tags.append("spam_pattern")
+
+    if bool(corroborators.get("cross_channel_spread")) and bool(corroborators.get("repeated_fingerprint")):
+        category = "raid_behavior"
+        score = max(score, 0.88)
+        tags.append("cross_channel_spread")
+    if bool(corroborators.get("new_account_burst")) and (
+        bool(corroborators.get("repeated_domain_cluster")) or bool(corroborators.get("repeated_fingerprint"))
+    ):
+        category = "raid_behavior"
+        score = max(score, 0.92)
+        tags.append("new_account_burst")
+    if category == "scam_phishing" and bool(corroborators.get("repeated_domain_cluster")):
+        score = max(score, 0.90)
+        tags.append("domain_cluster")
+
+    if category == "safe":
+        suggested = "none"
+    elif score >= 0.86:
+        suggested = "timeout"
+    elif score >= 0.72:
+        suggested = "delete"
+    elif score >= 0.56:
+        suggested = "warn"
+    return {
+        "category": category,
+        "risk_score": max(0.0, min(0.99, score)),
+        "confidence": score,
+        "confidence_band": _ai_mod_confidence_band(score),
+        "rationale_tags": tags[:6],
+        "suggested_action": suggested,
+        "language_mix": "en_hinglish",
+        "is_raid_suspected": bool(category == "raid_behavior"),
+        "is_scam_suspected": bool(category == "scam_phishing"),
+    }
+
+
+def _ai_mod_parse_llm_payload(payload: object, fallback: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return dict(fallback)
+    category = _ai_mod_normalize_category(payload.get("category"))
+    risk_score = _ai_mod_risk_score(payload.get("risk_score"))
+    confidence = _ai_mod_risk_score(payload.get("confidence", risk_score))
+    suggested = _ai_mod_normalize_action(payload.get("suggested_action"))
+    tags_raw = payload.get("rationale_tags", [])
+    tags: list[str] = []
+    if isinstance(tags_raw, list):
+        for item in tags_raw:
+            cleaned = str(item).strip().lower()
+            if cleaned and cleaned not in tags:
+                tags.append(cleaned[:40])
+            if len(tags) >= 6:
+                break
+    if category == "safe":
+        suggested = "none"
+    if risk_score <= 0.02 and category != "safe":
+        risk_score = max(risk_score, 0.08)
+    return {
+        "category": category,
+        "risk_score": risk_score,
+        "confidence": confidence,
+        "confidence_band": _ai_mod_confidence_band(risk_score),
+        "rationale_tags": tags or list(fallback.get("rationale_tags", [])),
+        "suggested_action": suggested,
+        "language_mix": str(payload.get("language_mix", "en_hinglish")).strip()[:24],
+        "is_raid_suspected": bool(payload.get("is_raid_suspected", category == "raid_behavior")),
+        "is_scam_suspected": bool(payload.get("is_scam_suspected", category == "scam_phishing")),
+        "explanation": str(payload.get("explanation", "")).strip()[:220],
+    }
+
+
+def _ai_mod_layer_allowed_actions(layer: int) -> set[str]:
+    if layer <= 1:
+        return set()
+    if layer == 2:
+        return {"warn"}
+    if layer == 3:
+        return {"warn", "delete", "timeout"}
+    if layer == 4:
+        return {"warn", "delete", "timeout", "kick", "ban"}
+    return {"warn", "delete", "timeout", "kick", "ban"}
+
+
+def _ai_mod_trim_user_history(entries: list[dict[str, Any]], cutoff_ts: float) -> list[dict[str, Any]]:
+    kept: list[dict[str, Any]] = []
+    for row in entries:
+        if not isinstance(row, dict):
+            continue
+        ts = float(row.get("ts", 0.0) or 0.0)
+        if ts < cutoff_ts:
+            continue
+        kept.append(row)
+    return kept[-120:]
+
+
+def _ai_mod_record_user_risk(
+    guild_id: int,
+    user_id: int,
+    *,
+    case_id: str,
+    category: str,
+    risk_score: float,
+    confidence_band: str,
+    action: str,
+) -> None:
+    state = get_ai_mod_state()
+    key = f"{guild_id}:{user_id}"
+    user_risk = state.setdefault("user_risk", {})
+    if not isinstance(user_risk, dict):
+        user_risk = {}
+        state["user_risk"] = user_risk
+    row = user_risk.get(key)
+    if not isinstance(row, dict):
+        row = {"history": []}
+        user_risk[key] = row
+    history = row.get("history")
+    if not isinstance(history, list):
+        history = []
+        row["history"] = history
+    history.append(
+        {
+            "ts": time.time(),
+            "case_id": case_id,
+            "category": category,
+            "risk_score": round(float(risk_score), 4),
+            "confidence_band": confidence_band,
+            "action": action,
+        }
+    )
+    cutoff = time.time() - (AI_MOD_RETENTION_DAYS * 86400)
+    row["history"] = _ai_mod_trim_user_history(history, cutoff)
+    _mark_ai_mod_dirty()
+
+
+def _ai_mod_recent_user_incidents(
+    guild_id: int,
+    user_id: int,
+    *,
+    days: int,
+) -> list[dict[str, Any]]:
+    state = get_ai_mod_state()
+    user_risk = state.get("user_risk", {})
+    if not isinstance(user_risk, dict):
+        return []
+    row = user_risk.get(f"{guild_id}:{user_id}")
+    if not isinstance(row, dict):
+        return []
+    history = row.get("history")
+    if not isinstance(history, list):
+        return []
+    cutoff = time.time() - (max(1, days) * 86400)
+    output: list[dict[str, Any]] = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        ts = float(item.get("ts", 0.0) or 0.0)
+        if ts >= cutoff:
+            output.append(item)
+    return output
+
+
+def _ai_mod_severe_repeat_offender(guild_id: int, user_id: int) -> bool:
+    incidents = _ai_mod_recent_user_incidents(guild_id, user_id, days=7)
+    if len(incidents) < 3:
+        return False
+    severe = 0
+    for item in incidents:
+        risk = _ai_mod_risk_score(item.get("risk_score"))
+        action = str(item.get("action", "none"))
+        if risk >= 0.82 or action in {"timeout", "kick", "ban"}:
+            severe += 1
+    return severe >= 2
+
+
+def _ai_mod_case_cap_prune(state: dict[str, Any]) -> None:
+    cases = state.get("cases", {})
+    if not isinstance(cases, dict):
+        return
+    if len(cases) <= AI_MOD_MAX_CASES:
+        return
+    ordered = sorted(
+        cases.items(),
+        key=lambda item: float(item[1].get("created_ts", 0.0) if isinstance(item[1], dict) else 0.0),
+    )
+    overflow = len(cases) - AI_MOD_MAX_CASES
+    for case_id, _ in ordered[:overflow]:
+        cases.pop(case_id, None)
+    _mark_ai_mod_dirty()
+
+
+def _ai_mod_create_case(
+    message: discord.Message,
+    *,
+    stage_a: dict[str, Any],
+    stage_b: dict[str, Any] | None,
+    category: str,
+    risk_score: float,
+    confidence_band: str,
+    rationale_tags: list[str],
+    suggested_action: str,
+    final_action: str,
+    mode: str,
+    layer: int,
+    corroborators: dict[str, Any],
+    normalized_text: str,
+) -> str:
+    state = get_ai_mod_state()
+    case_id = _ai_mod_next_case_id()
+    now_ts = time.time()
+    evidence_text = " ".join(message.clean_content.split()).strip()[:850]
+    case_record = {
+        "id": case_id,
+        "guild_id": int(message.guild.id),
+        "channel_id": int(message.channel.id),
+        "message_id": int(message.id),
+        "author_id": int(message.author.id),
+        "created_ts": now_ts,
+        "updated_ts": now_ts,
+        "status": "open" if mode == "enforce" else "shadow",
+        "category": category,
+        "risk_score": round(risk_score, 4),
+        "confidence_band": confidence_band,
+        "rationale_tags": rationale_tags[:8],
+        "suggested_action": suggested_action,
+        "action": final_action,
+        "mode": mode,
+        "layer": int(layer),
+        "language_profile": get_guild_ai_guard_language_profile(message.guild.id),
+        "message_excerpt": evidence_text,
+        "normalized_excerpt": normalized_text[:450],
+        "message_jump_url": message.jump_url,
+        "corroborators": corroborators,
+        "stage_a": stage_a,
+        "stage_b": stage_b,
+        "review": {"override_action": None, "reviewer_id": None, "review_note": "", "updated_ts": 0.0},
+        "appeal_ids": [],
+    }
+    state_cases = state.setdefault("cases", {})
+    if not isinstance(state_cases, dict):
+        state_cases = {}
+        state["cases"] = state_cases
+    state_cases[case_id] = case_record
+    _ai_mod_increment_metric("cases_created")
+    _ai_mod_record_user_risk(
+        message.guild.id,
+        message.author.id,
+        case_id=case_id,
+        category=category,
+        risk_score=risk_score,
+        confidence_band=confidence_band,
+        action=final_action,
+    )
+    _ai_mod_case_cap_prune(state)
+    _mark_ai_mod_dirty()
+    return case_id
+
+
+def _ai_mod_case(case_id: str) -> dict[str, Any] | None:
+    state = get_ai_mod_state()
+    cases = state.get("cases", {})
+    if not isinstance(cases, dict):
+        return None
+    row = cases.get(case_id.upper().strip())
+    if not isinstance(row, dict):
+        return None
+    return row
+
+
+def _ai_mod_open_cases_for_guild(guild_id: int) -> list[dict[str, Any]]:
+    state = get_ai_mod_state()
+    cases = state.get("cases", {})
+    if not isinstance(cases, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for case in cases.values():
+        if not isinstance(case, dict):
+            continue
+        if int(case.get("guild_id", 0) or 0) != guild_id:
+            continue
+        status = str(case.get("status", "open")).lower()
+        if status in {"closed", "resolved", "dismissed"}:
+            continue
+        rows.append(case)
+    rows.sort(key=lambda row: float(row.get("created_ts", 0.0) or 0.0), reverse=True)
+    return rows
+
+
+def _ai_mod_register_corroborator_signals(message: discord.Message) -> dict[str, Any]:
+    now_mono = time.monotonic()
+    guild_id = message.guild.id
+    user_id = message.author.id
+    domains = _ai_mod_extract_domains(message.content)
+    fingerprint = _ai_mod_message_fingerprint(message.content)
+
+    for domain in domains:
+        dq = AI_MOD_RECENT_LINK_EVENTS[(guild_id, domain)]
+        dq.append(now_mono)
+        _ai_mod_trim_timestamps(dq, 240.0)
+
+    fingerprint_queue = AI_MOD_RECENT_FINGERPRINT_EVENTS[(guild_id, fingerprint)]
+    fingerprint_queue.append((now_mono, user_id, message.channel.id))
+    while fingerprint_queue and now_mono - fingerprint_queue[0][0] > 240.0:
+        fingerprint_queue.popleft()
+
+    new_account_days = max(
+        0.0,
+        (discord.utils.utcnow() - message.author.created_at).total_seconds() / 86400.0,
+    )
+    if new_account_days <= 7.0:
+        account_dq = AI_MOD_RECENT_NEW_ACCOUNT_EVENTS[guild_id]
+        account_dq.append((now_mono, user_id))
+        while account_dq and now_mono - account_dq[0][0] > 180.0:
+            account_dq.popleft()
+
+    repeated_domain_cluster = False
+    max_domain_count = 0
+    for domain in domains:
+        dq = AI_MOD_RECENT_LINK_EVENTS[(guild_id, domain)]
+        _ai_mod_trim_timestamps(dq, 240.0)
+        max_domain_count = max(max_domain_count, len(dq))
+        if len(dq) >= 4:
+            repeated_domain_cluster = True
+
+    unique_users = {row[1] for row in fingerprint_queue}
+    unique_channels = {row[2] for row in fingerprint_queue}
+    repeated_fingerprint = len(fingerprint_queue) >= 4 and len(unique_users) >= 2
+    cross_channel_spread = len(unique_channels) >= 2 and len(fingerprint_queue) >= 4
+
+    account_queue = AI_MOD_RECENT_NEW_ACCOUNT_EVENTS.get(guild_id, deque())
+    unique_new_users = {row[1] for row in account_queue}
+    new_account_burst = len(unique_new_users) >= 4
+
+    corroborator_count = 0
+    for flag in (
+        new_account_burst,
+        repeated_domain_cluster,
+        repeated_fingerprint,
+        cross_channel_spread,
+    ):
+        if flag:
+            corroborator_count += 1
+    return {
+        "domains": domains[:6],
+        "fingerprint": fingerprint,
+        "max_domain_count": max_domain_count,
+        "fingerprint_hits": len(fingerprint_queue),
+        "fingerprint_user_count": len(unique_users),
+        "fingerprint_channel_count": len(unique_channels),
+        "new_account_days": round(new_account_days, 2),
+        "new_account_burst": new_account_burst,
+        "repeated_domain_cluster": repeated_domain_cluster,
+        "repeated_fingerprint": repeated_fingerprint,
+        "cross_channel_spread": cross_channel_spread,
+        "corroborator_count": corroborator_count,
+    }
+
+
+def _ai_mod_pick_matrix_actions(
+    category: str,
+    risk_score: float,
+    *,
+    strictness: str,
+) -> list[str]:
+    thresholds = _ai_mod_get_thresholds(strictness)
+    high = thresholds["high"]
+    very_high = thresholds["very_high"]
+    if category in {"spam_flood", "harassment_toxic"}:
+        if risk_score >= very_high:
+            return ["delete", "timeout"]
+        if risk_score >= high:
+            return ["delete"]
+    if category in {"scam_phishing", "raid_behavior"}:
+        if risk_score >= high:
+            return ["delete", "timeout"]
+    if risk_score >= 0.56 and category != "safe":
+        return ["warn"]
+    return []
+
+
+def _ai_mod_allow_autoban(
+    *,
+    category: str,
+    risk_score: float,
+    strictness: str,
+    layer: int,
+    allowed_actions: set[str],
+    corroborators: dict[str, Any],
+) -> bool:
+    if layer < 4 or "ban" not in allowed_actions:
+        return False
+    if category not in {"scam_phishing", "raid_behavior"}:
+        return False
+    thresholds = _ai_mod_get_thresholds(strictness)
+    if risk_score < thresholds["extreme"]:
+        return False
+    corroborator_count = int(corroborators.get("corroborator_count", 0) or 0)
+    if corroborator_count < 2:
+        return False
+    if not (
+        bool(corroborators.get("repeated_fingerprint"))
+        or bool(corroborators.get("cross_channel_spread"))
+        or bool(corroborators.get("repeated_domain_cluster"))
+    ):
+        return False
+    return True
+
+
+def _ai_mod_select_actions(
+    *,
+    guild_id: int,
+    user_id: int,
+    category: str,
+    risk_score: float,
+    strictness: str,
+    layer: int,
+    allowed_actions: set[str],
+    corroborators: dict[str, Any],
+) -> list[str]:
+    if layer <= 1:
+        return []
+    layer_allowed = _ai_mod_layer_allowed_actions(layer)
+    enabled_allowed = layer_allowed.intersection(allowed_actions)
+    actions = _ai_mod_pick_matrix_actions(category, risk_score, strictness=strictness)
+
+    if layer == 2:
+        if risk_score >= 0.56 and category != "safe" and "warn" in enabled_allowed:
+            return ["warn"]
+        return []
+
+    if _ai_mod_allow_autoban(
+        category=category,
+        risk_score=risk_score,
+        strictness=strictness,
+        layer=layer,
+        allowed_actions=enabled_allowed,
+        corroborators=corroborators,
+    ):
+        actions = ["delete", "ban"]
+    elif layer >= 4 and _ai_mod_severe_repeat_offender(guild_id, user_id):
+        thresholds = _ai_mod_get_thresholds(strictness)
+        if risk_score >= thresholds["very_high"]:
+            actions = ["delete", "timeout", "kick"]
+    if not actions and category != "safe" and risk_score >= 0.56:
+        actions = ["warn"]
+
+    deduped: list[str] = []
+    for action in AI_MOD_ACTION_ORDER:
+        if action in actions and action in enabled_allowed:
+            deduped.append(action)
+    return deduped
+
+
+def _ai_mod_timeout_minutes(category: str, confidence_band: str) -> int:
+    if confidence_band == "extreme":
+        return 60
+    if category in {"scam_phishing", "raid_behavior"}:
+        return 30 if confidence_band in {"very_high", "extreme"} else 20
+    if confidence_band == "very_high":
+        return 20
+    if confidence_band == "high":
+        return 10
+    return 5
+
+
+async def _ai_mod_notify_action(
+    message: discord.Message,
+    *,
+    case_id: str,
+    category: str,
+    confidence_band: str,
+    action_text: str,
+) -> None:
+    notify_policy = get_guild_ai_guard_notify_policy(message.guild.id)
+    category_label = category.replace("_", "/")
+    text = (
+        f"AI Guard action: `{category_label}` | confidence `{confidence_band}` | "
+        f"case `{case_id}` | action `{action_text}`.\n"
+        f"To appeal: `{PREFIX}appeal {case_id} <reason>`."
+    )
+    if notify_policy in {"channel_only", "channel_and_dm"}:
+        try:
+            await message.channel.send(f"{message.author.mention} {text}", delete_after=20)
+        except discord.HTTPException:
+            pass
+    if notify_policy in {"dm_only", "channel_and_dm"}:
+        try:
+            await message.author.send(text)
+        except discord.HTTPException:
+            pass
+
+
+async def _ai_mod_apply_actions(
+    message: discord.Message,
+    *,
+    case_id: str,
+    category: str,
+    confidence_band: str,
+    actions: list[str],
+) -> tuple[list[str], list[str]]:
+    if not actions:
+        return [], []
+    guild = message.guild
+    member = message.author if isinstance(message.author, discord.Member) else None
+    me = guild.me
+    applied: list[str] = []
+    notes: list[str] = []
+
+    if "delete" in actions:
+        try:
+            await message.delete()
+            applied.append("delete")
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            notes.append("delete_failed")
+
+    can_moderate_member = (
+        member is not None
+        and me is not None
+        and member != guild.owner
+        and member.top_role < me.top_role
+        and not member.guild_permissions.administrator
+    )
+
+    if "timeout" in actions:
+        if me is None or not me.guild_permissions.moderate_members or not can_moderate_member:
+            notes.append("timeout_no_permission")
+        else:
+            try:
+                minutes = _ai_mod_timeout_minutes(category, confidence_band)
+                until = discord.utils.utcnow() + timedelta(minutes=minutes)
+                await member.timeout(until, reason=f"AI Guard case {case_id}: {category}")
+                applied.append("timeout")
+            except discord.HTTPException:
+                notes.append("timeout_failed")
+
+    if "kick" in actions:
+        if me is None or not me.guild_permissions.kick_members or not can_moderate_member:
+            notes.append("kick_no_permission")
+        else:
+            try:
+                await member.kick(reason=f"AI Guard case {case_id}: repeat severe behavior")
+                applied.append("kick")
+            except discord.HTTPException:
+                notes.append("kick_failed")
+
+    if "ban" in actions:
+        if me is None or not me.guild_permissions.ban_members or not can_moderate_member:
+            notes.append("ban_no_permission")
+        else:
+            try:
+                await member.ban(reason=f"AI Guard case {case_id}: raid/scam extreme confidence")
+                applied.append("ban")
+            except discord.HTTPException:
+                notes.append("ban_failed")
+
+    if "warn" in actions:
+        applied.append("warn")
+        try:
+            await message.channel.send(
+                f"{message.author.mention} Please stop. This message is flagged by AI Guard.",
+                delete_after=15,
+            )
+        except discord.HTTPException:
+            pass
+
+    return applied, notes
+
+
+async def _ai_mod_run_stage_a(
+    message: discord.Message,
+    *,
+    normalized_text: str,
+    language_profile: str,
+    corroborators: dict[str, Any],
+) -> dict[str, Any]:
+    fallback = _ai_mod_heuristic_payload(message.content, normalized_text, corroborators=corroborators)
+    prompt = (
+        "Classify this Discord message risk.\n"
+        "Return JSON only.\n"
+        f"Allowed categories: {AI_MOD_STAGE_A_CATEGORIES}\n"
+        "Keep rationale_tags concise.\n"
+        f"Language profile: {language_profile}\n"
+        f"Message: {message.clean_content[:1200]}\n"
+        f"Normalized message: {normalized_text[:900]}\n"
+        f"Corroborators: {json.dumps(corroborators)[:600]}"
+    )
+    ai_messages = [
+        {"role": "system", "content": AI_MOD_FAST_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        raw = await request_ai_completion(
+            ai_messages,
+            max_tokens=180,
+            temperature=0.15,
+            policy_key="ai_mod_fast",
+            model_override=AI_MOD_FAST_MODEL or None,
+        )
+        payload = _extract_first_json_object(raw)
+        parsed = _ai_mod_parse_llm_payload(payload, fallback)
+        parsed["raw"] = raw[:800]
+        return parsed
+    except Exception:
+        fallback["raw"] = ""
+        return fallback
+
+
+async def _ai_mod_run_stage_b(
+    message: discord.Message,
+    *,
+    normalized_text: str,
+    language_profile: str,
+    stage_a: dict[str, Any],
+    corroborators: dict[str, Any],
+) -> dict[str, Any]:
+    fallback = dict(stage_a)
+    prompt = (
+        "You are moderation judge pass.\n"
+        "Re-evaluate with higher precision and lower false positives.\n"
+        "Return JSON only.\n"
+        f"Allowed categories: {AI_MOD_STAGE_A_CATEGORIES}\n"
+        f"Language profile: {language_profile}\n"
+        f"Message: {message.clean_content[:1400]}\n"
+        f"Normalized: {normalized_text[:1000]}\n"
+        f"StageA: {json.dumps(stage_a)[:900]}\n"
+        f"Corroborators: {json.dumps(corroborators)[:700]}"
+    )
+    ai_messages = [
+        {"role": "system", "content": AI_MOD_JUDGE_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        raw = await request_ai_completion(
+            ai_messages,
+            max_tokens=260,
+            temperature=0.1,
+            policy_key="ai_mod_judge",
+            model_override=AI_MOD_JUDGE_MODEL or None,
+        )
+        payload = _extract_first_json_object(raw)
+        parsed = _ai_mod_parse_llm_payload(payload, fallback)
+        parsed["raw"] = raw[:1000]
+        return parsed
+    except Exception:
+        fallback["raw"] = ""
+        return fallback
+
+
+def _ai_mod_should_evaluate(message: discord.Message) -> bool:
+    if message.guild is None or message.author.bot:
+        return False
+    if message.content.startswith(PREFIX):
+        return False
+    if not get_guild_ai_guard_enabled(message.guild.id):
+        return False
+    if get_guild_ai_guard_layer(message.guild.id) <= 0:
+        return False
+    if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
+        return False
+    if not message.content.strip():
+        return False
+    return True
+
+
+async def maybe_run_ai_guard(message: discord.Message) -> bool:
+    if not _ai_mod_should_evaluate(message):
+        return False
+    if isinstance(message.author, discord.Member) and is_moderator(message.author):
+        return False
+
+    _ai_mod_increment_metric("evaluated")
+    guild_id = message.guild.id
+    layer = get_guild_ai_guard_layer(guild_id)
+    strictness = get_guild_ai_guard_strictness(guild_id)
+    mode, forced_shadow = _ai_mod_effective_mode(guild_id)
+    language_profile = get_guild_ai_guard_language_profile(guild_id)
+    allowed_actions = get_guild_ai_guard_allowed_actions(guild_id)
+    normalized_text, lexicon_tags = _ai_mod_normalize_hinglish(message.content)
+    corroborators = _ai_mod_register_corroborator_signals(message)
+
+    stage_a = await _ai_mod_run_stage_a(
+        message,
+        normalized_text=normalized_text,
+        language_profile=language_profile,
+        corroborators=corroborators,
+    )
+    stage_a_risk = _ai_mod_risk_score(stage_a.get("risk_score"))
+    stage_b = None
+    if stage_a_risk >= _ai_mod_stage_b_threshold(strictness):
+        stage_b = await _ai_mod_run_stage_b(
+            message,
+            normalized_text=normalized_text,
+            language_profile=language_profile,
+            stage_a=stage_a,
+            corroborators=corroborators,
+        )
+
+    final = stage_b or stage_a
+    category = _ai_mod_normalize_category(final.get("category"))
+    risk_score = _ai_mod_risk_score(final.get("risk_score"))
+    confidence_band = _ai_mod_confidence_band(risk_score)
+    rationale_tags = list(final.get("rationale_tags", []))
+    if lexicon_tags:
+        rationale_tags = [*rationale_tags, *lexicon_tags][:8]
+    suggested_action = _ai_mod_normalize_action(final.get("suggested_action"))
+    if category == "safe" and risk_score < 0.56:
+        return False
+    actions = _ai_mod_select_actions(
+        guild_id=guild_id,
+        user_id=message.author.id,
+        category=category,
+        risk_score=risk_score,
+        strictness=strictness,
+        layer=layer,
+        allowed_actions=allowed_actions,
+        corroborators=corroborators,
+    )
+    final_action = "+".join(actions) if actions else "none"
+    if mode == "shadow":
+        actions = []
+    case_id = _ai_mod_create_case(
+        message,
+        stage_a=stage_a,
+        stage_b=stage_b,
+        category=category,
+        risk_score=risk_score,
+        confidence_band=confidence_band,
+        rationale_tags=rationale_tags,
+        suggested_action=suggested_action,
+        final_action=final_action,
+        mode=mode,
+        layer=layer,
+        corroborators=corroborators,
+        normalized_text=normalized_text,
+    )
+    case = _ai_mod_case(case_id)
+    if case is None:
+        return False
+    if forced_shadow:
+        case["shadow_forced"] = True
+        case["status"] = "shadow"
+    applied_actions: list[str] = []
+    apply_notes: list[str] = []
+    if mode == "enforce" and actions:
+        applied_actions, apply_notes = await _ai_mod_apply_actions(
+            message,
+            case_id=case_id,
+            category=category,
+            confidence_band=confidence_band,
+            actions=actions,
+        )
+        if applied_actions:
+            _ai_mod_increment_metric("enforced")
+            action_key = (guild_id, message.author.id)
+            history = AI_MOD_RECENT_ACTIONS[action_key]
+            history.append(time.monotonic())
+            _ai_mod_trim_timestamps(history, 86400.0)
+
+    case["updated_ts"] = time.time()
+    case["applied_actions"] = applied_actions
+    case["apply_notes"] = apply_notes
+    case["status"] = "actioned" if applied_actions else case.get("status", "open")
+    _mark_ai_mod_dirty()
+
+    action_text = "+".join(applied_actions) if applied_actions else ("shadow_only" if mode == "shadow" else "none")
+    log_channel = message.channel.parent if isinstance(message.channel, discord.Thread) else message.channel
+    if mode == "enforce" and applied_actions:
+        await _ai_mod_notify_action(
+            message,
+            case_id=case_id,
+            category=category,
+            confidence_band=confidence_band,
+            action_text=action_text,
+        )
+        await send_mod_log(
+            message.guild,
+            "AI Guard Enforcement",
+            target=message.author,
+            moderator=bot.user,
+            reason=f"{category} ({confidence_band})",
+            channel=log_channel,
+            details=f"Case: `{case_id}` | Risk: `{risk_score:.2f}` | Actions: `{action_text}`",
+        )
+    elif mode == "shadow":
+        await send_mod_log(
+            message.guild,
+            "AI Guard Shadow Case",
+            target=message.author,
+            moderator=bot.user,
+            reason=f"{category} ({confidence_band})",
+            channel=log_channel,
+            details=f"Case: `{case_id}` | Risk: `{risk_score:.2f}` | Suggested: `{final_action}`",
+        )
+
+    # Unsafe messages should not continue to normal conversational fallback.
+    if category != "safe" and risk_score >= 0.56:
+        return True
+    return False
+
+
+async def prune_ai_mod_retention() -> None:
+    state = get_ai_mod_state()
+    now_ts = time.time()
+    cutoff = now_ts - (AI_MOD_RETENTION_DAYS * 86400)
+    changed = False
+
+    cases = state.get("cases", {})
+    if isinstance(cases, dict):
+        for case_id in list(cases.keys()):
+            case = cases.get(case_id)
+            if not isinstance(case, dict):
+                cases.pop(case_id, None)
+                changed = True
+                continue
+            created_ts = float(case.get("created_ts", 0.0) or 0.0)
+            if created_ts < cutoff:
+                cases.pop(case_id, None)
+                changed = True
+
+    appeals = state.get("appeals", {})
+    if isinstance(appeals, dict):
+        for appeal_id in list(appeals.keys()):
+            appeal = appeals.get(appeal_id)
+            if not isinstance(appeal, dict):
+                appeals.pop(appeal_id, None)
+                changed = True
+                continue
+            created_ts = float(appeal.get("created_ts", 0.0) or 0.0)
+            if created_ts < cutoff:
+                appeals.pop(appeal_id, None)
+                changed = True
+
+    review_actions = state.get("review_actions", [])
+    if isinstance(review_actions, list):
+        fresh = []
+        for row in review_actions:
+            if not isinstance(row, dict):
+                continue
+            ts = float(row.get("ts", 0.0) or 0.0)
+            if ts >= cutoff:
+                fresh.append(row)
+        if len(fresh) != len(review_actions):
+            state["review_actions"] = fresh
+            changed = True
+
+    user_risk = state.get("user_risk", {})
+    if isinstance(user_risk, dict):
+        for key in list(user_risk.keys()):
+            row = user_risk.get(key)
+            if not isinstance(row, dict):
+                user_risk.pop(key, None)
+                changed = True
+                continue
+            history = row.get("history", [])
+            if not isinstance(history, list):
+                user_risk.pop(key, None)
+                changed = True
+                continue
+            filtered = _ai_mod_trim_user_history(history, cutoff)
+            if filtered:
+                if filtered != history:
+                    row["history"] = filtered
+                    changed = True
+            else:
+                user_risk.pop(key, None)
+                changed = True
+
+    _ai_mod_case_cap_prune(state)
+    state_meta = state.setdefault("meta", {})
+    if isinstance(state_meta, dict):
+        state_meta["last_prune_ts"] = now_ts
+    if changed:
+        _mark_ai_mod_dirty()
+
+
+async def maybe_send_ai_guard_report(guild: discord.Guild) -> None:
+    if not get_guild_ai_guard_enabled(guild.id):
+        return
+    if get_guild_ai_guard_layer(guild.id) != 1:
+        return
+    report_channel_id = get_guild_ai_guard_report_channel_id(guild.id)
+    if not report_channel_id:
+        return
+    report_channel = guild.get_channel(report_channel_id)
+    if not isinstance(report_channel, discord.TextChannel):
+        return
+    interval_minutes = get_guild_ai_guard_report_interval_minutes(guild.id)
+    now_mono = time.monotonic()
+    last_ts = AI_MOD_REPORT_LAST_TS.get(guild.id, 0.0)
+    if now_mono - last_ts < interval_minutes * 60:
+        return
+
+    window_seconds = interval_minutes * 60
+    cutoff_ts = time.time() - window_seconds
+    state = get_ai_mod_state()
+    cases = state.get("cases", {})
+    total = 0
+    severe = 0
+    by_category: Counter[str] = Counter()
+    if isinstance(cases, dict):
+        for row in cases.values():
+            if not isinstance(row, dict):
+                continue
+            if int(row.get("guild_id", 0) or 0) != guild.id:
+                continue
+            created_ts = float(row.get("created_ts", 0.0) or 0.0)
+            if created_ts < cutoff_ts:
+                continue
+            total += 1
+            category = _ai_mod_normalize_category(row.get("category"))
+            by_category[category] += 1
+            if _ai_mod_risk_score(row.get("risk_score")) >= 0.86:
+                severe += 1
+    if total == 0:
+        AI_MOD_REPORT_LAST_TS[guild.id] = now_mono
+        return
+    category_text = ", ".join(f"{key}:{value}" for key, value in by_category.most_common(5))
+    mode, forced_shadow = _ai_mod_effective_mode(guild.id)
+    note = " (shadow forced by rollout window)" if forced_shadow else ""
+    message_text = (
+        f"AI Guard L1 report ({interval_minutes}m)\n"
+        f"- Total cases: `{total}`\n"
+        f"- Severe (`>=0.86`): `{severe}`\n"
+        f"- Categories: {category_text or 'n/a'}\n"
+        f"- Effective mode: `{mode}`{note}"
+    )
+    try:
+        await report_channel.send(message_text)
+        AI_MOD_REPORT_LAST_TS[guild.id] = now_mono
+    except discord.HTTPException:
+        return
+
+
+async def run_ai_mod_tick() -> None:
+    await prune_ai_mod_retention()
+    for guild in bot.guilds:
+        try:
+            await maybe_send_ai_guard_report(guild)
+        except Exception as error:
+            print(f"[AI GUARD REPORT ERROR] guild={guild.id} error={error}")
 
 
 def reload_bad_words() -> int:
     ensure_data_files()
     global BAD_WORDS
+    if not BAD_WORDS_FILE.exists():
+        BAD_WORDS = set()
+        return 0
+    try:
+        lines = BAD_WORDS_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        BAD_WORDS = set()
+        return 0
     words: set[str] = set()
-    for line in BAD_WORDS_FILE.read_text(encoding="utf-8").splitlines():
+    for line in lines:
         cleaned = line.strip().lower()
         if cleaned and not cleaned.startswith("#"):
             words.add(cleaned)
@@ -413,6 +2528,519 @@ def set_guild_automod_enabled(guild_id: int, enabled: bool) -> None:
     guild_key = str(guild_id)
     config.setdefault(guild_key, {})
     config[guild_key]["automod_enabled"] = bool(enabled)
+    save_mod_config(config)
+
+
+def get_guild_fun_mode(guild_id: int) -> str:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    raw = str(guild_config.get("fun_mode", "spicy")).strip().lower()
+    if raw not in {"spicy", "balanced", "wholesome"}:
+        return "spicy"
+    return raw
+
+
+def set_guild_fun_mode(guild_id: int, mode: str) -> None:
+    normalized = mode.strip().lower()
+    if normalized not in {"spicy", "balanced", "wholesome"}:
+        normalized = "spicy"
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["fun_mode"] = normalized
+    save_mod_config(config)
+
+
+def get_guild_engagement_limits_enabled(guild_id: int) -> bool:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    value = guild_config.get("engagement_limits_enabled")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if lowered in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return True
+
+
+def set_guild_engagement_limits_enabled(guild_id: int, enabled: bool) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["engagement_limits_enabled"] = bool(enabled)
+    save_mod_config(config)
+
+
+def get_guild_moderation_escalation_enabled(guild_id: int) -> bool:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    value = guild_config.get("moderation_escalation_enabled")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if lowered in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return True
+
+
+def set_guild_moderation_escalation_enabled(guild_id: int, enabled: bool) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["moderation_escalation_enabled"] = bool(enabled)
+    save_mod_config(config)
+
+
+def get_guild_ai_guard_enabled(guild_id: int) -> bool:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    parsed = _read_optional_bool(guild_config.get("ai_guard_enabled"))
+    if parsed is None:
+        return AI_MOD_ENABLED_DEFAULT
+    return parsed
+
+
+def set_guild_ai_guard_enabled(guild_id: int, enabled: bool) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["ai_guard_enabled"] = bool(enabled)
+    if enabled:
+        config[guild_key]["ai_guard_enabled_ts"] = time.time()
+    save_mod_config(config)
+
+
+def get_guild_ai_guard_enabled_since(guild_id: int) -> float:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    raw = guild_config.get("ai_guard_enabled_ts")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def get_guild_ai_guard_layer(guild_id: int) -> int:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    raw = guild_config.get("ai_guard_layer", 0)
+    try:
+        return max(0, min(5, int(raw)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def set_guild_ai_guard_layer(guild_id: int, layer: int) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["ai_guard_layer"] = max(0, min(5, int(layer)))
+    save_mod_config(config)
+
+
+def get_guild_ai_guard_mode(guild_id: int) -> str:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    raw = str(guild_config.get("ai_guard_mode", "shadow")).strip().lower()
+    if raw not in {"shadow", "enforce"}:
+        return "shadow"
+    return raw
+
+
+def set_guild_ai_guard_mode(guild_id: int, mode: str) -> None:
+    normalized = mode.strip().lower()
+    if normalized not in {"shadow", "enforce"}:
+        normalized = "shadow"
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["ai_guard_mode"] = normalized
+    save_mod_config(config)
+
+
+def get_guild_ai_guard_strictness(guild_id: int) -> str:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    raw = str(guild_config.get("ai_guard_strictness", "moderate_strict")).strip().lower()
+    if raw not in {"moderate", "moderate_strict", "strict"}:
+        return "moderate_strict"
+    return raw
+
+
+def set_guild_ai_guard_strictness(guild_id: int, strictness: str) -> None:
+    normalized = strictness.strip().lower()
+    if normalized not in {"moderate", "moderate_strict", "strict"}:
+        normalized = "moderate_strict"
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["ai_guard_strictness"] = normalized
+    save_mod_config(config)
+
+
+def get_guild_ai_guard_allowed_actions(guild_id: int) -> set[str]:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    raw = guild_config.get("ai_guard_allowed_actions")
+    if not isinstance(raw, list):
+        return {"warn", "delete", "timeout", "kick", "ban"}
+    allowed: set[str] = set()
+    for item in raw:
+        text = str(item).strip().lower()
+        if text in {"warn", "delete", "timeout", "kick", "ban"}:
+            allowed.add(text)
+    if not allowed:
+        return {"warn", "delete", "timeout", "kick", "ban"}
+    return allowed
+
+
+def set_guild_ai_guard_allowed_actions(guild_id: int, actions: set[str]) -> None:
+    clean = sorted(
+        action
+        for action in actions
+        if action in {"warn", "delete", "timeout", "kick", "ban"}
+    )
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["ai_guard_allowed_actions"] = clean
+    save_mod_config(config)
+
+
+def get_guild_ai_guard_report_channel_id(guild_id: int) -> int | None:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    channel_id = guild_config.get("ai_guard_report_channel_id")
+    if isinstance(channel_id, int):
+        return channel_id
+    if isinstance(channel_id, str) and channel_id.isdigit():
+        return int(channel_id)
+    return None
+
+
+def set_guild_ai_guard_report_channel_id(guild_id: int, channel_id: int | None) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    if channel_id is None:
+        config[guild_key].pop("ai_guard_report_channel_id", None)
+    else:
+        config[guild_key]["ai_guard_report_channel_id"] = int(channel_id)
+    save_mod_config(config)
+
+
+def get_guild_ai_guard_report_interval_minutes(guild_id: int) -> int:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    raw = guild_config.get("ai_guard_report_interval_minutes", 30)
+    try:
+        return max(5, min(180, int(raw)))
+    except (TypeError, ValueError):
+        return 30
+
+
+def set_guild_ai_guard_report_interval_minutes(guild_id: int, minutes: int) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["ai_guard_report_interval_minutes"] = max(5, min(180, int(minutes)))
+    save_mod_config(config)
+
+
+def get_guild_ai_guard_appeals_enabled(guild_id: int) -> bool:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    parsed = _read_optional_bool(guild_config.get("ai_guard_appeals_enabled"))
+    if parsed is None:
+        return True
+    return parsed
+
+
+def set_guild_ai_guard_appeals_enabled(guild_id: int, enabled: bool) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["ai_guard_appeals_enabled"] = bool(enabled)
+    save_mod_config(config)
+
+
+def get_guild_ai_guard_notify_policy(guild_id: int) -> str:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    raw = str(guild_config.get("ai_guard_notify_policy", "channel_and_dm")).strip().lower()
+    if raw not in {"channel_only", "dm_only", "channel_and_dm"}:
+        return "channel_and_dm"
+    return raw
+
+
+def set_guild_ai_guard_notify_policy(guild_id: int, policy: str) -> None:
+    normalized = policy.strip().lower()
+    if normalized not in {"channel_only", "dm_only", "channel_and_dm"}:
+        normalized = "channel_and_dm"
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["ai_guard_notify_policy"] = normalized
+    save_mod_config(config)
+
+
+def get_guild_ai_guard_language_profile(guild_id: int) -> str:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    raw = str(guild_config.get("ai_guard_language_profile", "en_hinglish")).strip().lower()
+    if raw not in {"en", "en_hinglish"}:
+        return "en_hinglish"
+    return raw
+
+
+def set_guild_ai_guard_language_profile(guild_id: int, profile: str) -> None:
+    normalized = profile.strip().lower()
+    if normalized not in {"en", "en_hinglish"}:
+        normalized = "en_hinglish"
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["ai_guard_language_profile"] = normalized
+    save_mod_config(config)
+
+
+def get_guild_welcome_concierge_enabled(guild_id: int) -> bool:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    value = guild_config.get("welcome_concierge_enabled")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if lowered in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return WELCOME_CONCIERGE_ENABLED
+
+
+def set_guild_welcome_concierge_enabled(guild_id: int, enabled: bool) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["welcome_concierge_enabled"] = bool(enabled)
+    save_mod_config(config)
+
+
+def get_guild_intro_channel_id(guild_id: int) -> int | None:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    channel_id = guild_config.get("intro_channel_id")
+    if isinstance(channel_id, int):
+        return channel_id
+    if isinstance(channel_id, str) and channel_id.isdigit():
+        return int(channel_id)
+    return None
+
+
+def set_guild_intro_channel_id(guild_id: int, channel_id: int | None) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    if channel_id is None:
+        config[guild_key].pop("intro_channel_id", None)
+    else:
+        config[guild_key]["intro_channel_id"] = int(channel_id)
+    save_mod_config(config)
+
+
+def _read_optional_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if lowered in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return None
+
+
+def get_guild_engagement_hub_channel_id(guild_id: int) -> int | None:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    channel_id = guild_config.get("engagement_hub_channel_id")
+    if isinstance(channel_id, int):
+        return channel_id
+    if isinstance(channel_id, str) and channel_id.isdigit():
+        return int(channel_id)
+    return None
+
+
+def set_guild_engagement_hub_channel_id(guild_id: int, channel_id: int | None) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    if channel_id is None:
+        config[guild_key].pop("engagement_hub_channel_id", None)
+    else:
+        config[guild_key]["engagement_hub_channel_id"] = int(channel_id)
+    save_mod_config(config)
+
+
+def get_guild_auto_loops_enabled(guild_id: int) -> bool:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    parsed = _read_optional_bool(guild_config.get("auto_loops_enabled"))
+    if parsed is None:
+        return AUTO_LOOPS_ENABLED
+    return parsed
+
+
+def set_guild_auto_loops_enabled(guild_id: int, enabled: bool) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["auto_loops_enabled"] = bool(enabled)
+    save_mod_config(config)
+
+
+def get_guild_engagement_timezone(guild_id: int) -> str:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    raw = str(guild_config.get("engagement_timezone", "UTC")).strip()
+    if not raw:
+        return "UTC"
+    return raw
+
+
+def set_guild_engagement_timezone(guild_id: int, tz_name: str) -> None:
+    normalized = (tz_name or "UTC").strip() or "UTC"
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["engagement_timezone"] = normalized
+    save_mod_config(config)
+
+
+def get_guild_modguard_enabled(guild_id: int) -> bool:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    parsed = _read_optional_bool(guild_config.get("modguard_enabled"))
+    if parsed is None:
+        return True
+    return parsed
+
+
+def set_guild_modguard_enabled(guild_id: int, enabled: bool) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["modguard_enabled"] = bool(enabled)
+    save_mod_config(config)
+
+
+def get_guild_quest_mode_enabled(guild_id: int) -> bool:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    parsed = _read_optional_bool(guild_config.get("quest_mode_enabled"))
+    if parsed is None:
+        return True
+    return parsed
+
+
+def set_guild_quest_mode_enabled(guild_id: int, enabled: bool) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["quest_mode_enabled"] = bool(enabled)
+    save_mod_config(config)
+
+
+def get_guild_business_enabled(guild_id: int) -> bool:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    parsed = _read_optional_bool(guild_config.get("business_enabled"))
+    if parsed is None:
+        return BUSINESS_ENABLED
+    return parsed
+
+
+def set_guild_business_enabled(guild_id: int, enabled: bool) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["business_enabled"] = bool(enabled)
+    save_mod_config(config)
+
+
+def get_guild_business_market_paused(guild_id: int) -> bool:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    parsed = _read_optional_bool(guild_config.get("business_market_paused"))
+    if parsed is None:
+        return False
+    return parsed
+
+
+def set_guild_business_market_paused(guild_id: int, paused: bool) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["business_market_paused"] = bool(paused)
+    save_mod_config(config)
+
+
+def get_guild_business_moderation_enabled(guild_id: int) -> bool:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    parsed = _read_optional_bool(guild_config.get("business_moderation_enabled"))
+    if parsed is None:
+        return True
+    return parsed
+
+
+def set_guild_business_moderation_enabled(guild_id: int, enabled: bool) -> None:
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    config[guild_key]["business_moderation_enabled"] = bool(enabled)
+    save_mod_config(config)
+
+
+def get_guild_business_tax_overrides(guild_id: int) -> dict[str, float]:
+    config = load_mod_config()
+    guild_config = config.get(str(guild_id), {})
+    raw = guild_config.get("business_tax_overrides")
+    if not isinstance(raw, dict):
+        return {}
+    parsed: dict[str, float] = {}
+    for key in ("transaction_fee_rate", "property_tax_rate", "property_maintenance_rate"):
+        try:
+            value = float(raw.get(key))
+        except (TypeError, ValueError):
+            continue
+        parsed[key] = max(0.0, value)
+    return parsed
+
+
+def set_guild_business_tax_overrides(guild_id: int, payload: dict[str, float]) -> None:
+    clean: dict[str, float] = {}
+    for key in ("transaction_fee_rate", "property_tax_rate", "property_maintenance_rate"):
+        if key not in payload:
+            continue
+        try:
+            clean[key] = max(0.0, float(payload[key]))
+        except (TypeError, ValueError):
+            continue
+    config = load_mod_config()
+    guild_key = str(guild_id)
+    config.setdefault(guild_key, {})
+    if clean:
+        config[guild_key]["business_tax_overrides"] = clean
+    else:
+        config[guild_key].pop("business_tax_overrides", None)
     save_mod_config(config)
 
 
@@ -692,6 +3320,965 @@ def is_moderator(member: discord.Member) -> bool:
     )
 
 
+def resolve_style_for_fun_mode(
+    guild_id: int, requested_style: Literal["soft", "friendly", "brutal"]
+) -> Literal["soft", "friendly", "brutal"]:
+    mode = get_guild_fun_mode(guild_id)
+    if mode == "wholesome":
+        return "friendly" if requested_style == "brutal" else "soft"
+    if mode == "balanced":
+        return "friendly" if requested_style == "brutal" else requested_style
+    return requested_style
+
+
+def _trim_time_queue(queue: deque[float], window_seconds: int) -> None:
+    now = time.monotonic()
+    while queue and now - queue[0] > window_seconds:
+        queue.popleft()
+
+
+def consume_fun_command_quota(
+    guild_id: int,
+    user_id: int,
+    channel_id: int,
+) -> tuple[bool, str | None]:
+    if not get_guild_engagement_limits_enabled(guild_id):
+        return True, None
+
+    user_key = (guild_id, user_id)
+    channel_key = (guild_id, channel_id)
+    user_queue = FUN_USER_RATE_CACHE[user_key]
+    channel_queue = FUN_CHANNEL_RATE_CACHE[channel_key]
+    _trim_time_queue(user_queue, FUN_USER_RATE_WINDOW_SECONDS)
+    _trim_time_queue(channel_queue, FUN_CHANNEL_RATE_WINDOW_SECONDS)
+
+    if len(user_queue) >= FUN_USER_RATE_MAX_CALLS:
+        return (
+            False,
+            f"Slow down a bit - max `{FUN_USER_RATE_MAX_CALLS}` fun commands per "
+            f"`{FUN_USER_RATE_WINDOW_SECONDS}s` per user.",
+        )
+    if len(channel_queue) >= FUN_CHANNEL_RATE_MAX_CALLS:
+        return (
+            False,
+            f"This channel is rate-limited for fun commands right now "
+            f"(`{FUN_CHANNEL_RATE_MAX_CALLS}` per `{FUN_CHANNEL_RATE_WINDOW_SECONDS}s`).",
+        )
+
+    now = time.monotonic()
+    user_queue.append(now)
+    channel_queue.append(now)
+    return True, None
+
+
+async def enforce_fun_rate_limit_ctx(ctx: commands.Context) -> bool:
+    if ctx.guild is None:
+        return True
+    allowed, error_text = consume_fun_command_quota(ctx.guild.id, ctx.author.id, ctx.channel.id)
+    if allowed:
+        return True
+    try:
+        await ctx.send(error_text, delete_after=5)
+    except discord.HTTPException:
+        pass
+    return False
+
+
+async def enforce_fun_rate_limit_message(message: discord.Message) -> bool:
+    if message.guild is None:
+        return True
+    allowed, error_text = consume_fun_command_quota(
+        message.guild.id, message.author.id, message.channel.id
+    )
+    if allowed:
+        return True
+    try:
+        await message.channel.send(error_text, delete_after=5)
+    except discord.HTTPException:
+        pass
+    return False
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _safe_zoneinfo(tz_name: str | None) -> ZoneInfo:
+    if not tz_name:
+        return ZoneInfo("UTC")
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
+
+
+def _guild_now(guild_id: int) -> datetime:
+    tz_name = get_guild_engagement_timezone(guild_id)
+    return _utc_now().astimezone(_safe_zoneinfo(tz_name))
+
+
+def _guild_day_key(guild_id: int) -> str:
+    return _guild_now(guild_id).strftime("%Y-%m-%d")
+
+
+def _guild_week_key(guild_id: int) -> str:
+    now = _guild_now(guild_id)
+    return f"{now.isocalendar().year}-W{now.isocalendar().week:02d}"
+
+
+def _default_user_engagement_state() -> dict[str, object]:
+    return {
+        "xp": 0,
+        "streak": 0,
+        "best_streak": 0,
+        "last_active_ts": 0.0,
+        "daily": {"day": "", "xp": 0},
+        "weekly": {"key": "", "points": 0},
+        "quest": {"day": "", "progress": {}, "completed": []},
+        "event_points": 0,
+    }
+
+
+def load_engagement_state() -> None:
+    global ENGAGEMENT_STATE, ENGAGEMENT_STATE_DIRTY
+    payload = read_json(ENGAGEMENT_STATE_FILE)
+    if not payload:
+        payload = {"guilds": {}}
+    if not isinstance(payload, dict):
+        payload = {"guilds": {}}
+    guilds = payload.get("guilds")
+    if not isinstance(guilds, dict):
+        guilds = {}
+    ENGAGEMENT_STATE = {"guilds": guilds}
+    ENGAGEMENT_STATE_DIRTY = False
+
+
+def _mark_engagement_dirty() -> None:
+    global ENGAGEMENT_STATE_DIRTY
+    ENGAGEMENT_STATE_DIRTY = True
+
+
+async def flush_engagement_state(force: bool = False) -> None:
+    global ENGAGEMENT_STATE_DIRTY
+    if not force and not ENGAGEMENT_STATE_DIRTY:
+        return
+    async with ENGAGEMENT_STATE_LOCK:
+        if not force and not ENGAGEMENT_STATE_DIRTY:
+            return
+        try:
+            persisted = write_json(ENGAGEMENT_STATE_FILE, ENGAGEMENT_STATE)
+            if persisted:
+                ENGAGEMENT_STATE_DIRTY = False
+        except Exception:
+            pass
+
+
+def _default_aicrush_state() -> dict[str, Any]:
+    return {"schema_version": 1, "guilds": {}}
+
+
+def _sanitize_aicrush_state(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    guilds = payload.get("guilds")
+    if not isinstance(guilds, dict):
+        guilds = {}
+    sanitized: dict[str, Any] = {"schema_version": 1, "guilds": {}}
+    for guild_key, raw_guild in guilds.items():
+        if not isinstance(raw_guild, dict):
+            continue
+        clean_guild = {
+            "channels": raw_guild.get("channels", {}) if isinstance(raw_guild.get("channels"), dict) else {},
+            "users": raw_guild.get("users", {}) if isinstance(raw_guild.get("users"), dict) else {},
+            "edges": raw_guild.get("edges", {}) if isinstance(raw_guild.get("edges"), dict) else {},
+            "meta": raw_guild.get("meta", {}) if isinstance(raw_guild.get("meta"), dict) else {},
+        }
+        sanitized["guilds"][str(guild_key)] = clean_guild
+    return sanitized
+
+
+def load_aicrush_state() -> None:
+    global AICRUSH_STATE, AICRUSH_STATE_DIRTY
+    payload = read_json(AICRUSH_STATE_FILE)
+    if not payload:
+        payload = _default_aicrush_state()
+    AICRUSH_STATE = _sanitize_aicrush_state(payload)
+    AICRUSH_STATE_DIRTY = False
+
+
+def get_aicrush_state() -> dict[str, Any]:
+    global AICRUSH_STATE
+    if not AICRUSH_STATE:
+        AICRUSH_STATE = _default_aicrush_state()
+        _mark_aicrush_dirty()
+    AICRUSH_STATE = _sanitize_aicrush_state(AICRUSH_STATE)
+    return AICRUSH_STATE
+
+
+def _mark_aicrush_dirty() -> None:
+    global AICRUSH_STATE_DIRTY
+    AICRUSH_STATE_DIRTY = True
+
+
+async def flush_aicrush_state(force: bool = False) -> None:
+    global AICRUSH_STATE_DIRTY
+    if not force and not AICRUSH_STATE_DIRTY:
+        return
+    async with AICRUSH_STATE_LOCK:
+        if not force and not AICRUSH_STATE_DIRTY:
+            return
+        try:
+            persisted = write_json(AICRUSH_STATE_FILE, AICRUSH_STATE)
+            if persisted:
+                AICRUSH_STATE_DIRTY = False
+        except Exception:
+            pass
+
+
+def get_guild_aicrush_state(guild_id: int) -> dict[str, Any]:
+    state = get_aicrush_state()
+    guilds = state.setdefault("guilds", {})
+    if not isinstance(guilds, dict):
+        guilds = {}
+        state["guilds"] = guilds
+    key = str(guild_id)
+    guild_state = guilds.get(key)
+    if not isinstance(guild_state, dict):
+        guild_state = {"channels": {}, "users": {}, "edges": {}, "meta": {}}
+        guilds[key] = guild_state
+        _mark_aicrush_dirty()
+    for field in ("channels", "users", "edges", "meta"):
+        if not isinstance(guild_state.get(field), dict):
+            guild_state[field] = {}
+    meta = guild_state["meta"]
+    meta.setdefault("messages_indexed", 0)
+    meta.setdefault("last_backfill_ts", 0.0)
+    meta.setdefault("last_incremental_ts", 0.0)
+    meta.setdefault("last_indexed_message_ts", 0.0)
+    return guild_state
+
+
+def _default_altfinder_state() -> dict[str, Any]:
+    return {"schema_version": 1, "guilds": {}}
+
+
+def _sanitize_altfinder_suspects(raw: Any) -> dict[str, list[int]]:
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, list[int]] = {}
+    for key, value in raw.items():
+        if not isinstance(value, list):
+            continue
+        suspect_ids: list[int] = []
+        for item in value:
+            try:
+                suspect_id = int(item)
+            except (TypeError, ValueError):
+                continue
+            if suspect_id not in suspect_ids:
+                suspect_ids.append(suspect_id)
+            if len(suspect_ids) >= ALTFINDER_MAX_SUSPECTS:
+                break
+        if suspect_ids:
+            cleaned[str(key)] = suspect_ids
+    return cleaned
+
+
+def _sanitize_altfinder_state(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    guilds = payload.get("guilds")
+    if not isinstance(guilds, dict):
+        guilds = {}
+    sanitized: dict[str, Any] = {"schema_version": 1, "guilds": {}}
+    for guild_key, raw_guild in guilds.items():
+        if not isinstance(raw_guild, dict):
+            continue
+        clean_guild = {
+            "channels": raw_guild.get("channels", {}) if isinstance(raw_guild.get("channels"), dict) else {},
+            "users": raw_guild.get("users", {}) if isinstance(raw_guild.get("users"), dict) else {},
+            "meta": raw_guild.get("meta", {}) if isinstance(raw_guild.get("meta"), dict) else {},
+            "suspects": _sanitize_altfinder_suspects(raw_guild.get("suspects", {})),
+        }
+        sanitized["guilds"][str(guild_key)] = clean_guild
+    return sanitized
+
+
+def load_altfinder_state() -> None:
+    global ALTFINDER_STATE, ALTFINDER_STATE_DIRTY
+    payload = read_json(ALTFINDER_STATE_FILE)
+    if not payload:
+        payload = _default_altfinder_state()
+    ALTFINDER_STATE = _sanitize_altfinder_state(payload)
+    ALTFINDER_STATE_DIRTY = False
+
+
+def get_altfinder_state() -> dict[str, Any]:
+    global ALTFINDER_STATE
+    if not ALTFINDER_STATE:
+        ALTFINDER_STATE = _default_altfinder_state()
+        _mark_altfinder_dirty()
+    ALTFINDER_STATE = _sanitize_altfinder_state(ALTFINDER_STATE)
+    return ALTFINDER_STATE
+
+
+def _mark_altfinder_dirty() -> None:
+    global ALTFINDER_STATE_DIRTY
+    ALTFINDER_STATE_DIRTY = True
+
+
+async def flush_altfinder_state(force: bool = False) -> None:
+    global ALTFINDER_STATE_DIRTY
+    if not force and not ALTFINDER_STATE_DIRTY:
+        return
+    async with ALTFINDER_STATE_LOCK:
+        if not force and not ALTFINDER_STATE_DIRTY:
+            return
+        try:
+            persisted = write_json(ALTFINDER_STATE_FILE, ALTFINDER_STATE)
+            if persisted:
+                ALTFINDER_STATE_DIRTY = False
+        except Exception:
+            pass
+
+
+def get_guild_altfinder_state(guild_id: int) -> dict[str, Any]:
+    state = get_altfinder_state()
+    guilds = state.setdefault("guilds", {})
+    if not isinstance(guilds, dict):
+        guilds = {}
+        state["guilds"] = guilds
+    key = str(guild_id)
+    guild_state = guilds.get(key)
+    if not isinstance(guild_state, dict):
+        guild_state = {"channels": {}, "users": {}, "meta": {}, "suspects": {}}
+        guilds[key] = guild_state
+        _mark_altfinder_dirty()
+    for field in ("channels", "users", "meta", "suspects"):
+        if not isinstance(guild_state.get(field), dict):
+            guild_state[field] = {}
+    meta = guild_state["meta"]
+    meta.setdefault("messages_indexed", 0)
+    meta.setdefault("last_backfill_ts", 0.0)
+    meta.setdefault("last_incremental_ts", 0.0)
+    meta.setdefault("last_indexed_message_ts", 0.0)
+    return guild_state
+
+
+def get_altfinder_suspects(guild_id: int, target_user_id: int) -> list[int]:
+    guild_state = get_guild_altfinder_state(guild_id)
+    suspects = guild_state.get("suspects", {})
+    if not isinstance(suspects, dict):
+        return []
+    raw = suspects.get(str(target_user_id), [])
+    if not isinstance(raw, list):
+        return []
+    output: list[int] = []
+    for item in raw:
+        try:
+            suspect_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if suspect_id not in output:
+            output.append(suspect_id)
+        if len(output) >= ALTFINDER_MAX_SUSPECTS:
+            break
+    return output
+
+
+def set_altfinder_suspects(guild_id: int, target_user_id: int, suspect_ids: list[int]) -> None:
+    guild_state = get_guild_altfinder_state(guild_id)
+    suspects = guild_state.setdefault("suspects", {})
+    cleaned: list[int] = []
+    for suspect_id in suspect_ids:
+        if suspect_id == target_user_id or suspect_id in cleaned:
+            continue
+        cleaned.append(int(suspect_id))
+        if len(cleaned) >= ALTFINDER_MAX_SUSPECTS:
+            break
+    if cleaned:
+        suspects[str(target_user_id)] = cleaned
+    else:
+        suspects.pop(str(target_user_id), None)
+    _mark_altfinder_dirty()
+    _altfinder_invalidate_guild_cache(guild_id)
+
+
+def clear_altfinder_suspects(guild_id: int, target_user_id: int) -> None:
+    guild_state = get_guild_altfinder_state(guild_id)
+    suspects = guild_state.setdefault("suspects", {})
+    suspects.pop(str(target_user_id), None)
+    _mark_altfinder_dirty()
+    _altfinder_invalidate_guild_cache(guild_id)
+
+
+def _default_socialintel_state() -> dict[str, Any]:
+    return {"schema_version": 1, "guilds": {}}
+
+
+def _sanitize_socialintel_state(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    guilds = payload.get("guilds")
+    if not isinstance(guilds, dict):
+        guilds = {}
+    sanitized: dict[str, Any] = {"schema_version": 1, "guilds": {}}
+    for guild_key, raw_guild in guilds.items():
+        if not isinstance(raw_guild, dict):
+            continue
+        clean_guild = {
+            "channels": raw_guild.get("channels", {}) if isinstance(raw_guild.get("channels"), dict) else {},
+            "users": raw_guild.get("users", {}) if isinstance(raw_guild.get("users"), dict) else {},
+            "pairs": raw_guild.get("pairs", {}) if isinstance(raw_guild.get("pairs"), dict) else {},
+            "meta": raw_guild.get("meta", {}) if isinstance(raw_guild.get("meta"), dict) else {},
+        }
+        sanitized["guilds"][str(guild_key)] = clean_guild
+    return sanitized
+
+
+def load_socialintel_state() -> None:
+    global SOCIALINTEL_STATE, SOCIALINTEL_STATE_DIRTY
+    payload = read_json(SOCIALINTEL_STATE_FILE)
+    if not payload:
+        payload = _default_socialintel_state()
+    SOCIALINTEL_STATE = _sanitize_socialintel_state(payload)
+    SOCIALINTEL_STATE_DIRTY = False
+
+
+def get_socialintel_state() -> dict[str, Any]:
+    global SOCIALINTEL_STATE
+    if not SOCIALINTEL_STATE:
+        SOCIALINTEL_STATE = _default_socialintel_state()
+        _mark_socialintel_dirty()
+    SOCIALINTEL_STATE = _sanitize_socialintel_state(SOCIALINTEL_STATE)
+    return SOCIALINTEL_STATE
+
+
+def _mark_socialintel_dirty() -> None:
+    global SOCIALINTEL_STATE_DIRTY
+    SOCIALINTEL_STATE_DIRTY = True
+
+
+async def flush_socialintel_state(force: bool = False) -> None:
+    global SOCIALINTEL_STATE_DIRTY
+    if not force and not SOCIALINTEL_STATE_DIRTY:
+        return
+    async with SOCIALINTEL_STATE_LOCK:
+        if not force and not SOCIALINTEL_STATE_DIRTY:
+            return
+        try:
+            persisted = write_json(SOCIALINTEL_STATE_FILE, SOCIALINTEL_STATE)
+            if persisted:
+                SOCIALINTEL_STATE_DIRTY = False
+        except Exception:
+            pass
+
+
+def get_guild_socialintel_state(guild_id: int) -> dict[str, Any]:
+    state = get_socialintel_state()
+    guilds = state.setdefault("guilds", {})
+    if not isinstance(guilds, dict):
+        guilds = {}
+        state["guilds"] = guilds
+    key = str(guild_id)
+    guild_state = guilds.get(key)
+    if not isinstance(guild_state, dict):
+        guild_state = {"channels": {}, "users": {}, "pairs": {}, "meta": {}}
+        guilds[key] = guild_state
+        _mark_socialintel_dirty()
+    for field in ("channels", "users", "pairs", "meta"):
+        if not isinstance(guild_state.get(field), dict):
+            guild_state[field] = {}
+    meta = guild_state["meta"]
+    meta.setdefault("messages_indexed", 0)
+    meta.setdefault("last_backfill_ts", 0.0)
+    meta.setdefault("last_incremental_ts", 0.0)
+    meta.setdefault("last_indexed_message_ts", 0.0)
+    meta.setdefault("last_proactive_ts", 0.0)
+    return guild_state
+
+
+def get_guild_engagement_state(guild_id: int) -> dict[str, object]:
+    guilds = ENGAGEMENT_STATE.setdefault("guilds", {})
+    if not isinstance(guilds, dict):
+        guilds = {}
+        ENGAGEMENT_STATE["guilds"] = guilds
+    key = str(guild_id)
+    state = guilds.get(key)
+    if not isinstance(state, dict):
+        state = {"users": {}, "automation": {}}
+        guilds[key] = state
+        _mark_engagement_dirty()
+    state.setdefault("users", {})
+    state.setdefault("automation", {})
+    return state
+
+
+def get_user_engagement_state(guild_id: int, user_id: int) -> dict[str, object]:
+    guild_state = get_guild_engagement_state(guild_id)
+    users = guild_state.setdefault("users", {})
+    if not isinstance(users, dict):
+        users = {}
+        guild_state["users"] = users
+    key = str(user_id)
+    state = users.get(key)
+    if not isinstance(state, dict):
+        state = _default_user_engagement_state()
+        users[key] = state
+        _mark_engagement_dirty()
+    for field, default_value in _default_user_engagement_state().items():
+        if field not in state:
+            state[field] = default_value
+    return state
+
+
+def _pick_daily_quests(guild_id: int, day_key: str) -> list[dict[str, object]]:
+    pool = list(QUEST_LIBRARY)
+    if not pool:
+        return []
+    rng = random.Random(f"{guild_id}:{day_key}:quests")
+    desired = min(len(pool), max(1, QUEST_DAILY_COUNT))
+    return rng.sample(pool, desired)
+
+
+def get_user_daily_quests(guild_id: int, user_state: dict[str, object]) -> tuple[list[dict[str, object]], dict[str, int], set[str]]:
+    day_key = _guild_day_key(guild_id)
+    quest_state = user_state.get("quest")
+    if not isinstance(quest_state, dict):
+        quest_state = {"day": "", "progress": {}, "completed": []}
+        user_state["quest"] = quest_state
+    if quest_state.get("day") != day_key:
+        quest_state["day"] = day_key
+        quest_state["progress"] = {}
+        quest_state["completed"] = []
+        _mark_engagement_dirty()
+    progress_raw = quest_state.get("progress")
+    if not isinstance(progress_raw, dict):
+        progress_raw = {}
+        quest_state["progress"] = progress_raw
+    completed_raw = quest_state.get("completed")
+    if isinstance(completed_raw, list):
+        completed = {str(item) for item in completed_raw}
+    else:
+        completed = set()
+        quest_state["completed"] = []
+    progress: dict[str, int] = {}
+    for key, value in progress_raw.items():
+        try:
+            progress[str(key)] = max(0, int(value))
+        except (TypeError, ValueError):
+            continue
+    return _pick_daily_quests(guild_id, day_key), progress, completed
+
+
+def _update_streak(user_state: dict[str, object], guild_id: int, now_ts: float) -> None:
+    previous = float(user_state.get("last_active_ts", 0.0) or 0.0)
+    previous_day = ""
+    if previous > 0:
+        previous_day = datetime.fromtimestamp(previous, tz=timezone.utc).astimezone(
+            _safe_zoneinfo(get_guild_engagement_timezone(guild_id))
+        ).strftime("%Y-%m-%d")
+    current_day = _guild_day_key(guild_id)
+    streak = int(user_state.get("streak", 0))
+    if not previous_day:
+        streak = 1
+    elif previous_day != current_day:
+        delta_hours = max(0.0, (now_ts - previous) / 3600.0)
+        if delta_hours <= STREAK_GRACE_HOURS:
+            streak = max(1, streak + 1)
+        else:
+            streak = 1
+    user_state["streak"] = streak
+    user_state["best_streak"] = max(int(user_state.get("best_streak", 0)), streak)
+    user_state["last_active_ts"] = now_ts
+
+
+def grant_user_xp(
+    guild_id: int,
+    user_id: int,
+    xp_gain: int,
+    *,
+    apply_daily_cap: bool = True,
+    include_weekly: bool = True,
+) -> int:
+    if xp_gain <= 0:
+        return 0
+    user_state = get_user_engagement_state(guild_id, user_id)
+    day_key = _guild_day_key(guild_id)
+    daily = user_state.get("daily")
+    if not isinstance(daily, dict):
+        daily = {"day": day_key, "xp": 0}
+        user_state["daily"] = daily
+    if daily.get("day") != day_key:
+        daily["day"] = day_key
+        daily["xp"] = 0
+
+    gain = int(xp_gain)
+    if apply_daily_cap:
+        remaining = max(0, XP_DAILY_CAP - int(daily.get("xp", 0)))
+        gain = min(gain, remaining)
+    if gain <= 0:
+        return 0
+
+    user_state["xp"] = int(user_state.get("xp", 0)) + gain
+    daily["xp"] = int(daily.get("xp", 0)) + gain
+    if include_weekly:
+        weekly = user_state.get("weekly")
+        if not isinstance(weekly, dict):
+            weekly = {"key": "", "points": 0}
+            user_state["weekly"] = weekly
+        week_key = _guild_week_key(guild_id)
+        if weekly.get("key") != week_key:
+            weekly["key"] = week_key
+            weekly["points"] = 0
+        weekly["points"] = int(weekly.get("points", 0)) + gain
+    _mark_engagement_dirty()
+    return gain
+
+
+def _normalize_content_for_xp(text: str) -> str:
+    return " ".join(text.lower().split()).strip()
+
+
+def _quest_progress_for_message(message: discord.Message, content: str) -> dict[str, int]:
+    return {
+        "messages": 1,
+        "replies": 1 if message.reference is not None else 0,
+        "mentions": len([m for m in message.mentions if not m.bot]),
+        "threads": 1 if isinstance(message.channel, discord.Thread) else 0,
+        "long_msgs": 1 if len(content) >= 80 else 0,
+    }
+
+
+def apply_message_engagement_progress(message: discord.Message) -> tuple[int, int]:
+    if not ENGAGEMENT_ENABLED or message.guild is None:
+        return 0, 0
+    if not isinstance(message.author, discord.Member) or message.author.bot:
+        return 0, 0
+
+    content = message.clean_content.strip()
+    if not content or len(content) < XP_MIN_MESSAGE_CHARS:
+        return 0, 0
+    if message.content.startswith(PREFIX):
+        return 0, 0
+
+    key = (message.guild.id, message.author.id)
+    now_mono = time.monotonic()
+    normalized = _normalize_content_for_xp(content)
+    last = ENGAGEMENT_LAST_MESSAGE_CACHE.get(key)
+    if last is not None:
+        last_ts, last_content = last
+        if now_mono - last_ts < XP_MESSAGE_COOLDOWN_SECONDS:
+            return 0, 0
+        if normalized == last_content and now_mono - last_ts < XP_MESSAGE_COOLDOWN_SECONDS * 3:
+            return 0, 0
+    ENGAGEMENT_LAST_MESSAGE_CACHE[key] = (now_mono, normalized)
+
+    user_state = get_user_engagement_state(message.guild.id, message.author.id)
+    _update_streak(user_state, message.guild.id, time.time())
+
+    base_xp = 10
+    bonus = 0
+    if message.reference is not None:
+        bonus += 2
+    if isinstance(message.channel, discord.Thread):
+        bonus += 2
+    if message.mentions:
+        bonus += min(2, len([m for m in message.mentions if not m.bot]))
+    total_gain = base_xp + bonus
+
+    quest_bonus = 0
+    if get_guild_quest_mode_enabled(message.guild.id):
+        quests, progress, completed = get_user_daily_quests(message.guild.id, user_state)
+        delta = _quest_progress_for_message(message, content)
+        for metric, increment in delta.items():
+            if increment <= 0:
+                continue
+            progress[metric] = int(progress.get(metric, 0)) + increment
+        for quest in quests:
+            quest_id = str(quest.get("id", ""))
+            metric = str(quest.get("type", ""))
+            target = int(quest.get("target", 1))
+            reward = int(quest.get("reward", 0))
+            if not quest_id or metric not in progress:
+                continue
+            if quest_id in completed:
+                continue
+            if progress.get(metric, 0) >= target:
+                completed.add(quest_id)
+                quest_bonus += max(0, reward)
+        quest_state = user_state.setdefault("quest", {"day": _guild_day_key(message.guild.id), "progress": {}, "completed": []})
+        if isinstance(quest_state, dict):
+            quest_state["progress"] = progress
+            quest_state["completed"] = sorted(completed)
+            quest_state["day"] = _guild_day_key(message.guild.id)
+            _mark_engagement_dirty()
+
+    gained = grant_user_xp(
+        message.guild.id,
+        message.author.id,
+        total_gain + quest_bonus,
+        apply_daily_cap=True,
+        include_weekly=True,
+    )
+    return gained, quest_bonus
+
+
+def get_metric_for_user(
+    user_state: dict[str, object],
+    board: str,
+    *,
+    day_key: str,
+    week_key: str,
+) -> int:
+    normalized = board.strip().lower()
+    if normalized == "daily":
+        daily = user_state.get("daily", {})
+        if isinstance(daily, dict) and daily.get("day") == day_key:
+            return int(daily.get("xp", 0))
+        return 0
+    if normalized == "weekly":
+        weekly = user_state.get("weekly", {})
+        if isinstance(weekly, dict) and weekly.get("key") == week_key:
+            return int(weekly.get("points", 0))
+        return 0
+    return int(user_state.get("xp", 0))
+
+
+def resolve_engagement_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    me = guild.me
+    if me is None:
+        return None
+    configured = get_guild_engagement_hub_channel_id(guild.id)
+    if configured:
+        channel = guild.get_channel(configured)
+        if isinstance(channel, discord.TextChannel):
+            perms = channel.permissions_for(me)
+            if perms.view_channel and perms.send_messages:
+                return channel
+    for channel in guild.text_channels:
+        perms = channel.permissions_for(me)
+        if perms.view_channel and perms.send_messages:
+            return channel
+    return None
+
+
+def _trim_post_history(guild_id: int) -> None:
+    queue = AUTO_LOOP_POST_HISTORY[guild_id]
+    now = time.monotonic()
+    while queue and now - queue[0] > 3600:
+        queue.popleft()
+
+
+def can_send_automation_post(guild_id: int) -> bool:
+    _trim_post_history(guild_id)
+    queue = AUTO_LOOP_POST_HISTORY[guild_id]
+    if len(queue) >= AUTO_LOOP_MAX_POSTS_PER_HOUR:
+        return False
+    queue.append(time.monotonic())
+    return True
+
+
+def _build_recap_from_window(entries: list[WindowMessage]) -> str:
+    if not entries:
+        return "No major chat activity in the recent window."
+    participants: Counter[str] = Counter(entry.author_display_name for entry in entries)
+    words: list[str] = []
+    for entry in entries:
+        for token in WORD_PATTERN.findall(entry.content.lower()):
+            cleaned = token.strip("'")
+            if len(cleaned) <= 2 or cleaned in ROAST_STOP_WORDS:
+                continue
+            words.append(cleaned)
+    top_people = ", ".join(name for name, _ in participants.most_common(3)) or "n/a"
+    top_topics = ", ".join(word for word, _ in Counter(words).most_common(4)) or "general chat"
+    return (
+        f"- Active members: {top_people}\n"
+        f"- Main topics: {top_topics}\n"
+        "- Re-entry prompt: jump in with one opinion or one question."
+    )
+
+
+def _event_type_prompt(event_type: str) -> tuple[str, set[str]]:
+    normalized = event_type.strip().lower()
+    if normalized == "trivia":
+        picked = random.choice(TRIVIA_PACK)
+        return str(picked["prompt"]), set(picked["answers"])
+    if normalized == "hottake":
+        topic = random.choice(HOTTAKE_TOPICS)
+        return f"Hot-take round: **{topic}**\nDrop your stance in one sharp line.", set()
+    if normalized == "caption":
+        return random.choice(CAPTION_PROMPTS), set()
+    raise ValueError("Unsupported event type.")
+
+
+async def finalize_event_session(guild: discord.Guild, *, reason: str = "timer") -> None:
+    session = EVENT_SESSIONS.pop(guild.id, None)
+    if not session:
+        return
+    channel = guild.get_channel(int(session.get("channel_id", 0)))
+    if not isinstance(channel, discord.TextChannel):
+        return
+    scores_raw = session.get("scores")
+    if not isinstance(scores_raw, dict) or not scores_raw:
+        await channel.send("Event ended. Not enough participation this round.")
+        return
+    scored = sorted(
+        ((int(user_id), int(points)) for user_id, points in scores_raw.items()),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    winner_id, winner_score = scored[0]
+    winner = guild.get_member(winner_id)
+
+    awarded_lines: list[str] = []
+    for user_id, points in scored[:12]:
+        bonus = min(40, max(4, points * 4))
+        granted = grant_user_xp(guild.id, user_id, bonus, apply_daily_cap=True, include_weekly=True)
+        if granted > 0:
+            state = get_user_engagement_state(guild.id, user_id)
+            state["event_points"] = int(state.get("event_points", 0)) + granted
+            _mark_engagement_dirty()
+            awarded_lines.append(f"<@{user_id}> +`{granted}` XP")
+
+    winner_text = winner.mention if winner else f"<@{winner_id}>"
+    scoreboard = "\n".join(f"{idx}. <@{uid}> - `{pts}` pts" for idx, (uid, pts) in enumerate(scored[:5], start=1))
+    await channel.send(
+        f"Event ended ({reason}). Winner: {winner_text} with `{winner_score}` points.\n"
+        f"Top scores:\n{scoreboard}\n\n"
+        f"XP awards:\n{chr(10).join(awarded_lines) if awarded_lines else 'No XP awarded (daily cap reached).'}"
+    )
+    await flush_engagement_state()
+
+
+def register_automod_strike(guild_id: int, user_id: int) -> tuple[int, int, bool]:
+    strikes = AUTOMOD_STRIKE_CACHE[(guild_id, user_id)]
+    _trim_time_queue(strikes, STRIKE_DECAY_DAYS * 24 * 60 * 60)
+    strikes.append(time.monotonic())
+    strike_count = len(strikes)
+    if strike_count <= 1:
+        return strike_count, 0, False
+    if strike_count == 2:
+        return strike_count, 2, False
+    if strike_count == 3:
+        return strike_count, 10, False
+    if strike_count == 4:
+        return strike_count, 30, True
+    return strike_count, 60, True
+
+
+def _heat_weight_for_action(action: str) -> float:
+    lowered = action.lower()
+    if "spam" in lowered:
+        return 0.45
+    if "blocked word" in lowered:
+        return 0.35
+    if "blocked link" in lowered:
+        return 0.26
+    return 0.22
+
+
+def _channel_heat_score(guild_id: int, channel_id: int) -> float:
+    queue = CHANNEL_HEAT_EVENTS[(guild_id, channel_id)]
+    now = time.monotonic()
+    while queue and now - queue[0][0] > 12 * 60:
+        queue.popleft()
+    if not queue:
+        return 0.0
+    score = 0.0
+    for ts, weight in queue:
+        age = now - ts
+        if age <= 0:
+            score += weight
+            continue
+        decay = max(0.0, 1.0 - (age / (12 * 60)))
+        score += weight * decay
+    return score
+
+
+async def apply_channel_heat_event(
+    channel: discord.TextChannel,
+    *,
+    action: str,
+    moderator: discord.abc.User | None = None,
+) -> None:
+    guild = channel.guild
+    if not get_guild_modguard_enabled(guild.id):
+        return
+    key = (guild.id, channel.id)
+    queue = CHANNEL_HEAT_EVENTS[key]
+    queue.append((time.monotonic(), _heat_weight_for_action(action)))
+    score = _channel_heat_score(guild.id, channel.id)
+    if score < MOD_HEAT_THRESHOLD:
+        return
+
+    existing = CHANNEL_HEAT_SLOWMODE_STATE.get(key)
+    now = time.monotonic()
+    if existing and now < float(existing.get("until", 0.0)):
+        return
+
+    old_delay = channel.slowmode_delay
+    target_delay = max(old_delay, MOD_HEAT_SLOWMODE_SECONDS)
+    if target_delay <= old_delay and old_delay > 0:
+        CHANNEL_HEAT_SLOWMODE_STATE[key] = {
+            "until": now + 10 * 60,
+            "old_delay": float(old_delay),
+        }
+        return
+
+    try:
+        await channel.edit(
+            slowmode_delay=target_delay,
+            reason=f"ModGuard heat protection ({score:.2f})",
+        )
+    except discord.HTTPException:
+        return
+
+    CHANNEL_HEAT_SLOWMODE_STATE[key] = {
+        "until": now + 10 * 60,
+        "old_delay": float(old_delay),
+    }
+    try:
+        await channel.send(
+            f"ModGuard: temporary slowmode `{target_delay}s` enabled due to channel heat.",
+            delete_after=8,
+        )
+    except discord.HTTPException:
+        pass
+    await send_mod_log(
+        guild,
+        "ModGuard: Heat Slowmode",
+        moderator=moderator or bot.user,
+        channel=channel,
+        details=f"Score: `{score:.2f}`, delay: `{target_delay}s`.",
+    )
+
+
+async def release_expired_heat_slowmodes() -> None:
+    now = time.monotonic()
+    for (guild_id, channel_id), state in list(CHANNEL_HEAT_SLOWMODE_STATE.items()):
+        until = float(state.get("until", 0.0))
+        if now < until:
+            continue
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            CHANNEL_HEAT_SLOWMODE_STATE.pop((guild_id, channel_id), None)
+            continue
+        channel = guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            CHANNEL_HEAT_SLOWMODE_STATE.pop((guild_id, channel_id), None)
+            continue
+        old_delay = int(state.get("old_delay", 0.0))
+        try:
+            await channel.edit(
+                slowmode_delay=max(0, old_delay),
+                reason="ModGuard heat cooldown expired",
+            )
+        except discord.HTTPException:
+            pass
+        CHANNEL_HEAT_SLOWMODE_STATE.pop((guild_id, channel_id), None)
+
+
 MALE_ROLE_HINTS = {
     "male",
     "man",
@@ -766,8 +4353,8 @@ def role_gender_hint(role: discord.Role, guild_id: int) -> str | None:
     role_name_raw = role.name.lower().strip()
     role_name = normalize_role_name_for_gender(role.name)
 
-    female_symbols = ("♀", "🚺", "👧", "👩", "🩷", "🎀", "💖")
-    male_symbols = ("♂", "🚹", "👦", "👨", "💙")
+    female_symbols = ("â™€", "ðŸšº", "ðŸ‘§", "ðŸ‘©", "ðŸ©·", "ðŸŽ€", "ðŸ’–")
+    male_symbols = ("â™‚", "ðŸš¹", "ðŸ‘¦", "ðŸ‘¨", "ðŸ’™")
 
     if any(sym in role_name_raw for sym in female_symbols):
         return "female"
@@ -835,6 +4422,209 @@ def lines_to_paragraph(lines: list[str], max_chars: int) -> str:
 
 
 @dataclass
+class WindowMessage:
+    message_id: int
+    channel_id: int
+    author_id: int
+    author_display_name: str
+    content: str
+    created_at_ts: float
+    mention_ids: tuple[int, ...]
+    reference_message_id: int | None
+    has_attachments: bool
+
+
+def prune_message_window_cache() -> None:
+    if len(MESSAGE_WINDOW_CACHE) <= MESSAGE_WINDOW_CACHE_MAX_ENTRIES:
+        return
+    ordered = sorted(MESSAGE_WINDOW_CACHE.items(), key=lambda item: item[1][0], reverse=True)
+    keep = dict(ordered[:MESSAGE_WINDOW_CACHE_MAX_ENTRIES])
+    MESSAGE_WINDOW_CACHE.clear()
+    MESSAGE_WINDOW_CACHE.update(keep)
+    for key in list(MESSAGE_WINDOW_LOCKS.keys()):
+        if key not in MESSAGE_WINDOW_CACHE:
+            MESSAGE_WINDOW_LOCKS.pop(key, None)
+
+
+def _window_cutoff_bucket(after) -> int:
+    if after is None:
+        return 0
+    try:
+        return int(after.timestamp() // 60)
+    except Exception:
+        return 0
+
+
+def _build_window_entry(
+    message: discord.Message,
+    *,
+    include_attachment_marker: bool,
+) -> WindowMessage | None:
+    if message.author.bot:
+        return None
+    content = message.clean_content.strip()
+    if not content and include_attachment_marker and message.attachments:
+        content = "[Attachment]"
+    if not content:
+        return None
+    cleaned = " ".join(content.split()).strip()
+    if not cleaned:
+        return None
+    mention_ids = tuple(mentioned.id for mentioned in message.mentions if not mentioned.bot)
+    return WindowMessage(
+        message_id=message.id,
+        channel_id=message.channel.id,
+        author_id=message.author.id,
+        author_display_name=message.author.display_name,
+        content=cleaned[:360],
+        created_at_ts=message.created_at.timestamp(),
+        mention_ids=mention_ids,
+        reference_message_id=message.reference.message_id if message.reference else None,
+        has_attachments=bool(message.attachments),
+    )
+
+
+async def _get_cached_window(
+    cache_key: tuple,
+    cache_ttl_seconds: int,
+    loader,
+) -> list[WindowMessage]:
+    now = time.monotonic()
+    cached = MESSAGE_WINDOW_CACHE.get(cache_key)
+    if cached and now - cached[0] < cache_ttl_seconds:
+        return cached[1]
+
+    lock = MESSAGE_WINDOW_LOCKS[cache_key]
+    async with lock:
+        cached = MESSAGE_WINDOW_CACHE.get(cache_key)
+        if cached and time.monotonic() - cached[0] < cache_ttl_seconds:
+            return cached[1]
+        result = await loader()
+        MESSAGE_WINDOW_CACHE[cache_key] = (time.monotonic(), result)
+        prune_message_window_cache()
+        return result
+
+
+def get_readable_text_channels(guild: discord.Guild) -> list[discord.TextChannel]:
+    me = guild.me
+    if me is None:
+        return []
+    return [
+        channel
+        for channel in guild.text_channels
+        if channel.permissions_for(me).view_channel and channel.permissions_for(me).read_message_history
+    ]
+
+
+async def get_channel_window_cached(
+    channel: discord.TextChannel,
+    *,
+    after=None,
+    scan_limit: int = CATCHUP_SCAN_LIMIT,
+    cache_ttl_seconds: int = CATCHUP_CACHE_SECONDS,
+    include_attachment_marker: bool = True,
+) -> list[WindowMessage]:
+    limit = max(40, scan_limit)
+    cache_key = (
+        "channel_window",
+        channel.guild.id,
+        channel.id,
+        limit,
+        _window_cutoff_bucket(after),
+        int(include_attachment_marker),
+    )
+
+    async def loader() -> list[WindowMessage]:
+        entries: list[WindowMessage] = []
+        try:
+            async for msg in channel.history(limit=limit, after=after, oldest_first=True):
+                entry = _build_window_entry(msg, include_attachment_marker=include_attachment_marker)
+                if entry is not None:
+                    entries.append(entry)
+        except (discord.Forbidden, discord.HTTPException):
+            return []
+        return entries
+
+    return await _get_cached_window(cache_key, cache_ttl_seconds, loader)
+
+
+async def get_guild_window_cached(
+    guild: discord.Guild,
+    *,
+    full_history_scan: bool,
+    scan_per_channel: int,
+    max_history_messages: int,
+    pause_every: int,
+    pause_seconds: float,
+    after=None,
+    max_channels: int = 0,
+    cache_ttl_seconds: int = 120,
+) -> list[WindowMessage]:
+    channels = get_readable_text_channels(guild)
+    if max_channels > 0:
+        channels = channels[:max_channels]
+    channel_signature = tuple(channel.id for channel in channels[:80])
+    cache_key = (
+        "guild_window",
+        guild.id,
+        int(full_history_scan),
+        max(20, scan_per_channel),
+        max(200, max_history_messages),
+        _window_cutoff_bucket(after),
+        max_channels,
+        channel_signature,
+    )
+
+    async def loader() -> list[WindowMessage]:
+        entries: list[WindowMessage] = []
+        scanned = 0
+        for channel in channels:
+            if scanned >= max_history_messages:
+                break
+            history_limit = None if full_history_scan else max(20, scan_per_channel)
+            try:
+                async for msg in channel.history(limit=history_limit, after=after, oldest_first=True):
+                    entry = _build_window_entry(msg, include_attachment_marker=True)
+                    scanned += 1
+                    if (
+                        pause_every > 0
+                        and pause_seconds > 0
+                        and scanned % pause_every == 0
+                    ):
+                        await asyncio.sleep(pause_seconds)
+                    if scanned >= max_history_messages:
+                        break
+                    if entry is None:
+                        continue
+                    entries.append(entry)
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+        entries.sort(key=lambda item: item.created_at_ts)
+        return entries
+
+    return await _get_cached_window(cache_key, cache_ttl_seconds, loader)
+
+
+async def get_social_message_window(guild: discord.Guild) -> list[WindowMessage]:
+    shared_full_history = AICRUSH_FULL_HISTORY_SCAN or ROAST_FULL_HISTORY_SCAN
+    shared_scan_per_channel = max(AICRUSH_SCAN_PER_CHANNEL, ROAST_SCAN_PER_CHANNEL)
+    shared_max_history = max(AICRUSH_MAX_HISTORY_MESSAGES, ROAST_MAX_HISTORY_MESSAGES)
+    shared_pause_every = max(ROAST_SCAN_PAUSE_EVERY, AICRUSH_SCAN_PAUSE_EVERY)
+    shared_pause_seconds = max(ROAST_SCAN_PAUSE_SECONDS, AICRUSH_SCAN_PAUSE_SECONDS)
+    shared_max_channels = max(AICRUSH_MAX_CHANNELS, ROAST_MAX_CHANNELS)
+    return await get_guild_window_cached(
+        guild,
+        full_history_scan=shared_full_history,
+        scan_per_channel=shared_scan_per_channel,
+        max_history_messages=shared_max_history,
+        pause_every=shared_pause_every,
+        pause_seconds=shared_pause_seconds,
+        max_channels=shared_max_channels,
+        cache_ttl_seconds=min(AICRUSH_CACHE_SECONDS, ROAST_CACHE_SECONDS, 180),
+    )
+
+
+@dataclass
 class RoastContext:
     message_count: int
     replies_count: int
@@ -847,6 +4637,8 @@ class RoastContext:
     question_ratio: float
     exclaim_ratio: float
     emoji_per_msg: float
+    punctuation_energy: float
+    vocab_diversity: float
 
 
 ROAST_STOP_WORDS = {
@@ -918,22 +4710,51 @@ def roast_behavior_labels(context: RoastContext) -> list[str]:
     return labels[:5]
 
 
+def roast_fingerprint(context: RoastContext) -> str:
+    return (
+        f"punc={context.punctuation_energy:.2f}|emoji={context.emoji_per_msg:.2f}|"
+        f"vocab={context.vocab_diversity:.2f}|words={','.join(context.top_words[:4])}|"
+        f"phrases={','.join(context.top_phrases[:3])}|reply={roast_reply_tone(context.reply_lines)}"
+    )
+
+
+def get_recent_roast_outputs(guild_id: int, user_id: int, style: str) -> list[str]:
+    key = (guild_id, user_id, style)
+    queue = ROAST_RECENT_OUTPUTS.get(key, deque())
+    if not queue:
+        return []
+    cutoff = time.monotonic() - (ROAST_REPEAT_COOLDOWN_HOURS * 3600)
+    while queue and queue[0][0] < cutoff:
+        queue.popleft()
+    if not queue:
+        ROAST_RECENT_OUTPUTS.pop(key, None)
+        return []
+    ROAST_RECENT_OUTPUTS[key] = queue
+    return [item[1] for item in queue]
+
+
+def remember_roast_output(guild_id: int, user_id: int, style: str, output: str) -> None:
+    key = (guild_id, user_id, style)
+    queue = ROAST_RECENT_OUTPUTS[key]
+    queue.append((time.monotonic(), output.strip()))
+
+
+def roast_engagement_cta(fun_mode: str) -> str:
+    if fun_mode == "wholesome":
+        return "Reply with a playful comeback and keep it friendly."
+    if fun_mode == "balanced":
+        return "Drop a witty comeback and let the thread decide the winner."
+    return "Your turn: clap back with one savage line."
+
+
 async def collect_roast_context(guild: discord.Guild, target_user_id: int) -> RoastContext:
-    me = guild.me
-    if me is None:
-        return RoastContext(0, 0, 0, [], [], [], [], 0.0, 0.0, 0.0, 0.0)
-
-    channels = [
-        channel
-        for channel in guild.text_channels
-        if channel.permissions_for(me).view_channel and channel.permissions_for(me).read_message_history
-    ]
-    if ROAST_MAX_CHANNELS > 0:
-        channels = channels[:ROAST_MAX_CHANNELS]
-
+    entries = await get_social_message_window(guild)
+    if not entries:
+        return RoastContext(0, 0, 0, [], [], [], [], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    recent_entries = entries[-ROAST_MAX_HISTORY_MESSAGES:]
     user_lines: list[str] = []
     reply_lines: list[str] = []
-    scanned_messages = 0
+    scanned_messages = len(recent_entries)
     message_count = 0
     replies_count = 0
     user_chars = 0
@@ -942,70 +4763,44 @@ async def collect_roast_context(guild: discord.Guild, target_user_id: int) -> Ro
     question_messages = 0
     exclaim_messages = 0
     emoji_count = 0
+    vocab_tokens: list[str] = []
     user_budget = int(ROAST_MAX_CONTEXT_CHARS * 0.72)
     reply_budget = ROAST_MAX_CONTEXT_CHARS - user_budget
-
-    for channel in channels:
-        if scanned_messages >= ROAST_MAX_HISTORY_MESSAGES:
-            break
-
-        if ROAST_FULL_HISTORY_SCAN:
-            history_kwargs: dict[str, object] = {"limit": None, "oldest_first": True}
-        else:
-            history_kwargs = {"limit": ROAST_SCAN_PER_CHANNEL, "oldest_first": True}
-
-        target_message_ids: set[int] = set()
-        try:
-            async for msg in channel.history(**history_kwargs):
-                scanned_messages += 1
-                if (
-                    ROAST_SCAN_PAUSE_EVERY > 0
-                    and ROAST_SCAN_PAUSE_SECONDS > 0
-                    and scanned_messages % ROAST_SCAN_PAUSE_EVERY == 0
-                ):
-                    await asyncio.sleep(ROAST_SCAN_PAUSE_SECONDS)
-                if scanned_messages >= ROAST_MAX_HISTORY_MESSAGES:
-                    break
-
-                if msg.author.bot:
-                    continue
-                content = msg.clean_content.strip()
-                if not content:
-                    continue
-                cleaned = " ".join(content.split()).strip()[:320]
-                if not cleaned:
-                    continue
-
-                if msg.author.id == target_user_id:
-                    target_message_ids.add(msg.id)
-                    message_count += 1
-                    total_len += len(cleaned)
-                    if "?" in cleaned:
-                        question_messages += 1
-                    if "!" in cleaned:
-                        exclaim_messages += 1
-                    emoji_count += len(EMOJI_PATTERN.findall(cleaned))
-                    user_chars = append_with_char_budget(
-                        user_lines, cleaned, user_chars, user_budget
-                    )
-                    continue
-
-                is_reply_to_target = False
-                if msg.reference and msg.reference.message_id in target_message_ids:
-                    is_reply_to_target = True
-                elif any(mentioned.id == target_user_id for mentioned in msg.mentions):
-                    is_reply_to_target = True
-
-                if is_reply_to_target:
-                    replies_count += 1
-                    reply_chars = append_with_char_budget(
-                        reply_lines, cleaned, reply_chars, reply_budget
-                    )
-        except (discord.Forbidden, discord.HTTPException):
+    target_message_ids: set[int] = set()
+    for entry in recent_entries:
+        cleaned = entry.content[:320]
+        if entry.author_id == target_user_id:
+            target_message_ids.add(entry.message_id)
+            message_count += 1
+            total_len += len(cleaned)
+            if "?" in cleaned:
+                question_messages += 1
+            if "!" in cleaned:
+                exclaim_messages += 1
+            emoji_count += len(EMOJI_PATTERN.findall(cleaned))
+            user_chars = append_with_char_budget(
+                user_lines, cleaned, user_chars, user_budget
+            )
+            for token in WORD_PATTERN.findall(cleaned.lower()):
+                stripped = token.strip("'")
+                if len(stripped) > 2 and stripped not in ROAST_STOP_WORDS:
+                    vocab_tokens.append(stripped)
             continue
+
+        is_reply_to_target = (
+            (entry.reference_message_id is not None and entry.reference_message_id in target_message_ids)
+            or (target_user_id in entry.mention_ids)
+        )
+        if is_reply_to_target:
+            replies_count += 1
+            reply_chars = append_with_char_budget(
+                reply_lines, cleaned, reply_chars, reply_budget
+            )
 
     top_words, top_phrases = extract_roast_term_stats(user_lines)
     divisor = max(1, message_count)
+    punctuation_energy = (question_messages + exclaim_messages) / divisor
+    vocab_diversity = len(set(vocab_tokens)) / max(1, len(vocab_tokens))
     return RoastContext(
         message_count=message_count,
         replies_count=replies_count,
@@ -1018,21 +4813,35 @@ async def collect_roast_context(guild: discord.Guild, target_user_id: int) -> Ro
         question_ratio=question_messages / divisor,
         exclaim_ratio=exclaim_messages / divisor,
         emoji_per_msg=emoji_count / divisor,
+        punctuation_energy=punctuation_energy,
+        vocab_diversity=vocab_diversity,
     )
 
 
 def build_personal_roast_prompt(
-    member: discord.Member, style: Literal["soft", "friendly", "brutal"], context: RoastContext
+    member: discord.Member,
+    style: Literal["soft", "friendly", "brutal"],
+    context: RoastContext,
+    *,
+    recent_outputs: list[str] | None = None,
 ) -> str:
     style_instruction = {
-        "soft": "Keep it gentle and light teasing only.",
-        "friendly": "Use medium spice with witty jabs and playful tone.",
-        "brutal": "Use high-intensity roast energy, but remain policy-safe and non-hateful.",
+        "soft": "Tone template: playful, affectionate teasing, no harsh humiliation.",
+        "friendly": "Tone template: witty medium-spice jabs with social banter energy.",
+        "brutal": "Tone template: high spice and savage punchlines, but still policy-safe and non-hateful.",
     }[style]
     behavior_bits = ", ".join(roast_behavior_labels(context)) or "general chat presence"
     top_words = ", ".join(context.top_words[:6]) or "none"
     top_phrases = ", ".join(context.top_phrases[:5]) or "none"
     reply_tone = roast_reply_tone(context.reply_lines)
+    anti_repeat = ""
+    if recent_outputs:
+        compact = [line[:120] for line in recent_outputs[-3:]]
+        anti_repeat = (
+            "8) Avoid repeating these prior roast structures/themes:\n"
+            + "\n".join(f"- {line}" for line in compact)
+            + "\n"
+        )
 
     return (
         f"Create a {style} personal roast for a Discord member.\n"
@@ -1043,7 +4852,8 @@ def build_personal_roast_prompt(
         "4) Keep it playful and fun-only.\n"
         f"5) {style_instruction}\n"
         "6) Output exactly 5-9 short roast lines.\n"
-        "7) Final line must start with `Closer:` and end positively.\n\n"
+        "7) Final line must start with `Closer:` and end positively.\n"
+        f"{anti_repeat}\n"
         f"Target username: {member.name}\n"
         f"Target display name: {member.display_name}\n"
         f"Message count analyzed: {context.message_count}\n"
@@ -1052,6 +4862,8 @@ def build_personal_roast_prompt(
         f"Question ratio: {context.question_ratio * 100:.0f}%\n"
         f"Exclaim ratio: {context.exclaim_ratio * 100:.0f}%\n"
         f"Emoji per message: {context.emoji_per_msg:.2f}\n"
+        f"Punctuation energy: {context.punctuation_energy:.2f}\n"
+        f"Vocabulary diversity: {context.vocab_diversity:.2f}\n"
         f"Dominant behavior labels: {behavior_bits}\n"
         f"Frequent words: {top_words}\n"
         f"Frequent phrase patterns: {top_phrases}\n"
@@ -1104,129 +4916,4864 @@ def generate_personal_roast_local(
     return "\n".join(lines[:9])
 
 
-async def collect_aicrush_interactions(
-    guild: discord.Guild, target_user_id: int
-) -> tuple[int, Counter[int], list[str], dict[int, list[str]]]:
-    me = guild.me
-    if me is None:
-        return 0, Counter(), [], {}
+WELCOME_INTEREST_HINTS: dict[str, set[str]] = {
+    "gaming": {"game", "gaming", "fps", "moba", "valorant", "minecraft", "fortnite", "steam"},
+    "coding": {"code", "coding", "dev", "developer", "python", "js", "ai", "programming"},
+    "anime": {"anime", "manga", "otaku"},
+    "music": {"music", "song", "songs", "playlist", "spotify"},
+    "movies": {"movie", "movies", "film", "films", "series", "shows"},
+    "memes": {"meme", "memes", "funny", "shitpost"},
+    "study": {"study", "studies", "exam", "school", "college", "notes", "productivity"},
+    "sports": {"sport", "sports", "football", "cricket", "nba", "gym", "fitness"},
+}
 
-    channels = [
-        ch
-        for ch in guild.text_channels
-        if ch.permissions_for(me).view_channel and ch.permissions_for(me).read_message_history
-    ]
+
+def parse_interest_tokens(text: str) -> list[str]:
+    cleaned = " ".join(text.lower().split())[:WELCOME_INTEREST_MAX_CHARS]
+    tokens = [tok.strip("'") for tok in WORD_PATTERN.findall(cleaned)]
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if len(token) < 3 or token in seen:
+            continue
+        seen.add(token)
+        ordered.append(token)
+        if len(ordered) >= 14:
+            break
+    return ordered
+
+
+def find_intro_channel_for_guild(guild: discord.Guild) -> discord.TextChannel | None:
+    configured_id = get_guild_intro_channel_id(guild.id)
+    if configured_id:
+        channel = guild.get_channel(configured_id)
+        if isinstance(channel, discord.TextChannel):
+            return channel
+
+    preferred = (
+        "introductions",
+        "introduction",
+        "introduce-yourself",
+        "intro",
+        "welcome",
+        "general",
+    )
+    for name_hint in preferred:
+        for channel in guild.text_channels:
+            if name_hint in channel.name.lower():
+                return channel
+    return guild.text_channels[0] if guild.text_channels else None
+
+
+def recommend_channels_for_member(
+    guild: discord.Guild,
+    member: discord.Member,
+    interest_tokens: list[str],
+    limit: int,
+    *,
+    exclude_channel_ids: set[int] | None = None,
+) -> list[discord.TextChannel]:
+    exclude = exclude_channel_ids or set()
+    normalized_interests = set(interest_tokens)
+    inferred_topics: set[str] = set()
+    for topic, hints in WELCOME_INTEREST_HINTS.items():
+        if normalized_interests.intersection(hints):
+            inferred_topics.add(topic)
+
+    scored: list[tuple[int, discord.TextChannel]] = []
+    for channel in guild.text_channels:
+        if channel.id in exclude:
+            continue
+        perms = channel.permissions_for(member)
+        if not perms.view_channel:
+            continue
+        if channel.is_nsfw():
+            continue
+
+        blob = f"{channel.name} {(channel.topic or '')}".lower()
+        score = 0
+        if any(keyword in channel.name.lower() for keyword in ("intro", "welcome", "general", "chat")):
+            score += 1
+        for token in normalized_interests:
+            if token in blob:
+                score += 3
+        for topic in inferred_topics:
+            if topic in blob:
+                score += 2
+        if score > 0:
+            scored.append((score, channel))
+
+    if not scored:
+        fallback = []
+        for channel in guild.text_channels:
+            perms = channel.permissions_for(member)
+            if not perms.view_channel or channel.is_nsfw() or channel.id in exclude:
+                continue
+            fallback.append(channel)
+            if len(fallback) >= limit:
+                break
+        return fallback
+
+    scored.sort(key=lambda item: (-item[0], item[1].position, item[1].name))
+    return [channel for _, channel in scored[:limit]]
+
+
+def _welcome_ttl_seconds() -> int:
+    return max(300, WELCOME_DM_TIMEOUT_MINUTES * 60)
+
+
+def prune_welcome_sessions() -> None:
+    now = time.monotonic()
+    ttl = _welcome_ttl_seconds()
+    for key, session in list(WELCOME_ONBOARDING_SESSIONS.items()):
+        last = float(session.get("last_activity", 0.0))
+        if now - last > ttl:
+            WELCOME_ONBOARDING_SESSIONS.pop(key, None)
+
+
+def start_welcome_session(guild_id: int, user_id: int) -> dict[str, object]:
+    key = (guild_id, user_id)
+    now = time.monotonic()
+    payload: dict[str, object] = {
+        "started_at": now,
+        "last_activity": now,
+        "step": "awaiting_interests",
+        "interest_tokens": [],
+        "sent_channel_ids": [],
+    }
+    WELCOME_ONBOARDING_SESSIONS[key] = payload
+    return payload
+
+
+def get_latest_welcome_session_for_user(user_id: int) -> tuple[tuple[int, int], dict[str, object]] | None:
+    prune_welcome_sessions()
+    latest_key: tuple[int, int] | None = None
+    latest_session: dict[str, object] | None = None
+    latest_ts = -1.0
+    for key, session in WELCOME_ONBOARDING_SESSIONS.items():
+        if key[1] != user_id:
+            continue
+        last = float(session.get("last_activity", 0.0))
+        if last > latest_ts:
+            latest_ts = last
+            latest_key = key
+            latest_session = session
+    if latest_key is None or latest_session is None:
+        return None
+    return latest_key, latest_session
+
+
+async def send_welcome_concierge(member: discord.Member) -> None:
+    if member.bot:
+        return
+    if not get_guild_welcome_concierge_enabled(member.guild.id):
+        return
+
+    session = start_welcome_session(member.guild.id, member.id)
+    intro_channel = find_intro_channel_for_guild(member.guild)
+    starter_channels = recommend_channels_for_member(
+        member.guild, member, [], WELCOME_RECOMMENDATION_COUNT
+    )
+    session["sent_channel_ids"] = [channel.id for channel in starter_channels]
+
+    interest_examples = "gaming, coding, anime, movies, memes, music, study, sports"
+    channel_lines = "\n".join(f"- {channel.mention}" for channel in starter_channels[:4]) or "- (No channel suggestions yet)"
+    intro_line = (
+        f"First action: say hi in {intro_channel.mention}."
+        if intro_channel is not None
+        else "First action: introduce yourself in your server's intro/general channel."
+    )
+
+    text = (
+        f"Hey {member.display_name}, welcome to **{member.guild.name}**.\n"
+        "I can quickly onboard you so you find your people faster.\n\n"
+        f"Reply with your interests (comma-separated), for example: `{interest_examples}`.\n"
+        "You can also reply `skip` for general recommendations.\n\n"
+        f"Starter channels:\n{channel_lines}\n"
+        f"{intro_line}"
+    )
+
+    try:
+        await member.send(text)
+    except discord.HTTPException:
+        WELCOME_ONBOARDING_SESSIONS.pop((member.guild.id, member.id), None)
+
+
+async def handle_welcome_concierge_dm(message: discord.Message) -> bool:
+    if message.guild is not None or message.author.bot:
+        return False
+    if message.content.startswith(PREFIX):
+        return False
+
+    found = get_latest_welcome_session_for_user(message.author.id)
+    if found is None:
+        return False
+    key, session = found
+    guild = bot.get_guild(key[0])
+    if guild is None:
+        WELCOME_ONBOARDING_SESSIONS.pop(key, None)
+        return False
+
+    member = guild.get_member(message.author.id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(message.author.id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            WELCOME_ONBOARDING_SESSIONS.pop(key, None)
+            return False
+
+    content = " ".join(message.content.split()).strip()
+    lowered = content.lower()
+    if lowered in {"stop", "cancel", "end"}:
+        WELCOME_ONBOARDING_SESSIONS.pop(key, None)
+        await message.channel.send("Welcome setup closed. Ping me anytime if you want recommendations.")
+        return True
+
+    if not content:
+        await message.channel.send("Send a few interests like `gaming, anime, coding` or type `skip`.")
+        return True
+
+    interest_tokens = [] if lowered == "skip" else parse_interest_tokens(content)
+    if not interest_tokens and lowered != "skip":
+        await message.channel.send("I couldn't read interests from that. Try 2-5 keywords or type `skip`.")
+        return True
+
+    sent_ids = set(int(ch_id) for ch_id in session.get("sent_channel_ids", []))
+    recommendations = recommend_channels_for_member(
+        guild,
+        member,
+        interest_tokens,
+        WELCOME_RECOMMENDATION_COUNT,
+        exclude_channel_ids=sent_ids,
+    )
+    if not recommendations:
+        recommendations = recommend_channels_for_member(
+            guild,
+            member,
+            [],
+            WELCOME_RECOMMENDATION_COUNT,
+        )
+
+    intro_channel = find_intro_channel_for_guild(guild)
+    tags = ", ".join(interest_tokens[:7]) if interest_tokens else "general community chats"
+    channel_lines = "\n".join(f"- {channel.mention}" for channel in recommendations[:WELCOME_RECOMMENDATION_COUNT])
+    if not channel_lines:
+        channel_lines = "- No tailored channel matches yet; start in general and I'll refine later."
+    intro_line = (
+        f"First action: introduce yourself in {intro_channel.mention}."
+        if intro_channel is not None
+        else "First action: introduce yourself in the server intro/general channel."
+    )
+
+    response = (
+        f"Perfect â€” I mapped your interests to **{tags}**.\n\n"
+        f"Best channels for you in **{guild.name}**:\n{channel_lines}\n\n"
+        f"{intro_line}\n"
+        "Tip: use `&catchup 24` in a channel anytime to catch up quickly."
+    )
+    await message.channel.send(response)
+
+    session["last_activity"] = time.monotonic()
+    session["step"] = "completed"
+    WELCOME_ONBOARDING_SESSIONS.pop(key, None)
+    return True
+
+
+# AICrush implementation lives below. It maintains a persisted directed-affinity
+# index and ranks both likely crushes and likely admirers from that graph.
+
+
+AICRUSH_ALIAS_STOP_WORDS = {
+    "the", "and", "for", "with", "that", "this", "from", "just", "have", "your", "you",
+    "are", "was", "were", "they", "them", "their", "his", "her", "bro", "sis", "king",
+    "queen", "admin", "mod", "staff", "team", "general", "chat", "hello", "hi", "hey",
+    "bell", "user", "member", "server", "discord", "real", "name", "nickname",
+}
+
+
+def normalize_aicrush_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", (text or "").lower())
+    without_marks = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", without_marks)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def aicrush_tokenize(text: str) -> list[str]:
+    normalized = normalize_aicrush_text(text)
+    return [token for token in normalized.split() if token]
+
+
+def _aicrush_is_valid_alias_token(token: str) -> bool:
+    if len(token) < 3 or token.isdigit():
+        return False
+    return token not in AICRUSH_ALIAS_STOP_WORDS
+
+
+def _build_member_aicrush_aliases(member: discord.Member) -> dict[str, list[str]]:
+    phrases: set[str] = set()
+    tokens: set[str] = set()
+    raw_names = [member.display_name, member.name]
+    for raw_name in raw_names:
+        normalized = normalize_aicrush_text(raw_name)
+        if not normalized:
+            continue
+        if len(normalized) >= 3 and normalized not in AICRUSH_ALIAS_STOP_WORDS:
+            phrases.add(normalized)
+        parts = [part for part in normalized.split() if _aicrush_is_valid_alias_token(part)]
+        tokens.update(parts)
+        if len(parts) >= 2:
+            merged = "".join(parts)
+            if len(merged) >= 4 and merged not in AICRUSH_ALIAS_STOP_WORDS:
+                phrases.add(merged)
+    return {"phrases": sorted(phrases), "tokens": sorted(tokens)}
+
+
+def get_guild_aicrush_alias_index(guild: discord.Guild) -> dict[str, Any]:
+    cached = AICRUSH_ALIAS_CACHE.get(guild.id)
+    now = time.monotonic()
+    if cached and now - cached[0] < 900:
+        return cached[1]
+
+    token_map: dict[str, set[int]] = defaultdict(set)
+    phrase_map: dict[str, set[int]] = defaultdict(set)
+    member_aliases: dict[int, dict[str, list[str]]] = {}
+    for member in guild.members:
+        if member.bot:
+            continue
+        aliases = _build_member_aicrush_aliases(member)
+        member_aliases[member.id] = aliases
+        for token in aliases["tokens"]:
+            token_map[token].add(member.id)
+        for phrase in aliases["phrases"]:
+            phrase_map[phrase].add(member.id)
+
+    index = {
+        "token_map": {token: sorted(ids) for token, ids in token_map.items()},
+        "phrase_map": {phrase: sorted(ids) for phrase, ids in phrase_map.items()},
+        "member_aliases": member_aliases,
+    }
+    AICRUSH_ALIAS_CACHE[guild.id] = (now, index)
+    return index
+
+
+def _aicrush_trim_counter_map(counter_map: dict[str, Any], limit: int) -> dict[str, Any]:
+    if len(counter_map) <= limit:
+        return counter_map
+    ordered = sorted(
+        counter_map.items(),
+        key=lambda item: float(item[1] or 0),
+        reverse=True,
+    )[:limit]
+    return {str(key): value for key, value in ordered}
+
+
+def _aicrush_append_unique_sample(bucket: list[str], text: str, limit: int) -> None:
+    cleaned = " ".join(text.split()).strip()[:180]
+    if not cleaned or cleaned in bucket:
+        return
+    bucket.append(cleaned)
+    if len(bucket) > limit:
+        del bucket[:-limit]
+
+
+def _aicrush_remember_message_author(message_id: int, author_id: int, created_ts: float) -> None:
+    AICRUSH_MESSAGE_AUTHOR_CACHE[message_id] = (author_id, created_ts)
+    while len(AICRUSH_MESSAGE_AUTHOR_CACHE) > 24000:
+        oldest_key = next(iter(AICRUSH_MESSAGE_AUTHOR_CACHE))
+        AICRUSH_MESSAGE_AUTHOR_CACHE.pop(oldest_key, None)
+
+
+def _aicrush_resolve_reply_target_id(message: discord.Message) -> int | None:
+    if message.reference is None or message.reference.message_id is None:
+        return None
+    resolved = getattr(message.reference, "resolved", None)
+    if isinstance(resolved, discord.Message) and not resolved.author.bot:
+        return int(resolved.author.id)
+    cached = AICRUSH_MESSAGE_AUTHOR_CACHE.get(int(message.reference.message_id))
+    if cached is not None:
+        return int(cached[0])
+    return None
+
+
+def _aicrush_get_user_row(guild_state: dict[str, Any], member: discord.Member) -> dict[str, Any]:
+    users = guild_state.setdefault("users", {})
+    key = str(member.id)
+    row = users.get(key)
+    if not isinstance(row, dict):
+        row = {
+            "display_name": member.display_name,
+            "username": member.name,
+            "message_count": 0,
+            "last_message_ts": 0.0,
+            "topics": {},
+            "samples": [],
+            "aliases": {},
+        }
+        users[key] = row
+    row["display_name"] = member.display_name
+    row["username"] = member.name
+    if not isinstance(row.get("topics"), dict):
+        row["topics"] = {}
+    if not isinstance(row.get("samples"), list):
+        row["samples"] = []
+    row["aliases"] = _build_member_aicrush_aliases(member)
+    return row
+
+
+def _aicrush_update_user_profile(
+    guild_state: dict[str, Any],
+    member: discord.Member,
+    content: str,
+    created_ts: float,
+) -> None:
+    row = _aicrush_get_user_row(guild_state, member)
+    row["message_count"] = int(row.get("message_count", 0) or 0) + 1
+    row["last_message_ts"] = max(float(row.get("last_message_ts", 0.0) or 0.0), created_ts)
+    topics = row.get("topics", {})
+    if not isinstance(topics, dict):
+        topics = {}
+        row["topics"] = topics
+    for token in aicrush_tokenize(content)[:18]:
+        if not _aicrush_is_valid_alias_token(token):
+            continue
+        topics[token] = int(topics.get(token, 0) or 0) + 1
+    row["topics"] = _aicrush_trim_counter_map(topics, 32)
+    samples = row.get("samples", [])
+    if not isinstance(samples, list):
+        samples = []
+        row["samples"] = samples
+    _aicrush_append_unique_sample(samples, content, 10)
+
+
+def _aicrush_get_edge_row(
+    guild_state: dict[str, Any], source_id: int, target_id: int
+) -> dict[str, Any]:
+    edges = guild_state.setdefault("edges", {})
+    source_key = str(source_id)
+    source_edges = edges.get(source_key)
+    if not isinstance(source_edges, dict):
+        source_edges = {}
+        edges[source_key] = source_edges
+    target_key = str(target_id)
+    row = source_edges.get(target_key)
+    if not isinstance(row, dict):
+        row = {
+            "score": 0.0,
+            "mention_count": 0,
+            "reply_count": 0,
+            "name_hit_score": 0.0,
+            "copresence_score": 0.0,
+            "touch_count": 0,
+            "last_ts": 0.0,
+            "channels": {},
+            "samples": [],
+        }
+        source_edges[target_key] = row
+    if not isinstance(row.get("channels"), dict):
+        row["channels"] = {}
+    if not isinstance(row.get("samples"), list):
+        row["samples"] = []
+    return row
+
+
+def _aicrush_update_edge(
+    guild_state: dict[str, Any],
+    source_id: int,
+    target_id: int,
+    *,
+    score: float,
+    kind: str,
+    created_ts: float,
+    channel_id: int,
+    sample_text: str,
+) -> None:
+    if source_id == target_id or score <= 0:
+        return
+    row = _aicrush_get_edge_row(guild_state, source_id, target_id)
+    row["score"] = round(float(row.get("score", 0.0) or 0.0) + score, 4)
+    row["touch_count"] = int(row.get("touch_count", 0) or 0) + 1
+    row["last_ts"] = max(float(row.get("last_ts", 0.0) or 0.0), created_ts)
+    channels = row.get("channels", {})
+    channel_key = str(channel_id)
+    channels[channel_key] = int(channels.get(channel_key, 0) or 0) + 1
+    row["channels"] = _aicrush_trim_counter_map(channels, 8)
+    if kind == "mention":
+        row["mention_count"] = int(row.get("mention_count", 0) or 0) + 1
+    elif kind == "reply":
+        row["reply_count"] = int(row.get("reply_count", 0) or 0) + 1
+    elif kind == "name_hit":
+        row["name_hit_score"] = round(float(row.get("name_hit_score", 0.0) or 0.0) + score, 4)
+    elif kind == "copresence":
+        row["copresence_score"] = round(float(row.get("copresence_score", 0.0) or 0.0) + score, 4)
+    samples = row.get("samples", [])
+    if not isinstance(samples, list):
+        samples = []
+        row["samples"] = samples
+    _aicrush_append_unique_sample(samples, sample_text, 6)
+
+
+def _aicrush_extract_name_hit_targets(
+    guild: discord.Guild,
+    author_id: int,
+    content: str,
+    *,
+    direct_target_ids: set[int],
+) -> dict[int, float]:
+    if not content:
+        return {}
+    alias_index = get_guild_aicrush_alias_index(guild)
+    token_map = alias_index.get("token_map", {})
+    phrase_map = alias_index.get("phrase_map", {})
+    token_hits: dict[int, float] = defaultdict(float)
+    tokens = set(aicrush_tokenize(content))
+    for token in tokens:
+        candidate_ids = token_map.get(token)
+        if not isinstance(candidate_ids, list) or not candidate_ids or len(candidate_ids) > 2:
+            continue
+        for candidate_id in candidate_ids:
+            if candidate_id == author_id or candidate_id in direct_target_ids:
+                continue
+            token_hits[int(candidate_id)] += 0.35 if len(candidate_ids) == 1 else 0.18
+
+    padded = f" {content} "
+    for phrase, candidate_ids in phrase_map.items():
+        if not isinstance(candidate_ids, list) or not candidate_ids or len(candidate_ids) > 2:
+            continue
+        if len(phrase) < 4:
+            continue
+        if f" {phrase} " not in padded and phrase not in padded:
+            continue
+        for candidate_id in candidate_ids:
+            if candidate_id == author_id or candidate_id in direct_target_ids:
+                continue
+            token_hits[int(candidate_id)] += 0.75 if len(candidate_ids) == 1 else 0.4
+    return {
+        candidate_id: round(score, 4)
+        for candidate_id, score in token_hits.items()
+        if score >= 0.35
+    }
+
+
+def _aicrush_track_recent_channel_author(
+    guild_id: int,
+    channel_id: int,
+    author_id: int,
+    created_ts: float,
+) -> list[int]:
+    key = (guild_id, channel_id)
+    queue = AICRUSH_CHANNEL_RECENT_AUTHORS[key]
+    while queue and created_ts - queue[0][0] > AICRUSH_CHANNEL_RECENT_WINDOW_SECONDS:
+        queue.popleft()
+    others = {other_author for _, other_author in queue if other_author != author_id}
+    queue.append((created_ts, author_id))
+    return list(others)
+
+
+def _aicrush_invalidate_result_cache(guild_id: int, user_ids: set[int]) -> None:
+    if not user_ids:
+        return
+    for cache_key in list(AICRUSH_RESULT_CACHE.keys()):
+        if cache_key[0] == guild_id and cache_key[1] in user_ids:
+            AICRUSH_RESULT_CACHE.pop(cache_key, None)
+
+
+def index_aicrush_message(message: discord.Message, *, backfill: bool = False) -> set[int]:
+    if message.guild is None or message.author.bot:
+        return set()
+    member = message.author if isinstance(message.author, discord.Member) else None
+    if member is None:
+        return set()
+    content = message.clean_content.strip()
+    if not content and not message.attachments:
+        return set()
+    if not content and message.attachments:
+        content = "[attachment]"
+
+    created_ts = message.created_at.timestamp()
+    guild_state = get_guild_aicrush_state(message.guild.id)
+    meta = guild_state.setdefault("meta", {})
+    channel_state = guild_state.setdefault("channels", {}).setdefault(str(message.channel.id), {})
+    channel_state["latest_message_id"] = max(
+        int(channel_state.get("latest_message_id", 0) or 0),
+        int(message.id),
+    )
+    existing_earliest = int(channel_state.get("earliest_message_id", 0) or 0)
+    channel_state["earliest_message_id"] = (
+        int(message.id)
+        if existing_earliest <= 0
+        else min(existing_earliest, int(message.id))
+    )
+    channel_state["last_message_ts"] = max(
+        float(channel_state.get("last_message_ts", 0.0) or 0.0),
+        created_ts,
+    )
+    if backfill:
+        meta["last_backfill_ts"] = time.time()
+    else:
+        meta["last_incremental_ts"] = time.time()
+    meta["last_indexed_message_ts"] = max(
+        float(meta.get("last_indexed_message_ts", 0.0) or 0.0),
+        created_ts,
+    )
+    meta["messages_indexed"] = int(meta.get("messages_indexed", 0) or 0) + 1
+
+    _aicrush_update_user_profile(guild_state, member, content, created_ts)
+    direct_target_ids = {
+        int(mentioned.id)
+        for mentioned in message.mentions
+        if not mentioned.bot and mentioned.id != member.id
+    }
+    reply_target_id = _aicrush_resolve_reply_target_id(message)
+    impacted_ids: set[int] = {member.id}
+
+    _aicrush_remember_message_author(int(message.id), int(member.id), created_ts)
+
+    recent_others = _aicrush_track_recent_channel_author(
+        message.guild.id,
+        message.channel.id,
+        member.id,
+        created_ts,
+    )
+    for other_id in recent_others[:10]:
+        _aicrush_update_edge(
+            guild_state,
+            member.id,
+            other_id,
+            score=0.08,
+            kind="copresence",
+            created_ts=created_ts,
+            channel_id=message.channel.id,
+            sample_text=content,
+        )
+        impacted_ids.add(other_id)
+
+    for target_id in direct_target_ids:
+        _aicrush_update_edge(
+            guild_state,
+            member.id,
+            target_id,
+            score=2.0,
+            kind="mention",
+            created_ts=created_ts,
+            channel_id=message.channel.id,
+            sample_text=content,
+        )
+        impacted_ids.add(target_id)
+
+    if reply_target_id is not None and reply_target_id != member.id:
+        _aicrush_update_edge(
+            guild_state,
+            member.id,
+            reply_target_id,
+            score=2.8,
+            kind="reply",
+            created_ts=created_ts,
+            channel_id=message.channel.id,
+            sample_text=content,
+        )
+        impacted_ids.add(reply_target_id)
+
+    normalized_content = normalize_aicrush_text(content)
+    for target_id, hit_score in _aicrush_extract_name_hit_targets(
+        message.guild,
+        member.id,
+        normalized_content,
+        direct_target_ids=direct_target_ids,
+    ).items():
+        _aicrush_update_edge(
+            guild_state,
+            member.id,
+            target_id,
+            score=hit_score,
+            kind="name_hit",
+            created_ts=created_ts,
+            channel_id=message.channel.id,
+            sample_text=content,
+        )
+        impacted_ids.add(target_id)
+
+    _mark_aicrush_dirty()
+    _aicrush_invalidate_result_cache(message.guild.id, impacted_ids)
+    return impacted_ids
+
+
+async def run_aicrush_backfill(
+    guild: discord.Guild,
+    *,
+    message_budget: int | None = None,
+    time_budget_seconds: float | None = None,
+) -> dict[str, Any]:
+    guild_state = get_guild_aicrush_state(guild.id)
+    channels = get_readable_text_channels(guild)
     if AICRUSH_MAX_CHANNELS > 0:
         channels = channels[:AICRUSH_MAX_CHANNELS]
-
-    total_user_messages = 0
-    interaction_points: Counter[int] = Counter()
-    target_lines: list[str] = []
-    candidate_lines: dict[int, list[str]] = defaultdict(list)
-    target_chars = 0
-    candidate_chars: dict[int, int] = defaultdict(int)
-    scanned_messages = 0
-    max_target_chars = int(AICRUSH_MAX_CONTEXT_CHARS * 0.66)
-    max_candidate_chars = int(AICRUSH_MAX_CONTEXT_CHARS * 0.34)
+    channel_rows = guild_state.setdefault("channels", {})
     for channel in channels:
-        if scanned_messages >= AICRUSH_MAX_HISTORY_MESSAGES:
+        channel_rows.setdefault(
+            str(channel.id),
+            {
+                "latest_message_id": 0,
+                "earliest_message_id": 0,
+                "last_message_ts": 0.0,
+                "before_message_id": 0,
+                "fully_scanned": False,
+                "last_backfill_ts": 0.0,
+            },
+        )
+
+    budget_remaining = max(200, int(message_budget or AICRUSH_BACKFILL_MESSAGE_BUDGET))
+    end_time = time.monotonic() + float(
+        time_budget_seconds or AICRUSH_BACKFILL_TIME_BUDGET_SECONDS
+    )
+    fetched_messages: list[discord.Message] = []
+    touched_channel_ids: set[int] = set()
+    backfill_passes = 0
+    total_fetched = 0
+
+    while budget_remaining > 0 and time.monotonic() < end_time:
+        backfill_passes += 1
+        progress_this_pass = 0
+        channel_priority = sorted(
+            channels,
+            key=lambda channel: (
+                1 if bool(channel_rows.get(str(channel.id), {}).get("fully_scanned")) else 0,
+                float(channel_rows.get(str(channel.id), {}).get("last_backfill_ts", 0.0) or 0.0),
+            ),
+        )
+        for channel in channel_priority:
+            if budget_remaining <= 0 or time.monotonic() >= end_time:
+                break
+            row = channel_rows.setdefault(str(channel.id), {})
+            if bool(row.get("fully_scanned")):
+                continue
+            per_channel_limit = min(max(50, AICRUSH_SCAN_PER_CHANNEL), budget_remaining)
+            history_kwargs: dict[str, Any] = {"limit": per_channel_limit}
+            before_message_id = int(row.get("before_message_id", 0) or 0)
+            if before_message_id <= 0:
+                before_message_id = int(row.get("earliest_message_id", 0) or 0)
+            if before_message_id > 0:
+                history_kwargs["before"] = discord.Object(id=before_message_id)
+            batch: list[discord.Message] = []
+            try:
+                async for msg in channel.history(**history_kwargs):
+                    if not msg.author.bot:
+                        batch.append(msg)
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+            row["last_backfill_ts"] = time.time()
+            if not batch:
+                row["fully_scanned"] = True
+                continue
+            oldest_id = min(int(msg.id) for msg in batch)
+            row["before_message_id"] = oldest_id
+            row["earliest_message_id"] = (
+                oldest_id
+                if int(row.get("earliest_message_id", 0) or 0) <= 0
+                else min(int(row.get("earliest_message_id", 0) or 0), oldest_id)
+            )
+            if len(batch) < per_channel_limit:
+                row["fully_scanned"] = True
+            fetched_messages.extend(batch)
+            budget_remaining -= len(batch)
+            progress_this_pass += len(batch)
+            total_fetched += len(batch)
+            touched_channel_ids.add(channel.id)
+            if (
+                AICRUSH_SCAN_PAUSE_EVERY > 0
+                and AICRUSH_SCAN_PAUSE_SECONDS > 0
+                and total_fetched % AICRUSH_SCAN_PAUSE_EVERY < len(batch)
+            ):
+                await asyncio.sleep(AICRUSH_SCAN_PAUSE_SECONDS)
+        if progress_this_pass <= 0:
             break
-        history_kwargs: dict[str, object]
-        if AICRUSH_FULL_HISTORY_SCAN:
-            history_kwargs = {"limit": None, "oldest_first": True}
-        else:
-            history_kwargs = {"limit": AICRUSH_SCAN_PER_CHANNEL, "oldest_first": True}
-        target_message_ids: set[int] = set()
-        try:
-            async for msg in channel.history(**history_kwargs):
-                scanned_messages += 1
-                if (
-                    AICRUSH_SCAN_PAUSE_EVERY > 0
-                    and AICRUSH_SCAN_PAUSE_SECONDS > 0
-                    and scanned_messages % AICRUSH_SCAN_PAUSE_EVERY == 0
-                ):
-                    await asyncio.sleep(AICRUSH_SCAN_PAUSE_SECONDS)
-                if scanned_messages >= AICRUSH_MAX_HISTORY_MESSAGES:
-                    break
 
-                if msg.author.bot:
-                    continue
+    fetched_messages.sort(key=lambda msg: (msg.created_at.timestamp(), int(msg.id)))
+    touched_user_ids: set[int] = set()
+    for msg in fetched_messages:
+        touched_user_ids.update(index_aicrush_message(msg, backfill=True))
 
-                content = msg.clean_content.strip()
-                author_id = msg.author.id
-                if author_id == target_user_id:
-                    total_user_messages += 1
-                    target_message_ids.add(msg.id)
-                    target_chars = append_with_char_budget(
-                        target_lines, content, target_chars, max_target_chars
-                    )
+    channels_total = len(channels)
+    fully_scanned = sum(
+        1
+        for row in channel_rows.values()
+        if isinstance(row, dict) and bool(row.get("fully_scanned"))
+    )
+    meta = guild_state.setdefault("meta", {})
+    meta["last_backfill_ts"] = time.time()
+    _mark_aicrush_dirty()
+    _aicrush_invalidate_result_cache(guild.id, touched_user_ids)
+    return {
+        "scanned_messages": len(fetched_messages),
+        "channels_considered": channels_total,
+        "channels_touched": len(touched_channel_ids),
+        "channels_fully_scanned": fully_scanned,
+        "messages_indexed": int(meta.get("messages_indexed", 0) or 0),
+        "passes": backfill_passes,
+    }
 
-                    seen_ids: set[int] = set()
-                    for mentioned in msg.mentions:
-                        if mentioned.bot or mentioned.id == target_user_id:
-                            continue
-                        if mentioned.id not in seen_ids:
-                            interaction_points[mentioned.id] += 2
-                            seen_ids.add(mentioned.id)
 
-                    ref = msg.reference
-                    resolved = ref.resolved if ref else None
-                    if isinstance(resolved, discord.Message):
-                        ref_author = resolved.author
-                        if (
-                            isinstance(ref_author, (discord.Member, discord.User))
-                            and not ref_author.bot
-                            and ref_author.id != target_user_id
-                            and ref_author.id not in seen_ids
-                        ):
-                            interaction_points[ref_author.id] += 3
-                            seen_ids.add(ref_author.id)
-                    continue
+def _aicrush_edge_total_score(edge: dict[str, Any] | None) -> float:
+    if not isinstance(edge, dict):
+        return 0.0
+    return max(0.0, float(edge.get("score", 0.0) or 0.0))
 
-                if author_id == target_user_id:
-                    continue
-                is_reply_to_target = False
-                if msg.reference and msg.reference.message_id in target_message_ids:
-                    is_reply_to_target = True
-                elif any(m.id == target_user_id for m in msg.mentions):
-                    is_reply_to_target = True
 
-                if is_reply_to_target:
-                    interaction_points[author_id] += 2
-                    existing = candidate_chars[author_id]
-                    candidate_chars[author_id] = append_with_char_budget(
-                        candidate_lines[author_id], content, existing, max_candidate_chars
-                    )
-        except (discord.Forbidden, discord.HTTPException):
+def _aicrush_topic_similarity(
+    left_topics: dict[str, int],
+    right_topics: dict[str, int],
+) -> float:
+    if not left_topics or not right_topics:
+        return 0.0
+    overlap = set(left_topics).intersection(right_topics)
+    if not overlap:
+        return 0.0
+    numerator = sum(min(int(left_topics[key]), int(right_topics[key])) for key in overlap)
+    denominator = max(
+        1,
+        sum(int(left_topics[key]) for key in left_topics)
+        + sum(int(right_topics[key]) for key in right_topics),
+    )
+    return round((2.0 * numerator) / denominator, 4)
+
+
+def _aicrush_merge_samples(*sample_groups: list[str], limit: int) -> list[str]:
+    merged: list[str] = []
+    for group in sample_groups:
+        for sample in group:
+            _aicrush_append_unique_sample(merged, sample, limit)
+    return merged[:limit]
+
+
+def _aicrush_merge_ranked_channel_ids(*channel_maps: dict[str, Any], limit: int) -> list[int]:
+    merged: Counter[int] = Counter()
+    for channel_map in channel_maps:
+        if not isinstance(channel_map, dict):
             continue
-    return total_user_messages, interaction_points, target_lines, dict(candidate_lines)
+        for channel_key, raw_count in channel_map.items():
+            try:
+                channel_id = int(channel_key)
+                count = max(0, int(raw_count or 0))
+            except (TypeError, ValueError):
+                continue
+            if channel_id > 0 and count > 0:
+                merged[channel_id] += count
+    return [channel_id for channel_id, _ in merged.most_common(max(1, limit))]
 
 
-async def find_best_opposite_gender_match(
+@dataclass
+class AICrushContext:
+    target_message_count: int
+    scanned_messages: int
+    target_topics: list[str]
+    outgoing_affinity: dict[int, float]
+    incoming_affinity: dict[int, float]
+    name_hit_affinity: dict[int, float]
+    reverse_name_hit_affinity: dict[int, float]
+    candidate_samples: dict[int, list[str]]
+    target_samples: list[str]
+    scan_coverage: dict[str, Any]
+    data_freshness_ts: float
+    outbound_counts: dict[int, int]
+    inbound_counts: dict[int, int]
+    topic_overlap: dict[int, float]
+    candidate_evidence: dict[int, dict[str, Any]]
+
+
+async def collect_aicrush_interactions(
+    guild: discord.Guild, target_user_id: int
+) -> "AICrushContext":
+    guild_state = get_guild_aicrush_state(guild.id)
+    users = guild_state.get("users", {})
+    edges = guild_state.get("edges", {})
+    target_row = users.get(str(target_user_id), {}) if isinstance(users, dict) else {}
+    target_topics_raw = target_row.get("topics", {}) if isinstance(target_row, dict) else {}
+    if not isinstance(target_topics_raw, dict):
+        target_topics_raw = {}
+    target_samples = target_row.get("samples", []) if isinstance(target_row, dict) else []
+    if not isinstance(target_samples, list):
+        target_samples = []
+
+    outgoing_edges = edges.get(str(target_user_id), {}) if isinstance(edges, dict) else {}
+    if not isinstance(outgoing_edges, dict):
+        outgoing_edges = {}
+
+    outgoing_affinity: dict[int, float] = {}
+    incoming_affinity: dict[int, float] = {}
+    name_hit_affinity: dict[int, float] = {}
+    reverse_name_hit_affinity: dict[int, float] = {}
+    candidate_samples: dict[int, list[str]] = {}
+    outbound_counts: dict[int, int] = {}
+    inbound_counts: dict[int, int] = {}
+    topic_overlap: dict[int, float] = {}
+    candidate_evidence: dict[int, dict[str, Any]] = {}
+    candidate_ids: set[int] = set()
+
+    for target_key, edge in outgoing_edges.items():
+        if not isinstance(edge, dict):
+            continue
+        try:
+            candidate_id = int(target_key)
+        except (TypeError, ValueError):
+            continue
+        if candidate_id == target_user_id:
+            continue
+        outgoing_affinity[candidate_id] = _aicrush_edge_total_score(edge)
+        name_hit_affinity[candidate_id] = float(edge.get("name_hit_score", 0.0) or 0.0)
+        outbound_counts[candidate_id] = int(edge.get("touch_count", 0) or 0)
+        candidate_ids.add(candidate_id)
+
+    if isinstance(edges, dict):
+        for source_key, source_edges in edges.items():
+            if not isinstance(source_edges, dict):
+                continue
+            edge = source_edges.get(str(target_user_id))
+            if not isinstance(edge, dict):
+                continue
+            try:
+                source_id = int(source_key)
+            except (TypeError, ValueError):
+                continue
+            if source_id == target_user_id:
+                continue
+            incoming_affinity[source_id] = _aicrush_edge_total_score(edge)
+            reverse_name_hit_affinity[source_id] = float(edge.get("name_hit_score", 0.0) or 0.0)
+            inbound_counts[source_id] = int(edge.get("touch_count", 0) or 0)
+            candidate_ids.add(source_id)
+
+    for candidate_id in candidate_ids:
+        candidate_row = users.get(str(candidate_id), {}) if isinstance(users, dict) else {}
+        candidate_topics = candidate_row.get("topics", {}) if isinstance(candidate_row, dict) else {}
+        if not isinstance(candidate_topics, dict):
+            candidate_topics = {}
+        topic_overlap[candidate_id] = _aicrush_topic_similarity(target_topics_raw, candidate_topics)
+        out_edge = outgoing_edges.get(str(candidate_id), {}) if isinstance(outgoing_edges, dict) else {}
+        in_edge = (
+            edges.get(str(candidate_id), {}).get(str(target_user_id), {})
+            if isinstance(edges, dict) and isinstance(edges.get(str(candidate_id)), dict)
+            else {}
+        )
+        candidate_samples[candidate_id] = _aicrush_merge_samples(
+            out_edge.get("samples", []) if isinstance(out_edge, dict) else [],
+            in_edge.get("samples", []) if isinstance(in_edge, dict) else [],
+            candidate_row.get("samples", []) if isinstance(candidate_row, dict) else [],
+            limit=8,
+        )
+        candidate_evidence[candidate_id] = {
+            "outgoing_mentions": int(out_edge.get("mention_count", 0) or 0)
+            if isinstance(out_edge, dict)
+            else 0,
+            "incoming_mentions": int(in_edge.get("mention_count", 0) or 0)
+            if isinstance(in_edge, dict)
+            else 0,
+            "outgoing_replies": int(out_edge.get("reply_count", 0) or 0)
+            if isinstance(out_edge, dict)
+            else 0,
+            "incoming_replies": int(in_edge.get("reply_count", 0) or 0)
+            if isinstance(in_edge, dict)
+            else 0,
+            "outgoing_copresence": float(out_edge.get("copresence_score", 0.0) or 0.0)
+            if isinstance(out_edge, dict)
+            else 0.0,
+            "incoming_copresence": float(in_edge.get("copresence_score", 0.0) or 0.0)
+            if isinstance(in_edge, dict)
+            else 0.0,
+            "outgoing_last_ts": float(out_edge.get("last_ts", 0.0) or 0.0)
+            if isinstance(out_edge, dict)
+            else 0.0,
+            "incoming_last_ts": float(in_edge.get("last_ts", 0.0) or 0.0)
+            if isinstance(in_edge, dict)
+            else 0.0,
+            "channel_ids": _aicrush_merge_ranked_channel_ids(
+                out_edge.get("channels", {}) if isinstance(out_edge, dict) else {},
+                in_edge.get("channels", {}) if isinstance(in_edge, dict) else {},
+                limit=4,
+            ),
+        }
+
+    channels = guild_state.get("channels", {})
+    channels_total = len(channels) if isinstance(channels, dict) else 0
+    channels_fully_scanned = 0
+    if isinstance(channels, dict):
+        channels_fully_scanned = sum(
+            1
+            for row in channels.values()
+            if isinstance(row, dict) and bool(row.get("fully_scanned"))
+        )
+    meta = guild_state.get("meta", {})
+    freshness_ts = max(
+        float(meta.get("last_indexed_message_ts", 0.0) or 0.0),
+        float(meta.get("last_backfill_ts", 0.0) or 0.0),
+    )
+    return AICrushContext(
+        target_message_count=int(target_row.get("message_count", 0) or 0) if isinstance(target_row, dict) else 0,
+        scanned_messages=int(meta.get("messages_indexed", 0) or 0) if isinstance(meta, dict) else 0,
+        target_topics=[
+            topic
+            for topic, _ in sorted(
+                target_topics_raw.items(), key=lambda item: int(item[1]), reverse=True
+            )[:8]
+        ],
+        outgoing_affinity=outgoing_affinity,
+        incoming_affinity=incoming_affinity,
+        name_hit_affinity=name_hit_affinity,
+        reverse_name_hit_affinity=reverse_name_hit_affinity,
+        candidate_samples=candidate_samples,
+        target_samples=target_samples[:10],
+        scan_coverage={
+            "channels_total": channels_total,
+            "channels_fully_scanned": channels_fully_scanned,
+            "messages_indexed": int(meta.get("messages_indexed", 0) or 0) if isinstance(meta, dict) else 0,
+        },
+        data_freshness_ts=freshness_ts,
+        outbound_counts=outbound_counts,
+        inbound_counts=inbound_counts,
+        topic_overlap=topic_overlap,
+        candidate_evidence=candidate_evidence,
+    )
+
+
+def aicrush_recency_weight(reference_ts: float, event_ts: float) -> float:
+    age_hours = max(0.0, (reference_ts - event_ts) / 3600)
+    return max(0.25, pow(0.965, age_hours))
+
+
+def _aicrush_gender_compatibility_bonus(
+    target_gender: str | None, candidate_gender: str | None
+) -> float:
+    if target_gender is None or candidate_gender is None:
+        return 0.0
+    if target_gender != candidate_gender:
+        return 0.7
+    return -0.15
+
+
+def _aicrush_confidence_from_pool(candidates: list[dict[str, Any]]) -> tuple[float, str]:
+    if not candidates:
+        return 0.0, "none"
+    top = float(candidates[0].get("heuristic_score", 0.0))
+    second = float(candidates[1].get("heuristic_score", 0.0)) if len(candidates) > 1 else 0.0
+    dominance = top / max(0.1, top + second)
+    evidence = min(1.0, float(candidates[0].get("evidence_density", 0.0)))
+    confidence = max(0.08, min(0.97, (dominance * 0.55) + (evidence * 0.45)))
+    if confidence >= 0.8:
+        band = "high"
+    elif confidence >= 0.58:
+        band = "medium"
+    else:
+        band = "low"
+    return confidence, band
+
+
+async def build_aicrush_directional_candidate_pool(
     guild: discord.Guild,
     target_member: discord.Member,
-    interaction_points: Counter[int],
-) -> tuple[discord.Member | None, str | None, int]:
+    context: "AICrushContext",
+    *,
+    direction: Literal["crush", "admirer"],
+    limit: int = 8,
+) -> tuple[list[dict[str, Any]], str | None]:
     target_gender = detect_member_gender_from_roles(target_member)
-    if target_gender is None:
-        return None, None, 0
+    expected_gender = None
+    if target_gender == "male":
+        expected_gender = "female"
+    elif target_gender == "female":
+        expected_gender = "male"
 
-    required_gender = "female" if target_gender == "male" else "male"
-    for user_id, points in interaction_points.most_common():
-        if user_id == target_member.id:
+    candidate_ids = set(context.outgoing_affinity).union(context.incoming_affinity)
+    ranked: list[dict[str, Any]] = []
+    for candidate_id in candidate_ids:
+        if candidate_id == target_member.id:
             continue
-        candidate = guild.get_member(user_id)
+        candidate = guild.get_member(candidate_id)
         if candidate is None:
             try:
-                candidate = await guild.fetch_member(user_id)
+                candidate = await guild.fetch_member(candidate_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 continue
         if candidate.bot:
             continue
+
+        out_score = float(context.outgoing_affinity.get(candidate_id, 0.0))
+        in_score = float(context.incoming_affinity.get(candidate_id, 0.0))
+        name_score = float(context.name_hit_affinity.get(candidate_id, 0.0))
+        reverse_name_score = float(context.reverse_name_hit_affinity.get(candidate_id, 0.0))
+        overlap_score = float(context.topic_overlap.get(candidate_id, 0.0))
+        reciprocal_score = min(out_score, in_score)
+        outgoing_touches = int(context.outbound_counts.get(candidate_id, 0))
+        incoming_touches = int(context.inbound_counts.get(candidate_id, 0))
+        touch_volume = outgoing_touches + incoming_touches
+        evidence = context.candidate_evidence.get(candidate_id, {})
+        outgoing_mentions = int(evidence.get("outgoing_mentions", 0) or 0)
+        incoming_mentions = int(evidence.get("incoming_mentions", 0) or 0)
+        outgoing_replies = int(evidence.get("outgoing_replies", 0) or 0)
+        incoming_replies = int(evidence.get("incoming_replies", 0) or 0)
+        outgoing_copresence = float(evidence.get("outgoing_copresence", 0.0) or 0.0)
+        incoming_copresence = float(evidence.get("incoming_copresence", 0.0) or 0.0)
+        recent_signal_ts = max(
+            float(evidence.get("outgoing_last_ts", 0.0) or 0.0),
+            float(evidence.get("incoming_last_ts", 0.0) or 0.0),
+        )
+        recency_bonus = (
+            aicrush_recency_weight(max(context.data_freshness_ts, time.time()), recent_signal_ts)
+            if recent_signal_ts > 0
+            else 0.25
+        )
         candidate_gender = detect_member_gender_from_roles(candidate)
-        if candidate_gender == required_gender:
-            return candidate, target_gender, points
-    return None, target_gender, 0
+        preferred_gender_match = (
+            expected_gender is not None
+            and candidate_gender is not None
+            and candidate_gender == expected_gender
+        )
+        gender_bonus = _aicrush_gender_compatibility_bonus(target_gender, candidate_gender)
+        if direction == "crush":
+            direction_score = out_score
+            heuristic_score = (
+                out_score * 1.18
+                + in_score * 0.28
+                + reciprocal_score * 0.92
+                + name_score * 0.75
+                + overlap_score * 1.45
+                + min(1.5, touch_volume * 0.08)
+                + min(0.9, outgoing_replies * 0.09)
+                + min(0.45, outgoing_mentions * 0.05)
+                + min(0.4, outgoing_copresence * 0.35)
+                + recency_bonus * 0.45
+                + gender_bonus
+            )
+        else:
+            direction_score = in_score
+            heuristic_score = (
+                in_score * 1.24
+                + out_score * 0.18
+                + reciprocal_score * 0.88
+                + reverse_name_score * 0.85
+                + overlap_score * 1.25
+                + min(1.4, touch_volume * 0.07)
+                + min(0.9, incoming_replies * 0.1)
+                + min(0.45, incoming_mentions * 0.05)
+                + min(0.4, incoming_copresence * 0.35)
+                + recency_bonus * 0.45
+                + gender_bonus * 0.8
+            )
+        evidence_density = min(
+            1.0,
+            (
+                direction_score
+                + reciprocal_score
+                + name_score
+                + reverse_name_score
+                + (touch_volume * 0.14)
+                + (overlap_score * 2.4)
+                + ((outgoing_mentions + incoming_mentions) * 0.1)
+                + ((outgoing_replies + incoming_replies) * 0.12)
+                + (recency_bonus * 0.85)
+            ) / 9.0,
+        )
+        ranked.append(
+            {
+                "member": candidate,
+                "direction": direction,
+                "direction_score": round(direction_score, 4),
+                "heuristic_score": round(heuristic_score, 4),
+                "outgoing_score": round(out_score, 4),
+                "incoming_score": round(in_score, 4),
+                "name_score": round(name_score, 4),
+                "reverse_name_score": round(reverse_name_score, 4),
+                "topic_overlap": round(overlap_score, 4),
+                "reciprocal_score": round(reciprocal_score, 4),
+                "outgoing": outgoing_touches,
+                "incoming": incoming_touches,
+                "touch_volume": touch_volume,
+                "evidence_density": round(evidence_density, 4),
+                "candidate_gender": candidate_gender,
+                "preferred_gender_match": preferred_gender_match,
+                "samples": context.candidate_samples.get(candidate_id, []),
+                "outgoing_mentions": outgoing_mentions,
+                "incoming_mentions": incoming_mentions,
+                "outgoing_replies": outgoing_replies,
+                "incoming_replies": incoming_replies,
+                "outgoing_copresence": round(outgoing_copresence, 4),
+                "incoming_copresence": round(incoming_copresence, 4),
+                "recency_bonus": round(recency_bonus, 4),
+                "channel_ids": evidence.get("channel_ids", []),
+            }
+        )
+
+    ranked = [
+        row
+        for row in ranked
+        if float(row.get("direction_score", 0.0)) > 0
+        or float(row.get("heuristic_score", 0.0)) > 0.75
+    ]
+    ranked.sort(
+        key=lambda row: (
+            -float(row.get("heuristic_score", 0.0)),
+            -float(row.get("direction_score", 0.0)),
+            -float(row.get("evidence_density", 0.0)),
+        )
+    )
+    return ranked[: max(1, limit)], target_gender
+
+
+def _aicrush_rank_schema() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "aicrush_pick",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "picked_user_id": {"type": "integer"},
+                    "confidence": {"type": "number"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["picked_user_id", "confidence", "reason"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+async def rerank_aicrush_candidates_with_ai(
+    target_member: discord.Member,
+    *,
+    target_gender: str | None,
+    context: "AICrushContext",
+    candidates: list[dict[str, Any]],
+    direction: Literal["crush", "admirer"],
+) -> tuple[int | None, str, float]:
+    if len(candidates) < 2:
+        return None, "", 0.0
+
+    allowed_ids = {
+        int(row["member"].id)
+        for row in candidates
+        if isinstance(row.get("member"), discord.Member)
+    }
+    if len(allowed_ids) < 2:
+        return None, "", 0.0
+
+    target_para = lines_to_paragraph(
+        context.target_samples,
+        int(AICRUSH_MAX_CONTEXT_CHARS * 0.32),
+    )
+    candidate_chunks: list[str] = []
+    for row in candidates[:7]:
+        candidate = row.get("member")
+        if not isinstance(candidate, discord.Member):
+            continue
+        cid = int(candidate.id)
+        candidate_para = lines_to_paragraph(
+            row.get("samples", []),
+            int(AICRUSH_MAX_CONTEXT_CHARS * 0.14),
+        )
+        candidate_chunks.append(
+            (
+                f"- user_id: {cid}\n"
+                f"  name: {candidate.display_name}\n"
+                f"  direction: {direction}\n"
+                f"  heuristic_score: {float(row.get('heuristic_score', 0.0)):.3f}\n"
+                f"  direction_score: {float(row.get('direction_score', 0.0)):.3f}\n"
+                f"  outgoing_score: {float(row.get('outgoing_score', 0.0)):.3f}\n"
+                f"  incoming_score: {float(row.get('incoming_score', 0.0)):.3f}\n"
+                f"  name_score: {float(row.get('name_score', 0.0)):.3f}\n"
+                f"  reverse_name_score: {float(row.get('reverse_name_score', 0.0)):.3f}\n"
+                f"  topic_overlap: {float(row.get('topic_overlap', 0.0)):.3f}\n"
+                f"  evidence_density: {float(row.get('evidence_density', 0.0)):.3f}\n"
+                f"  candidate_context: {candidate_para or '(limited)'}"
+            )
+        )
+    if len(candidate_chunks) < 2:
+        return None, "", 0.0
+
+    direction_instruction = (
+        "Pick who the target member most likely has a crush on."
+        if direction == "crush"
+        else "Pick who most likely has a crush on the target member."
+    )
+    prompt = (
+        "Rank a playful Discord crush candidate from evidence only.\n"
+        f"{direction_instruction}\n"
+        "Use replies, mentions, plain-text name references, mutuality, and topic overlap.\n"
+        "Treat gender hint only as a soft boost. Do not force it.\n"
+        "Return only the required JSON fields.\n\n"
+        f"Target member: {target_member.display_name}\n"
+        f"Target gender hint: {target_gender or 'unknown'}\n"
+        f"Target topics: {', '.join(context.target_topics) or 'limited'}\n"
+        f"Target samples: {target_para or '(limited)'}\n\n"
+        "Candidates:\n"
+        + "\n".join(candidate_chunks)
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an evidence-based ranking assistant for a Discord relationship inference feature. "
+                "Be conservative, prefer interaction evidence over speculation, and avoid certainty claims."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+
+    payload: dict[str, Any] | None = None
+    if GROQ_API_KEY:
+        try:
+            raw = await request_groq_completion(
+                messages,
+                max_tokens=180,
+                temperature=0.1,
+                model_override=AICRUSH_RANK_MODEL or None,
+                fallback_models=AICRUSH_FALLBACK_MODELS,
+                response_format=_aicrush_rank_schema(),
+                include_fallback_notice=False,
+            )
+            payload = _extract_first_json_object(raw)
+        except Exception:
+            payload = None
+    if payload is None:
+        try:
+            raw = await request_ai_completion(
+                messages,
+                max_tokens=180,
+                temperature=0.15,
+                policy_key=f"aicrush_ranker_{direction}",
+                model_override=(AICRUSH_RANK_MODEL or None) if AI_PROVIDER == "groq" else None,
+                fallback_models=AICRUSH_FALLBACK_MODELS if AI_PROVIDER == "groq" else None,
+                include_fallback_notice=False,
+            )
+        except Exception:
+            return None, "", 0.0
+        payload = _extract_first_json_object(raw)
+    if not isinstance(payload, dict):
+        return None, "", 0.0
+
+    try:
+        picked_id = int(payload.get("picked_user_id"))
+    except (TypeError, ValueError):
+        return None, "", 0.0
+    if picked_id not in allowed_ids:
+        return None, "", 0.0
+    try:
+        confidence = max(0.0, min(1.0, float(payload.get("confidence", 0.0) or 0.0)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    reason = " ".join(str(payload.get("reason", "")).split()).strip()[:260]
+    return picked_id, reason, confidence
+
+
+def _aicrush_pick_row(
+    candidates: list[dict[str, Any]],
+    picked_id: int | None,
+) -> dict[str, Any] | None:
+    if not candidates:
+        return None
+    if picked_id is None:
+        return candidates[0]
+    for row in candidates:
+        member = row.get("member")
+        if isinstance(member, discord.Member) and int(member.id) == picked_id:
+            return row
+    return candidates[0]
+
+
+def _aicrush_direction_summary(label: str, row: dict[str, Any] | None) -> str:
+    if row is None:
+        return f"{label}: no clear signal yet"
+    member = row.get("member")
+    if not isinstance(member, discord.Member):
+        return f"{label}: unresolved"
+    return (
+        f"{label}: {member.display_name} | out `{float(row.get('outgoing_score', 0.0)):.2f}` | "
+        f"in `{float(row.get('incoming_score', 0.0)):.2f}` | name `{float(row.get('name_score', 0.0) or row.get('reverse_name_score', 0.0)):.2f}`"
+    )
+
+
+def _aicrush_channel_names(guild: discord.Guild, channel_ids: list[int], limit: int = 3) -> str:
+    names: list[str] = []
+    for raw_channel_id in channel_ids[: max(1, limit)]:
+        try:
+            channel_id = int(raw_channel_id)
+        except (TypeError, ValueError):
+            continue
+        channel = guild.get_channel(channel_id)
+        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+            names.append(f"#{channel.name}")
+    return ", ".join(names) if names else "cross-channel"
+
+
+def _aicrush_sample_texture(samples: list[str], limit: int = 2) -> str:
+    texture: list[str] = []
+    for raw_sample in samples[: max(1, limit)]:
+        cleaned = " ".join(str(raw_sample).split()).strip()
+        if not cleaned:
+            continue
+        if len(cleaned) > 90:
+            cleaned = cleaned[:87].rstrip() + "..."
+        quoted = f"\"{cleaned}\""
+        if quoted not in texture:
+            texture.append(quoted)
+    return " | ".join(texture) if texture else "limited sample text"
+
+
+def _aicrush_direction_evidence_line(
+    target_member: discord.Member,
+    *,
+    label: str,
+    row: dict[str, Any] | None,
+) -> str:
+    if row is None:
+        return f"{label}: no concentrated directional signal yet."
+    member = row.get("member")
+    if not isinstance(member, discord.Member):
+        return f"{label}: unresolved candidate."
+    if label == "Likely crush":
+        replies = int(row.get("outgoing_replies", 0) or 0)
+        mentions = int(row.get("outgoing_mentions", 0) or 0)
+        name_hits = float(row.get("name_score", 0.0) or 0.0)
+        actor_text = f"{target_member.display_name} -> {member.display_name}"
+    else:
+        replies = int(row.get("incoming_replies", 0) or 0)
+        mentions = int(row.get("incoming_mentions", 0) or 0)
+        name_hits = float(row.get("reverse_name_score", 0.0) or 0.0)
+        actor_text = f"{member.display_name} -> {target_member.display_name}"
+    return (
+        f"{label}: {actor_text} | replies `{replies}` | mentions `{mentions}` | "
+        f"name hits `{name_hits:.2f}` | topic overlap `{float(row.get('topic_overlap', 0.0)):.2f}` | "
+        f"mutual traffic `{int(row.get('touch_volume', 0) or 0)}` | "
+        f"shared channels `{_aicrush_channel_names(target_member.guild, row.get('channel_ids', []))}`."
+    )
+
+
+async def build_aicrush_pair_explanation(
+    target_member: discord.Member,
+    *,
+    crush_row: dict[str, Any] | None,
+    admirer_row: dict[str, Any] | None,
+    context: "AICrushContext",
+    crush_confidence: float,
+    admirer_confidence: float,
+) -> str:
+    target_topics = ", ".join(context.target_topics[:6]) or "limited topic evidence"
+    target_texture = _aicrush_sample_texture(context.target_samples, limit=2)
+    crush_texture = _aicrush_sample_texture(
+        crush_row.get("samples", []) if isinstance(crush_row, dict) else [],
+        limit=2,
+    )
+    admirer_texture = _aicrush_sample_texture(
+        admirer_row.get("samples", []) if isinstance(admirer_row, dict) else [],
+        limit=2,
+    )
+    local_reason = "\n".join(
+        [
+            _aicrush_direction_evidence_line(
+                target_member,
+                label="Likely crush",
+                row=crush_row,
+            ),
+            _aicrush_direction_evidence_line(
+                target_member,
+                label="Likely admirer",
+                row=admirer_row,
+            ),
+            f"Target chat themes: {target_topics}.",
+            f"Target sample texture: {target_texture}.",
+            f"Candidate sample texture: crush {crush_texture}; admirer {admirer_texture}.",
+        ]
+    )
+    if not GROQ_API_KEY and not is_ai_configured():
+        return local_reason
+
+    prompt = (
+        "Rewrite the evidence summary into a detailed Discord crush explanation.\n"
+        "Keep it to 4-6 short lines, evidence-first, fun-only, no explicit content, and no certainty claims.\n"
+        "Do not invent facts. Reuse the supplied signals, channels, themes, and sample texture.\n"
+        "Mention uncertainty if the evidence feels sparse.\n"
+        f"Target: {target_member.display_name}\n"
+        f"Crush confidence: {crush_confidence:.2f}\n"
+        f"Admirer confidence: {admirer_confidence:.2f}\n"
+        "Evidence summary:\n"
+        f"{local_reason}"
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You write evidence-based Discord feature copy. Keep it playful but grounded in the supplied chat evidence, "
+                "avoid harsh claims, and mention uncertainty when evidence is sparse."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        if GROQ_API_KEY:
+            return await request_groq_completion(
+                messages,
+                max_tokens=220,
+                temperature=0.45,
+                model_override=AICRUSH_EXPLAIN_MODEL or None,
+                fallback_models=AICRUSH_FALLBACK_MODELS,
+            )
+        return await request_ai_completion(
+            messages,
+            max_tokens=220,
+            temperature=0.45,
+            policy_key="aicrush_explain",
+            model_override=(AICRUSH_EXPLAIN_MODEL or None) if AI_PROVIDER == "groq" else None,
+            fallback_models=AICRUSH_FALLBACK_MODELS if AI_PROVIDER == "groq" else None,
+        )
+    except Exception:
+        return local_reason
+
+
+def _altfinder_name_aliases(display_name: str, username: str) -> dict[str, list[str]]:
+    phrases: set[str] = set()
+    tokens: set[str] = set()
+    for raw_name in (display_name, username):
+        normalized = normalize_aicrush_text(raw_name)
+        if not normalized:
+            continue
+        if len(normalized) >= 3 and normalized not in AICRUSH_ALIAS_STOP_WORDS:
+            phrases.add(normalized)
+        parts = [part for part in normalized.split() if _aicrush_is_valid_alias_token(part)]
+        tokens.update(parts)
+        if len(parts) >= 2:
+            merged = "".join(parts)
+            if len(merged) >= 4 and merged not in AICRUSH_ALIAS_STOP_WORDS:
+                phrases.add(merged)
+    compact = _altfinder_compact_name(display_name)
+    if len(compact) >= 4:
+        phrases.add(compact)
+    return {"phrases": sorted(phrases), "tokens": sorted(tokens)}
+
+
+def _altfinder_compact_name(text: str) -> str:
+    return normalize_aicrush_text(text).replace(" ", "")
+
+
+def _altfinder_asset_key(asset: object) -> str:
+    if asset is None:
+        return ""
+    try:
+        raw = str(getattr(asset, "url", "") or str(asset))
+    except Exception:
+        return ""
+    if not raw:
+        return ""
+    return raw.split("?", 1)[0].strip()
+
+
+def _altfinder_counter_overlap(left: dict[str, int], right: dict[str, int]) -> float:
+    if not left or not right:
+        return 0.0
+    shared = set(left).intersection(right)
+    if not shared:
+        return 0.0
+    numerator = sum(min(int(left[key]), int(right[key])) for key in shared)
+    denominator = max(
+        1,
+        sum(int(value) for value in left.values()) + sum(int(value) for value in right.values()),
+    )
+    return round((2.0 * numerator) / denominator, 4)
+
+
+def _altfinder_set_overlap(left: set[int] | set[str], right: set[int] | set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    union = left.union(right)
+    if not union:
+        return 0.0
+    return round(len(left.intersection(right)) / len(union), 4)
+
+
+def _altfinder_scalar_similarity(left: float, right: float, scale: float) -> float:
+    if scale <= 0:
+        return 0.0
+    diff = abs(float(left) - float(right))
+    return round(max(0.0, 1.0 - (diff / scale)), 4)
+
+
+def _altfinder_time_proximity_score(left_ts: float, right_ts: float) -> float:
+    if left_ts <= 0 or right_ts <= 0:
+        return 0.0
+    diff_days = abs(left_ts - right_ts) / 86400.0
+    if diff_days <= 1:
+        return 1.0
+    if diff_days <= 3:
+        return 0.85
+    if diff_days <= 7:
+        return 0.68
+    if diff_days <= 30:
+        return 0.42
+    if diff_days <= 120:
+        return 0.2
+    return 0.0
+
+
+def _altfinder_counter_common(
+    left: dict[str, int], right: dict[str, int], limit: int
+) -> list[tuple[str, float]]:
+    common: list[tuple[str, float]] = []
+    for key in set(left).intersection(right):
+        common.append((key, float(min(int(left[key]), int(right[key])))))
+    common.sort(key=lambda item: item[1], reverse=True)
+    return common[:limit]
+
+
+def _altfinder_counter_update(
+    row: dict[str, Any], field: str, key: int | str, amount: int, limit: int
+) -> None:
+    if amount <= 0:
+        return
+    counter = row.get(field)
+    if not isinstance(counter, dict):
+        counter = {}
+        row[field] = counter
+    text_key = str(key)
+    counter[text_key] = int(counter.get(text_key, 0) or 0) + int(amount)
+    if len(counter) > limit:
+        ordered = sorted(
+            counter.items(),
+            key=lambda item: int(item[1] or 0),
+            reverse=True,
+        )[:limit]
+        row[field] = {str(name): int(value) for name, value in ordered}
+
+
+def _altfinder_profile_signature(
+    display_name: str,
+    username: str,
+    avatar_key: str,
+    display_avatar_key: str,
+    default_avatar_key: str,
+) -> str:
+    compact_display = _altfinder_compact_name(display_name)
+    compact_user = _altfinder_compact_name(username)
+    avatar_basis = avatar_key or display_avatar_key or default_avatar_key or "no_avatar"
+    return f"{compact_display}|{compact_user}|{avatar_basis}"
+
+
+def _altfinder_normalize_status(status: object) -> str:
+    text = str(status or "").strip().lower()
+    if text in {"online", "idle", "dnd", "offline"}:
+        return text
+    if text in {"do_not_disturb", "do not disturb"}:
+        return "dnd"
+    return "offline"
+
+
+def _altfinder_apply_user_snapshot(row: dict[str, Any], user: discord.abc.User) -> None:
+    display_name = get_user_display_name(user)
+    username = getattr(user, "name", display_name)
+    row["display_name"] = display_name
+    row["username"] = username
+    row["aliases"] = _altfinder_name_aliases(display_name, username)
+    created_at = getattr(user, "created_at", None)
+    joined_at = getattr(user, "joined_at", None)
+    row["created_at_ts"] = created_at.timestamp() if created_at else 0.0
+    row["joined_at_ts"] = joined_at.timestamp() if joined_at else float(row.get("joined_at_ts", 0.0) or 0.0)
+    avatar_key = _altfinder_asset_key(getattr(user, "avatar", None))
+    display_avatar_key = _altfinder_asset_key(getattr(user, "display_avatar", None))
+    default_avatar_key = _altfinder_asset_key(getattr(user, "default_avatar", None))
+    row["avatar_key"] = avatar_key
+    row["display_avatar_key"] = display_avatar_key
+    row["default_avatar_key"] = default_avatar_key
+    signature = _altfinder_profile_signature(
+        display_name,
+        username,
+        avatar_key,
+        display_avatar_key,
+        default_avatar_key,
+    )
+    _altfinder_counter_update(row, "profile_signatures", signature, 1, 8)
+
+
+def _altfinder_sync_presence_snapshot(
+    row: dict[str, Any],
+    member: discord.Member,
+    *,
+    increment_history: bool,
+) -> None:
+    status_name = _altfinder_normalize_status(getattr(member, "status", None))
+    row["last_status"] = status_name
+    row["last_status_ts"] = time.time()
+    if not increment_history:
+        return
+    now_dt = _utc_now().astimezone(_safe_zoneinfo(get_guild_engagement_timezone(member.guild.id)))
+    _altfinder_counter_update(row, "presence_hours", now_dt.hour, 1, 24)
+    _altfinder_counter_update(row, "presence_weekdays", now_dt.weekday(), 1, 7)
+    _altfinder_counter_update(row, "status_counts", status_name, 1, 8)
+    last_status = str(row.get("presence_prev_status", "") or "")
+    if last_status and last_status != status_name:
+        _altfinder_counter_update(row, "status_transitions", f"{last_status}->{status_name}", 1, 16)
+    row["presence_prev_status"] = status_name
+
+
+def _altfinder_get_user_row(guild_state: dict[str, Any], user_id: int) -> dict[str, Any]:
+    users = guild_state.setdefault("users", {})
+    key = str(user_id)
+    row = users.get(key)
+    if not isinstance(row, dict):
+        row = {
+            "display_name": f"user-{user_id}",
+            "username": f"user-{user_id}",
+            "aliases": {"phrases": [], "tokens": []},
+            "created_at_ts": 0.0,
+            "joined_at_ts": 0.0,
+            "avatar_key": "",
+            "display_avatar_key": "",
+            "default_avatar_key": "",
+            "message_count": 0,
+            "last_message_ts": 0.0,
+            "message_total_chars": 0,
+            "message_total_words": 0,
+            "question_count": 0,
+            "exclaim_count": 0,
+            "emoji_total": 0,
+            "uppercase_chars_total": 0,
+            "link_count": 0,
+            "attachment_count": 0,
+            "mention_message_count": 0,
+            "reply_message_count": 0,
+            "topic_token_total": 0,
+            "topics": {},
+            "bigrams": {},
+            "samples": [],
+            "starter_tokens": {},
+            "ending_tokens": {},
+            "top_channels": {},
+            "active_hours": {},
+            "active_weekdays": {},
+            "presence_hours": {},
+            "presence_weekdays": {},
+            "status_counts": {},
+            "status_transitions": {},
+            "last_status": "offline",
+            "last_status_ts": 0.0,
+            "presence_prev_status": "",
+            "reply_targets": {},
+            "mention_targets": {},
+            "copresence_targets": {},
+            "profile_signatures": {},
+        }
+        users[key] = row
+    for field in (
+        "aliases",
+        "topics",
+        "bigrams",
+        "samples",
+        "starter_tokens",
+        "ending_tokens",
+        "top_channels",
+        "active_hours",
+        "active_weekdays",
+        "presence_hours",
+        "presence_weekdays",
+        "status_counts",
+        "status_transitions",
+        "reply_targets",
+        "mention_targets",
+        "copresence_targets",
+        "profile_signatures",
+    ):
+        current = row.get(field)
+        if field == "samples":
+            if not isinstance(current, list):
+                row[field] = []
+        elif field == "aliases":
+            if not isinstance(current, dict):
+                row[field] = {"phrases": [], "tokens": []}
+            else:
+                if not isinstance(current.get("phrases"), list):
+                    current["phrases"] = []
+                if not isinstance(current.get("tokens"), list):
+                    current["tokens"] = []
+        elif not isinstance(current, dict):
+            row[field] = {}
+    return row
+
+
+def _altfinder_extract_valid_tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+    for token in aicrush_tokenize(text):
+        if _aicrush_is_valid_alias_token(token):
+            tokens.append(token)
+    return tokens
+
+
+def _altfinder_extract_bigrams(tokens: list[str]) -> list[str]:
+    output: list[str] = []
+    for first, second in zip(tokens, tokens[1:]):
+        if first == second:
+            continue
+        output.append(f"{first} {second}")
+    return output
+
+
+def _altfinder_track_recent_channel_author(
+    guild_id: int,
+    channel_id: int,
+    author_id: int,
+    created_ts: float,
+) -> list[int]:
+    key = (guild_id, channel_id)
+    queue = ALTFINDER_CHANNEL_RECENT_AUTHORS[key]
+    while queue and created_ts - queue[0][0] > AICRUSH_CHANNEL_RECENT_WINDOW_SECONDS:
+        queue.popleft()
+    others = {other_author for _, other_author in queue if other_author != author_id}
+    queue.append((created_ts, author_id))
+    return list(others)
+
+
+def _altfinder_invalidate_guild_cache(guild_id: int) -> None:
+    for cache_key in list(ALTFINDER_RESULT_CACHE.keys()):
+        if cache_key[0] == guild_id:
+            ALTFINDER_RESULT_CACHE.pop(cache_key, None)
+
+
+def _altfinder_sample_texture(samples: list[str], limit: int = 2) -> str:
+    if not samples:
+        return "no visible sample texture"
+    chosen = [" ".join(sample.split()).strip()[:120] for sample in samples[:limit]]
+    chosen = [sample for sample in chosen if sample]
+    return " | ".join(chosen) if chosen else "no visible sample texture"
+
+
+def refresh_altfinder_member_directory(guild: discord.Guild) -> None:
+    guild_state = get_guild_altfinder_state(guild.id)
+    for member in guild.members:
+        if member.bot:
+            continue
+        row = _altfinder_get_user_row(guild_state, member.id)
+        _altfinder_apply_user_snapshot(row, member)
+        _altfinder_sync_presence_snapshot(row, member, increment_history=False)
+    _mark_altfinder_dirty()
+
+
+def record_altfinder_presence(member: discord.Member) -> None:
+    if member.bot:
+        return
+    guild_state = get_guild_altfinder_state(member.guild.id)
+    row = _altfinder_get_user_row(guild_state, member.id)
+    _altfinder_apply_user_snapshot(row, member)
+    _altfinder_sync_presence_snapshot(row, member, increment_history=True)
+    _mark_altfinder_dirty()
+    _altfinder_invalidate_guild_cache(member.guild.id)
+
+
+def index_altfinder_message(message: discord.Message, *, backfill: bool = False) -> set[int]:
+    if message.guild is None or message.author.bot:
+        return set()
+    content = message.clean_content.strip()
+    if not content and not message.attachments:
+        return set()
+    if not content and message.attachments:
+        content = "[attachment]"
+
+    guild_state = get_guild_altfinder_state(message.guild.id)
+    created_ts = message.created_at.timestamp()
+    meta = guild_state.setdefault("meta", {})
+    channels = guild_state.setdefault("channels", {})
+    channel_row = channels.setdefault(
+        str(message.channel.id),
+        {
+            "latest_message_id": 0,
+            "earliest_message_id": 0,
+            "last_message_ts": 0.0,
+            "before_message_id": 0,
+            "fully_scanned": False,
+            "last_backfill_ts": 0.0,
+        },
+    )
+    channel_row["latest_message_id"] = max(int(channel_row.get("latest_message_id", 0) or 0), int(message.id))
+    earliest = int(channel_row.get("earliest_message_id", 0) or 0)
+    channel_row["earliest_message_id"] = int(message.id) if earliest <= 0 else min(earliest, int(message.id))
+    channel_row["last_message_ts"] = max(float(channel_row.get("last_message_ts", 0.0) or 0.0), created_ts)
+    if backfill:
+        channel_row["last_backfill_ts"] = time.time()
+        meta["last_backfill_ts"] = time.time()
+    else:
+        meta["last_incremental_ts"] = time.time()
+    meta["messages_indexed"] = int(meta.get("messages_indexed", 0) or 0) + 1
+    meta["last_indexed_message_ts"] = max(float(meta.get("last_indexed_message_ts", 0.0) or 0.0), created_ts)
+
+    user = message.author
+    row = _altfinder_get_user_row(guild_state, user.id)
+    _altfinder_apply_user_snapshot(row, user)
+    row["message_count"] = int(row.get("message_count", 0) or 0) + 1
+    row["last_message_ts"] = max(float(row.get("last_message_ts", 0.0) or 0.0), created_ts)
+    row["message_total_chars"] = int(row.get("message_total_chars", 0) or 0) + len(content)
+    row["message_total_words"] = int(row.get("message_total_words", 0) or 0) + len(WORD_PATTERN.findall(content))
+    row["question_count"] = int(row.get("question_count", 0) or 0) + (1 if "?" in content else 0)
+    row["exclaim_count"] = int(row.get("exclaim_count", 0) or 0) + (1 if "!" in content else 0)
+    row["emoji_total"] = int(row.get("emoji_total", 0) or 0) + len(EMOJI_PATTERN.findall(content))
+    row["uppercase_chars_total"] = int(row.get("uppercase_chars_total", 0) or 0) + sum(1 for ch in content if ch.isupper())
+    row["link_count"] = int(row.get("link_count", 0) or 0) + (1 if LINK_PATTERN.search(content) else 0)
+    row["attachment_count"] = int(row.get("attachment_count", 0) or 0) + (1 if message.attachments else 0)
+    row["mention_message_count"] = int(row.get("mention_message_count", 0) or 0) + (1 if message.mentions else 0)
+    row["reply_message_count"] = int(row.get("reply_message_count", 0) or 0) + (1 if message.reference else 0)
+    _altfinder_counter_update(row, "top_channels", message.channel.id, 1, 18)
+    message_dt = message.created_at.astimezone(_safe_zoneinfo(get_guild_engagement_timezone(message.guild.id)))
+    _altfinder_counter_update(row, "active_hours", message_dt.hour, 1, 24)
+    _altfinder_counter_update(row, "active_weekdays", message_dt.weekday(), 1, 7)
+    _altfinder_sync_presence_snapshot(row, user, increment_history=False)
+
+    tokens = _altfinder_extract_valid_tokens(content)
+    row["topic_token_total"] = int(row.get("topic_token_total", 0) or 0) + len(tokens)
+    for token in tokens[:18]:
+        _altfinder_counter_update(row, "topics", token, 1, 40)
+    for bigram in _altfinder_extract_bigrams(tokens[:24])[:18]:
+        _altfinder_counter_update(row, "bigrams", bigram, 1, 40)
+    if tokens:
+        _altfinder_counter_update(row, "starter_tokens", tokens[0], 1, 24)
+        _altfinder_counter_update(row, "ending_tokens", tokens[-1], 1, 24)
+    _aicrush_remember_message_author(int(message.id), int(user.id), created_ts)
+    _aicrush_append_unique_sample(row["samples"], content, 12)
+
+    impacted_ids: set[int] = {user.id}
+    mention_ids = {
+        int(member.id)
+        for member in message.mentions
+        if not member.bot and member.id != user.id
+    }
+    for mention_id in mention_ids:
+        _altfinder_counter_update(row, "mention_targets", mention_id, 1, 40)
+        impacted_ids.add(mention_id)
+
+    reply_target_id = _aicrush_resolve_reply_target_id(message)
+    if reply_target_id is not None and reply_target_id != user.id:
+        _altfinder_counter_update(row, "reply_targets", reply_target_id, 1, 40)
+        impacted_ids.add(reply_target_id)
+
+    recent_others = _altfinder_track_recent_channel_author(
+        message.guild.id,
+        message.channel.id,
+        user.id,
+        created_ts,
+    )
+    for other_id in recent_others[:12]:
+        _altfinder_counter_update(row, "copresence_targets", other_id, 1, 45)
+        impacted_ids.add(other_id)
+
+    _mark_altfinder_dirty()
+    _altfinder_invalidate_guild_cache(message.guild.id)
+    return impacted_ids
+
+
+async def run_altfinder_backfill(
+    guild: discord.Guild,
+    *,
+    message_budget: int | None = None,
+    time_budget_seconds: float | None = None,
+) -> dict[str, Any]:
+    guild_state = get_guild_altfinder_state(guild.id)
+    channels = get_readable_text_channels(guild)
+    if AICRUSH_MAX_CHANNELS > 0:
+        channels = channels[:AICRUSH_MAX_CHANNELS]
+    channel_rows = guild_state.setdefault("channels", {})
+    for channel in channels:
+        channel_rows.setdefault(
+            str(channel.id),
+            {
+                "latest_message_id": 0,
+                "earliest_message_id": 0,
+                "last_message_ts": 0.0,
+                "before_message_id": 0,
+                "fully_scanned": False,
+                "last_backfill_ts": 0.0,
+            },
+        )
+
+    remaining_budget = max(200, int(message_budget or ALTFINDER_BACKFILL_MESSAGE_BUDGET))
+    deadline = time.monotonic() + float(time_budget_seconds or ALTFINDER_BACKFILL_TIME_BUDGET_SECONDS)
+    fetched_messages: list[discord.Message] = []
+    processed_channels = 0
+    passes = 0
+
+    while remaining_budget > 0 and time.monotonic() < deadline:
+        passes += 1
+        pass_scanned = 0
+        channel_priority = sorted(
+            channels,
+            key=lambda channel: (
+                1 if bool(channel_rows.get(str(channel.id), {}).get("fully_scanned")) else 0,
+                float(channel_rows.get(str(channel.id), {}).get("last_backfill_ts", 0.0) or 0.0),
+            ),
+        )
+        for channel in channel_priority:
+            if remaining_budget <= 0 or time.monotonic() >= deadline:
+                break
+            row = channel_rows.setdefault(str(channel.id), {})
+            if bool(row.get("fully_scanned")):
+                continue
+            per_channel_limit = min(max(50, AICRUSH_SCAN_PER_CHANNEL), remaining_budget)
+            history_kwargs: dict[str, Any] = {"limit": per_channel_limit}
+            before_message_id = int(row.get("before_message_id", 0) or 0)
+            if before_message_id <= 0:
+                before_message_id = int(row.get("earliest_message_id", 0) or 0)
+            if before_message_id > 0:
+                history_kwargs["before"] = discord.Object(id=before_message_id)
+            batch: list[discord.Message] = []
+            try:
+                async for msg in channel.history(**history_kwargs):
+                    if not msg.author.bot:
+                        batch.append(msg)
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+            processed_channels += 1
+            row["last_backfill_ts"] = time.time()
+            if not batch:
+                row["fully_scanned"] = True
+                continue
+            oldest_id = min(int(msg.id) for msg in batch)
+            row["before_message_id"] = oldest_id
+            earliest = int(row.get("earliest_message_id", 0) or 0)
+            row["earliest_message_id"] = oldest_id if earliest <= 0 else min(earliest, oldest_id)
+            if len(batch) < per_channel_limit:
+                row["fully_scanned"] = True
+            fetched_messages.extend(batch)
+            remaining_budget -= len(batch)
+            pass_scanned += len(batch)
+            if (
+                AICRUSH_SCAN_PAUSE_EVERY > 0
+                and AICRUSH_SCAN_PAUSE_SECONDS > 0
+                and pass_scanned % AICRUSH_SCAN_PAUSE_EVERY == 0
+            ):
+                await asyncio.sleep(AICRUSH_SCAN_PAUSE_SECONDS)
+        if pass_scanned <= 0:
+            break
+
+    fetched_messages.sort(key=lambda msg: (msg.created_at.timestamp(), int(msg.id)))
+    for msg in fetched_messages:
+        index_altfinder_message(msg, backfill=True)
+
+    channels_total = len(channels)
+    channels_fully_scanned = sum(
+        1
+        for row in channel_rows.values()
+        if isinstance(row, dict) and bool(row.get("fully_scanned"))
+    )
+    meta = guild_state.setdefault("meta", {})
+    meta["last_backfill_ts"] = time.time()
+    _mark_altfinder_dirty()
+    return {
+        "scanned_messages": len(fetched_messages),
+        "channels_considered": channels_total,
+        "channels_touched": processed_channels,
+        "channels_fully_scanned": channels_fully_scanned,
+        "messages_indexed": int(meta.get("messages_indexed", 0) or 0),
+        "passes": passes,
+    }
+
+
+def _altfinder_user_metrics(row: dict[str, Any]) -> dict[str, Any]:
+    message_count = int(row.get("message_count", 0) or 0)
+    total_chars = int(row.get("message_total_chars", 0) or 0)
+    total_words = int(row.get("message_total_words", 0) or 0)
+    topic_total = int(row.get("topic_token_total", 0) or 0)
+    topics = row.get("topics", {}) if isinstance(row.get("topics"), dict) else {}
+    return {
+        "message_count": message_count,
+        "avg_len": (total_chars / max(1, message_count)) if message_count > 0 else 0.0,
+        "avg_words": (total_words / max(1, message_count)) if message_count > 0 else 0.0,
+        "question_ratio": int(row.get("question_count", 0) or 0) / max(1, message_count),
+        "exclaim_ratio": int(row.get("exclaim_count", 0) or 0) / max(1, message_count),
+        "emoji_per_msg": int(row.get("emoji_total", 0) or 0) / max(1, message_count),
+        "uppercase_ratio": int(row.get("uppercase_chars_total", 0) or 0) / max(1, total_chars),
+        "link_ratio": int(row.get("link_count", 0) or 0) / max(1, message_count),
+        "attachment_ratio": int(row.get("attachment_count", 0) or 0) / max(1, message_count),
+        "mention_rate": int(row.get("mention_message_count", 0) or 0) / max(1, message_count),
+        "reply_rate": int(row.get("reply_message_count", 0) or 0) / max(1, message_count),
+        "vocab_diversity": len(topics) / max(1, topic_total),
+        "topics": topics,
+        "bigrams": row.get("bigrams", {}) if isinstance(row.get("bigrams"), dict) else {},
+        "starter_tokens": row.get("starter_tokens", {}) if isinstance(row.get("starter_tokens"), dict) else {},
+        "ending_tokens": row.get("ending_tokens", {}) if isinstance(row.get("ending_tokens"), dict) else {},
+        "top_channels": row.get("top_channels", {}) if isinstance(row.get("top_channels"), dict) else {},
+        "active_hours": row.get("active_hours", {}) if isinstance(row.get("active_hours"), dict) else {},
+        "active_weekdays": row.get("active_weekdays", {}) if isinstance(row.get("active_weekdays"), dict) else {},
+        "presence_hours": row.get("presence_hours", {}) if isinstance(row.get("presence_hours"), dict) else {},
+        "presence_weekdays": row.get("presence_weekdays", {}) if isinstance(row.get("presence_weekdays"), dict) else {},
+        "status_counts": row.get("status_counts", {}) if isinstance(row.get("status_counts"), dict) else {},
+        "status_transitions": row.get("status_transitions", {}) if isinstance(row.get("status_transitions"), dict) else {},
+        "last_status": str(row.get("last_status", "offline") or "offline"),
+        "reply_targets": row.get("reply_targets", {}) if isinstance(row.get("reply_targets"), dict) else {},
+        "mention_targets": row.get("mention_targets", {}) if isinstance(row.get("mention_targets"), dict) else {},
+        "copresence_targets": row.get("copresence_targets", {}) if isinstance(row.get("copresence_targets"), dict) else {},
+        "samples": row.get("samples", []) if isinstance(row.get("samples"), list) else [],
+        "profile_signatures": row.get("profile_signatures", {}) if isinstance(row.get("profile_signatures"), dict) else {},
+    }
+
+
+@dataclass
+class AltFinderContext:
+    target_row: dict[str, Any]
+    target_metrics: dict[str, Any]
+    target_message_count: int
+    scan_coverage: dict[str, Any]
+    candidate_rows: dict[int, dict[str, Any]]
+    current_member_ids: set[int]
+    suspect_ids: list[int]
+
+
+def collect_altfinder_context(guild: discord.Guild, target_member: discord.Member) -> AltFinderContext:
+    refresh_altfinder_member_directory(guild)
+    guild_state = get_guild_altfinder_state(guild.id)
+    users = guild_state.get("users", {}) if isinstance(guild_state.get("users"), dict) else {}
+    target_row = _altfinder_get_user_row(guild_state, target_member.id)
+    target_metrics = _altfinder_user_metrics(target_row)
+    candidate_rows: dict[int, dict[str, Any]] = {}
+    for user_key, row in users.items():
+        if not isinstance(row, dict):
+            continue
+        try:
+            user_id = int(user_key)
+        except (TypeError, ValueError):
+            continue
+        if user_id == target_member.id:
+            continue
+        candidate_rows[user_id] = row
+    current_member_ids = {member.id for member in guild.members if not member.bot}
+    channels = guild_state.get("channels", {}) if isinstance(guild_state.get("channels"), dict) else {}
+    channels_total = len(channels)
+    channels_fully_scanned = sum(
+        1
+        for row in channels.values()
+        if isinstance(row, dict) and bool(row.get("fully_scanned"))
+    )
+    meta = guild_state.get("meta", {}) if isinstance(guild_state.get("meta"), dict) else {}
+    scan_coverage = {
+        "channels_total": channels_total,
+        "channels_fully_scanned": channels_fully_scanned,
+        "messages_indexed": int(meta.get("messages_indexed", 0) or 0),
+        "last_backfill_ts": float(meta.get("last_backfill_ts", 0.0) or 0.0),
+        "last_indexed_message_ts": float(meta.get("last_indexed_message_ts", 0.0) or 0.0),
+    }
+    return AltFinderContext(
+        target_row=target_row,
+        target_metrics=target_metrics,
+        target_message_count=int(target_row.get("message_count", 0) or 0),
+        scan_coverage=scan_coverage,
+        candidate_rows=candidate_rows,
+        current_member_ids=current_member_ids,
+        suspect_ids=get_altfinder_suspects(guild.id, target_member.id),
+    )
+
+
+def _altfinder_name_similarity(target_row: dict[str, Any], candidate_row: dict[str, Any]) -> float:
+    target_aliases = target_row.get("aliases", {}) if isinstance(target_row.get("aliases"), dict) else {}
+    candidate_aliases = candidate_row.get("aliases", {}) if isinstance(candidate_row.get("aliases"), dict) else {}
+    target_tokens = set(str(item) for item in target_aliases.get("tokens", []) if item)
+    candidate_tokens = set(str(item) for item in candidate_aliases.get("tokens", []) if item)
+    target_phrases = set(str(item) for item in target_aliases.get("phrases", []) if item)
+    candidate_phrases = set(str(item) for item in candidate_aliases.get("phrases", []) if item)
+    token_overlap = _altfinder_set_overlap(target_tokens, candidate_tokens)
+    phrase_overlap = _altfinder_set_overlap(target_phrases, candidate_phrases)
+    display_similarity = difflib.SequenceMatcher(
+        None,
+        _altfinder_compact_name(str(target_row.get("display_name", ""))),
+        _altfinder_compact_name(str(candidate_row.get("display_name", ""))),
+    ).ratio()
+    username_similarity = difflib.SequenceMatcher(
+        None,
+        _altfinder_compact_name(str(target_row.get("username", ""))),
+        _altfinder_compact_name(str(candidate_row.get("username", ""))),
+    ).ratio()
+    return round(
+        min(1.0, (token_overlap * 0.3) + (phrase_overlap * 0.25) + (display_similarity * 0.25) + (username_similarity * 0.2)),
+        4,
+    )
+
+
+def _altfinder_metadata_components(target_row: dict[str, Any], candidate_row: dict[str, Any]) -> dict[str, Any]:
+    name_similarity = _altfinder_name_similarity(target_row, candidate_row)
+    created_proximity = _altfinder_time_proximity_score(
+        float(target_row.get("created_at_ts", 0.0) or 0.0),
+        float(candidate_row.get("created_at_ts", 0.0) or 0.0),
+    )
+    joined_proximity = _altfinder_time_proximity_score(
+        float(target_row.get("joined_at_ts", 0.0) or 0.0),
+        float(candidate_row.get("joined_at_ts", 0.0) or 0.0),
+    )
+    target_avatar_key = str(target_row.get("avatar_key", "") or "")
+    candidate_avatar_key = str(candidate_row.get("avatar_key", "") or "")
+    target_default_avatar_key = str(target_row.get("default_avatar_key", "") or "")
+    candidate_default_avatar_key = str(candidate_row.get("default_avatar_key", "") or "")
+    exact_avatar_match = bool(target_avatar_key and target_avatar_key == candidate_avatar_key)
+    exact_default_avatar_match = bool(
+        target_default_avatar_key
+        and candidate_default_avatar_key
+        and target_default_avatar_key == candidate_default_avatar_key
+    )
+    target_signatures = target_row.get("profile_signatures", {}) if isinstance(target_row.get("profile_signatures"), dict) else {}
+    candidate_signatures = candidate_row.get("profile_signatures", {}) if isinstance(candidate_row.get("profile_signatures"), dict) else {}
+    shared_signatures = set(target_signatures).intersection(candidate_signatures)
+    metadata_similarity = min(
+        1.0,
+        (name_similarity * 0.34)
+        + (created_proximity * 0.14)
+        + (joined_proximity * 0.12)
+        + (0.26 if exact_avatar_match else 0.0)
+        + (0.12 if exact_default_avatar_match else 0.0)
+        + min(0.2, len(shared_signatures) * 0.1),
+    )
+    return {
+        "name_similarity": round(name_similarity, 4),
+        "created_proximity": round(created_proximity, 4),
+        "joined_proximity": round(joined_proximity, 4),
+        "exact_avatar_match": exact_avatar_match,
+        "exact_default_avatar_match": exact_default_avatar_match,
+        "shared_signature_count": len(shared_signatures),
+        "shared_signatures": sorted(shared_signatures)[:4],
+        "metadata_similarity": round(metadata_similarity, 4),
+    }
+
+
+def _altfinder_resolve_label(
+    guild: discord.Guild,
+    candidate_id: int,
+    candidate_row: dict[str, Any],
+    current_member_ids: set[int],
+) -> dict[str, str]:
+    if candidate_id in current_member_ids:
+        member = guild.get_member(candidate_id)
+        if member is not None:
+            return {
+                "display": member.mention,
+                "plain": member.display_name,
+                "scope": "current member",
+            }
+    stored_name = str(candidate_row.get("display_name", "") or candidate_row.get("username", "") or "").strip()
+    plain = stored_name if stored_name else f"historical user {candidate_id}"
+    return {
+        "display": f"{plain} (`{candidate_id}`)",
+        "plain": plain,
+        "scope": "historical seen",
+    }
+
+
+def build_altfinder_candidate_pool(
+    guild: discord.Guild,
+    target_member: discord.Member,
+    context: AltFinderContext,
+    limit: int,
+) -> list[dict[str, Any]]:
+    target_metrics = context.target_metrics
+    target_row = context.target_row
+    suspect_id_set = {int(user_id) for user_id in context.suspect_ids}
+    candidates: list[dict[str, Any]] = []
+    for candidate_id, candidate_row in context.candidate_rows.items():
+        candidate_metrics = _altfinder_user_metrics(candidate_row)
+        candidate_message_count = int(candidate_metrics.get("message_count", 0) or 0)
+        if candidate_message_count <= 0:
+            continue
+        is_suspect = candidate_id in suspect_id_set
+
+        style_similarity = min(
+            1.0,
+            (_altfinder_scalar_similarity(float(target_metrics["avg_len"]), float(candidate_metrics["avg_len"]), 80.0) * 0.25)
+            + (_altfinder_scalar_similarity(float(target_metrics["avg_words"]), float(candidate_metrics["avg_words"]), 18.0) * 0.12)
+            + (_altfinder_scalar_similarity(float(target_metrics["question_ratio"]), float(candidate_metrics["question_ratio"]), 0.45) * 0.18)
+            + (_altfinder_scalar_similarity(float(target_metrics["exclaim_ratio"]), float(candidate_metrics["exclaim_ratio"]), 0.45) * 0.18)
+            + (_altfinder_scalar_similarity(float(target_metrics["emoji_per_msg"]), float(candidate_metrics["emoji_per_msg"]), 2.0) * 0.12)
+            + (_altfinder_scalar_similarity(float(target_metrics["uppercase_ratio"]), float(candidate_metrics["uppercase_ratio"]), 0.18) * 0.08)
+            + (_altfinder_scalar_similarity(float(target_metrics["link_ratio"]), float(candidate_metrics["link_ratio"]), 0.4) * 0.06)
+            + (_altfinder_scalar_similarity(float(target_metrics["mention_rate"]), float(candidate_metrics["mention_rate"]), 0.5) * 0.06)
+            + (_altfinder_scalar_similarity(float(target_metrics["reply_rate"]), float(candidate_metrics["reply_rate"]), 0.5) * 0.06)
+            + (_altfinder_scalar_similarity(float(target_metrics["vocab_diversity"]), float(candidate_metrics["vocab_diversity"]), 0.45) * 0.12)
+            + (_altfinder_counter_overlap(target_metrics["starter_tokens"], candidate_metrics["starter_tokens"]) * 0.08)
+            + (_altfinder_counter_overlap(target_metrics["ending_tokens"], candidate_metrics["ending_tokens"]) * 0.06)
+            + (_altfinder_counter_overlap(target_metrics["bigrams"], candidate_metrics["bigrams"]) * 0.15),
+        )
+        message_schedule_similarity = min(
+            1.0,
+            (_altfinder_counter_overlap(target_metrics["active_hours"], candidate_metrics["active_hours"]) * 0.68)
+            + (_altfinder_counter_overlap(target_metrics["active_weekdays"], candidate_metrics["active_weekdays"]) * 0.32),
+        )
+        presence_schedule_similarity = min(
+            1.0,
+            (_altfinder_counter_overlap(target_metrics["presence_hours"], candidate_metrics["presence_hours"]) * 0.55)
+            + (_altfinder_counter_overlap(target_metrics["presence_weekdays"], candidate_metrics["presence_weekdays"]) * 0.2)
+            + (_altfinder_counter_overlap(target_metrics["status_counts"], candidate_metrics["status_counts"]) * 0.15)
+            + (_altfinder_counter_overlap(target_metrics["status_transitions"], candidate_metrics["status_transitions"]) * 0.1),
+        )
+        schedule_similarity = min(
+            1.0,
+            (message_schedule_similarity * 0.62) + (presence_schedule_similarity * 0.38),
+        )
+        channel_similarity = _altfinder_counter_overlap(
+            target_metrics["top_channels"],
+            candidate_metrics["top_channels"],
+        )
+        reply_overlap = _altfinder_counter_overlap(
+            target_metrics["reply_targets"],
+            candidate_metrics["reply_targets"],
+        )
+        mention_overlap = _altfinder_counter_overlap(
+            target_metrics["mention_targets"],
+            candidate_metrics["mention_targets"],
+        )
+        copresence_overlap = _altfinder_counter_overlap(
+            target_metrics["copresence_targets"],
+            candidate_metrics["copresence_targets"],
+        )
+        interaction_similarity = min(
+            1.0,
+            (reply_overlap * 0.4) + (mention_overlap * 0.35) + (copresence_overlap * 0.25),
+        )
+        topic_similarity = min(
+            1.0,
+            (_altfinder_counter_overlap(target_metrics["topics"], candidate_metrics["topics"]) * 0.72)
+            + (_altfinder_counter_overlap(target_metrics["bigrams"], candidate_metrics["bigrams"]) * 0.28),
+        )
+        metadata = _altfinder_metadata_components(target_row, candidate_row)
+        coverage_factor = min(
+            1.0,
+            (min(int(target_metrics["message_count"]), candidate_message_count) / 90.0),
+        )
+        overlap_hits = sum(
+            1
+            for value in (
+                style_similarity,
+                schedule_similarity,
+                channel_similarity,
+                interaction_similarity,
+                topic_similarity,
+                float(metadata["metadata_similarity"]),
+            )
+            if value >= 0.25
+        )
+        evidence_density = min(
+            1.0,
+            (coverage_factor * 0.48)
+            + (overlap_hits * 0.08)
+            + (min(0.25, channel_similarity + interaction_similarity) * 0.3)
+            + (min(0.14, presence_schedule_similarity) if presence_schedule_similarity > 0 else 0.0),
+        )
+
+        heuristic_score = (
+            (style_similarity * 2.35)
+            + (message_schedule_similarity * 0.9)
+            + (presence_schedule_similarity * 0.95)
+            + (schedule_similarity * 0.4)
+            + (channel_similarity * 1.15)
+            + (interaction_similarity * 1.55)
+            + (topic_similarity * 1.95)
+            + (float(metadata["metadata_similarity"]) * 2.15)
+            + (evidence_density * 1.25)
+        )
+        if bool(metadata["exact_avatar_match"]):
+            heuristic_score += 0.9
+        if int(metadata["shared_signature_count"]) > 0:
+            heuristic_score += 0.75
+        if is_suspect:
+            heuristic_score += 0.18
+
+        if not (
+            heuristic_score >= 1.35
+            or float(metadata["metadata_similarity"]) >= 0.62
+            or (style_similarity >= 0.56 and topic_similarity >= 0.42)
+            or (presence_schedule_similarity >= 0.35 and channel_similarity >= 0.28)
+            or is_suspect
+        ):
+            continue
+
+        label_info = _altfinder_resolve_label(
+            guild,
+            candidate_id,
+            candidate_row,
+            context.current_member_ids,
+        )
+        common_channel_ids = [
+            int(channel_id)
+            for channel_id, _ in _altfinder_counter_common(
+                target_metrics["top_channels"],
+                candidate_metrics["top_channels"],
+                4,
+            )
+            if str(channel_id).isdigit()
+        ]
+        common_hours = [
+            int(hour)
+            for hour, _ in _altfinder_counter_common(
+                target_metrics["active_hours"],
+                candidate_metrics["active_hours"],
+                4,
+            )
+            if str(hour).isdigit()
+        ]
+        common_weekdays = [
+            int(day)
+            for day, _ in _altfinder_counter_common(
+                target_metrics["active_weekdays"],
+                candidate_metrics["active_weekdays"],
+                3,
+            )
+            if str(day).isdigit()
+        ]
+        shared_reply_targets = [
+            int(value)
+            for value, _ in _altfinder_counter_common(
+                target_metrics["reply_targets"],
+                candidate_metrics["reply_targets"],
+                4,
+            )
+            if str(value).isdigit()
+        ]
+        shared_mention_targets = [
+            int(value)
+            for value, _ in _altfinder_counter_common(
+                target_metrics["mention_targets"],
+                candidate_metrics["mention_targets"],
+                4,
+            )
+            if str(value).isdigit()
+        ]
+        shared_copresence_targets = [
+            int(value)
+            for value, _ in _altfinder_counter_common(
+                target_metrics["copresence_targets"],
+                candidate_metrics["copresence_targets"],
+                4,
+            )
+            if str(value).isdigit()
+        ]
+
+        candidates.append(
+            {
+                "candidate_id": candidate_id,
+                "candidate_row": candidate_row,
+                "candidate_metrics": candidate_metrics,
+                "display_label": label_info["display"],
+                "plain_label": label_info["plain"],
+                "scope_label": label_info["scope"],
+                "is_suspect": is_suspect,
+                "style_similarity": round(style_similarity, 4),
+                "message_schedule_similarity": round(message_schedule_similarity, 4),
+                "presence_schedule_similarity": round(presence_schedule_similarity, 4),
+                "schedule_similarity": round(schedule_similarity, 4),
+                "channel_similarity": round(channel_similarity, 4),
+                "reply_overlap": round(reply_overlap, 4),
+                "mention_overlap": round(mention_overlap, 4),
+                "copresence_overlap": round(copresence_overlap, 4),
+                "interaction_similarity": round(interaction_similarity, 4),
+                "topic_similarity": round(topic_similarity, 4),
+                "evidence_density": round(evidence_density, 4),
+                "heuristic_score": round(heuristic_score, 4),
+                "metadata_similarity": float(metadata["metadata_similarity"]),
+                "metadata": metadata,
+                "common_channel_ids": common_channel_ids,
+                "common_hours": common_hours,
+                "common_weekdays": common_weekdays,
+                "shared_reply_targets": shared_reply_targets,
+                "shared_mention_targets": shared_mention_targets,
+                "shared_copresence_targets": shared_copresence_targets,
+                "target_texture": _altfinder_sample_texture(target_metrics["samples"], limit=2),
+                "candidate_texture": _altfinder_sample_texture(candidate_metrics["samples"], limit=2),
+                "message_count": candidate_message_count,
+            }
+        )
+
+    candidates.sort(
+        key=lambda row: (
+            1 if bool(row.get("is_suspect")) else 0,
+            float(row.get("heuristic_score", 0.0)),
+            float(row.get("evidence_density", 0.0)),
+            float(row.get("metadata_similarity", 0.0)),
+        ),
+        reverse=True,
+    )
+    return candidates[: max(limit, ALTFINDER_MAX_RESULTS + 3)]
+
+
+def _altfinder_rank_schema() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "altfinder_rank",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "ranked_user_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                    },
+                    "summary": {"type": "string"},
+                },
+                "required": ["ranked_user_ids", "summary"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+async def rerank_altfinder_candidates_with_ai(
+    target_member: discord.Member,
+    *,
+    context: AltFinderContext,
+    candidates: list[dict[str, Any]],
+) -> list[int]:
+    if len(candidates) < 2:
+        return []
+    candidate_lines = []
+    shortlist = candidates[:7]
+    for row in shortlist:
+        metadata = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
+        candidate_lines.append(
+            (
+                f"- id={row['candidate_id']} label={row['plain_label']} scope={row['scope_label']} "
+                f"suspect={bool(row.get('is_suspect'))} "
+                f"score={float(row['heuristic_score']):.2f} evidence={float(row['evidence_density']):.2f} "
+                f"style={float(row['style_similarity']):.2f} msg_schedule={float(row['message_schedule_similarity']):.2f} "
+                f"presence={float(row['presence_schedule_similarity']):.2f} schedule={float(row['schedule_similarity']):.2f} "
+                f"channels={float(row['channel_similarity']):.2f} interactions={float(row['interaction_similarity']):.2f} "
+                f"topics={float(row['topic_similarity']):.2f} metadata={float(row['metadata_similarity']):.2f} "
+                f"avatar_match={bool(metadata.get('exact_avatar_match'))} "
+                f"texture={row['candidate_texture']}"
+            )
+        )
+    prompt = (
+        "Rank likely alt-account candidates for a Discord moderation report.\n"
+        "Prioritize visible chat behavior and metadata together; metadata alone is not enough.\n"
+        "Return the best ranking of candidate ids only. Do not invent ids.\n"
+        f"Target: {target_member.display_name}\n"
+        f"Target messages indexed: {context.target_message_count}\n"
+        f"Target texture: {_altfinder_sample_texture(context.target_metrics['samples'], limit=2)}\n"
+        "Candidates:\n"
+        + "\n".join(candidate_lines)
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You rank alt-account evidence for Discord moderation. Use the supplied evidence only, "
+                "prefer higher-confidence chat-behavior matches over cosmetic-only matches, and return JSON only."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        if GROQ_API_KEY:
+            raw = await request_groq_completion(
+                messages,
+                max_tokens=220,
+                temperature=0.1,
+                model_override=ALTFINDER_RANK_MODEL or None,
+                fallback_models=ALTFINDER_FALLBACK_MODELS,
+                response_format=_altfinder_rank_schema(),
+                include_fallback_notice=False,
+            )
+        else:
+            raw = await request_ai_completion(
+                messages,
+                max_tokens=220,
+                temperature=0.1,
+                policy_key="altfinder_rank",
+                model_override=(ALTFINDER_RANK_MODEL or None) if AI_PROVIDER == "groq" else None,
+                fallback_models=ALTFINDER_FALLBACK_MODELS if AI_PROVIDER == "groq" else None,
+                response_format=_altfinder_rank_schema() if AI_PROVIDER == "groq" else None,
+                include_fallback_notice=False,
+            )
+        payload = _extract_first_json_object(raw)
+        if not isinstance(payload, dict):
+            return []
+        ranked_ids = payload.get("ranked_user_ids", [])
+        allowed_ids = {int(row["candidate_id"]) for row in shortlist}
+        output: list[int] = []
+        if isinstance(ranked_ids, list):
+            for item in ranked_ids:
+                try:
+                    candidate_id = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if candidate_id in allowed_ids and candidate_id not in output:
+                    output.append(candidate_id)
+        return output
+    except Exception:
+        return []
+
+
+def _altfinder_apply_rank_order(
+    candidates: list[dict[str, Any]], ranked_user_ids: list[int]
+) -> list[dict[str, Any]]:
+    if not ranked_user_ids:
+        return list(candidates)
+    mapped = {int(row["candidate_id"]): row for row in candidates}
+    ordered: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for candidate_id in ranked_user_ids:
+        row = mapped.get(int(candidate_id))
+        if row is None:
+            continue
+        ordered.append(row)
+        seen.add(int(candidate_id))
+    for row in candidates:
+        candidate_id = int(row["candidate_id"])
+        if candidate_id not in seen:
+            ordered.append(row)
+    return ordered
+
+
+def annotate_altfinder_confidences(
+    candidates: list[dict[str, Any]],
+    target_message_count: int,
+) -> None:
+    if not candidates:
+        return
+    top_score = max(float(candidates[0].get("heuristic_score", 0.0)), 0.01)
+    for row in candidates:
+        heuristic_score = float(row.get("heuristic_score", 0.0))
+        evidence_density = float(row.get("evidence_density", 0.0))
+        metadata_similarity = float(row.get("metadata_similarity", 0.0))
+        style_similarity = float(row.get("style_similarity", 0.0))
+        topic_similarity = float(row.get("topic_similarity", 0.0))
+        relative_strength = min(1.0, heuristic_score / top_score)
+        confidence = min(
+            0.97,
+            (min(1.0, heuristic_score / 8.0) * 0.36)
+            + (evidence_density * 0.28)
+            + (relative_strength * 0.18)
+            + (metadata_similarity * 0.18),
+        )
+        if target_message_count < 18 or int(row.get("message_count", 0) or 0) < 18:
+            confidence = min(confidence, 0.62)
+        if target_message_count < 8 or int(row.get("message_count", 0) or 0) < 8:
+            confidence = min(confidence, 0.44)
+        if metadata_similarity >= 0.72 and style_similarity < 0.32 and topic_similarity < 0.25:
+            confidence = min(confidence, 0.58)
+        if confidence >= 0.78:
+            band = "high"
+        elif confidence >= 0.55:
+            band = "medium"
+        else:
+            band = "low"
+        row["confidence"] = round(max(0.06, confidence), 4)
+        row["confidence_band"] = band
+
+
+def _altfinder_short_evidence_summary(row: dict[str, Any]) -> str:
+    metadata = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
+    tags: list[str] = []
+    if bool(row.get("is_suspect")):
+        tags.append("configured suspect")
+    if bool(metadata.get("exact_avatar_match")):
+        tags.append("exact avatar match")
+    if int(metadata.get("shared_signature_count", 0) or 0) > 0:
+        tags.append("shared profile signature")
+    if float(row.get("style_similarity", 0.0)) >= 0.55:
+        tags.append("strong style match")
+    if float(row.get("presence_schedule_similarity", 0.0)) >= 0.35:
+        tags.append("similar online/offline pattern")
+    elif float(row.get("schedule_similarity", 0.0)) >= 0.45:
+        tags.append("same activity window")
+    if float(row.get("channel_similarity", 0.0)) >= 0.4:
+        tags.append("same channel footprint")
+    if float(row.get("interaction_similarity", 0.0)) >= 0.38:
+        tags.append("shared interaction pattern")
+    if float(row.get("topic_similarity", 0.0)) >= 0.42:
+        tags.append("same topic vocabulary")
+    if float(row.get("metadata_similarity", 0.0)) >= 0.4 and "exact avatar match" not in tags:
+        tags.append("metadata overlap")
+    return ", ".join(tags[:3]) if tags else "light overlap only"
+
+
+def _altfinder_channel_names(guild: discord.Guild, channel_ids: list[int]) -> str:
+    names: list[str] = []
+    for channel_id in channel_ids[:4]:
+        channel = guild.get_channel(channel_id)
+        if isinstance(channel, discord.abc.GuildChannel):
+            names.append(f"#{channel.name}")
+        else:
+            names.append(f"channel {channel_id}")
+    return ", ".join(names) if names else "limited overlap"
+
+
+def _altfinder_format_hours(hours: list[int]) -> str:
+    if not hours:
+        return "limited overlap"
+    formatted = [f"{int(hour):02d}:00" for hour in hours[:4]]
+    return ", ".join(formatted)
+
+
+def _altfinder_format_weekdays(days: list[int]) -> str:
+    mapping = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    labels = [mapping[int(day)] for day in days[:3] if 0 <= int(day) < len(mapping)]
+    return ", ".join(labels) if labels else "limited overlap"
+
+
+def _altfinder_shared_target_labels(
+    guild: discord.Guild,
+    ids: list[int],
+    context: AltFinderContext,
+) -> str:
+    labels: list[str] = []
+    for target_id in ids[:3]:
+        member = guild.get_member(target_id)
+        if member is not None:
+            labels.append(member.display_name)
+            continue
+        row = context.candidate_rows.get(target_id)
+        if isinstance(row, dict):
+            label = str(row.get("display_name", "") or row.get("username", "") or target_id)
+            labels.append(label)
+        else:
+            labels.append(str(target_id))
+    return ", ".join(labels) if labels else "limited overlap"
+
+
+def _altfinder_detailed_evidence_block(
+    guild: discord.Guild,
+    row: dict[str, Any],
+    *,
+    context: AltFinderContext,
+) -> str:
+    metadata = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
+    interaction_targets = row.get("shared_reply_targets", []) + row.get("shared_mention_targets", [])
+    metadata_flags: list[str] = []
+    if bool(metadata.get("exact_avatar_match")):
+        metadata_flags.append("exact avatar")
+    if bool(metadata.get("exact_default_avatar_match")):
+        metadata_flags.append("same default avatar")
+    if int(metadata.get("shared_signature_count", 0) or 0) > 0:
+        metadata_flags.append("shared profile snapshot")
+    if not metadata_flags:
+        metadata_flags.append("no exact cosmetic match")
+    return (
+        f"{row['display_label']} [{row['scope_label']}{' | suspect' if row.get('is_suspect') else ''}]\n"
+        f"- style similarity: `{float(row.get('style_similarity', 0.0)):.2f}`\n"
+        f"- schedule/activity overlap: `{float(row.get('message_schedule_similarity', 0.0)):.2f}` | "
+        f"hours { _altfinder_format_hours(row.get('common_hours', [])) } | "
+        f"days { _altfinder_format_weekdays(row.get('common_weekdays', [])) }\n"
+        f"- online/offline pattern: `{float(row.get('presence_schedule_similarity', 0.0)):.2f}` | "
+        f"status overlap `{float(_altfinder_counter_overlap(context.target_metrics['status_counts'], row.get('candidate_metrics', {}).get('status_counts', {}))):.2f}`\n"
+        f"- channel overlap: `{float(row.get('channel_similarity', 0.0)):.2f}` | "
+        f"{_altfinder_channel_names(guild, row.get('common_channel_ids', []))}\n"
+        f"- interaction overlap: `{float(row.get('interaction_similarity', 0.0)):.2f}` | "
+        f"shared targets { _altfinder_shared_target_labels(guild, interaction_targets, context) }\n"
+        f"- linguistic fingerprint: avg words `{float(row.get('candidate_metrics', {}).get('avg_words', 0.0)):.1f}` | "
+        f"starter overlap `{float(_altfinder_counter_overlap(context.target_metrics['starter_tokens'], row.get('candidate_metrics', {}).get('starter_tokens', {}))):.2f}` | "
+        f"ending overlap `{float(_altfinder_counter_overlap(context.target_metrics['ending_tokens'], row.get('candidate_metrics', {}).get('ending_tokens', {}))):.2f}`\n"
+        f"- metadata similarity: `{float(row.get('metadata_similarity', 0.0)):.2f}` | "
+        f"{', '.join(metadata_flags)} | name `{float(metadata.get('name_similarity', 0.0)):.2f}`\n"
+        f"- sample texture: target `{row.get('target_texture', 'n/a')}` | candidate `{row.get('candidate_texture', 'n/a')}`"
+    )
+
+
+def _altfinder_suspect_focus_lines(
+    suspect_ids: list[int],
+    ranked_rows: list[dict[str, Any]],
+) -> list[str]:
+    if not suspect_ids:
+        return []
+    ranked_map = {int(row["candidate_id"]): row for row in ranked_rows}
+    lines: list[str] = []
+    for suspect_id in suspect_ids[:ALTFINDER_MAX_SUSPECTS]:
+        row = ranked_map.get(int(suspect_id))
+        if row is None:
+            lines.append(f"- suspect `{suspect_id}`: limited evidence in readable history.")
+            continue
+        lines.append(
+            (
+                f"- {row['display_label']} | confidence `{int(float(row.get('confidence', 0.0)) * 100)}%` "
+                f"({row.get('confidence_band', 'low')}) | {_altfinder_short_evidence_summary(row)}"
+            )
+        )
+    return lines
+
+
+async def build_altfinder_investigation_summary(
+    target_member: discord.Member,
+    *,
+    ranked_rows: list[dict[str, Any]],
+    context: AltFinderContext,
+) -> str:
+    local_lines: list[str] = []
+    for row in ranked_rows[:3]:
+        local_lines.append(
+            (
+                f"{row['plain_label']} ({row['scope_label']}): "
+                f"confidence {int(float(row.get('confidence', 0.0)) * 100)}%, "
+                f"style {float(row.get('style_similarity', 0.0)):.2f}, "
+                f"presence {float(row.get('presence_schedule_similarity', 0.0)):.2f}, "
+                f"topics {float(row.get('topic_similarity', 0.0)):.2f}, "
+                f"metadata {float(row.get('metadata_similarity', 0.0)):.2f}, "
+                f"evidence { _altfinder_short_evidence_summary(row) }."
+            )
+        )
+    local_summary = "\n".join(local_lines)
+    if not local_summary:
+        return "No reliable shortlist yet."
+    if not GROQ_API_KEY and not is_ai_configured():
+        return local_summary
+
+    prompt = (
+        "Rewrite this into a factual Discord moderation investigation summary.\n"
+        "Keep it to 3-5 short lines. Do not overstate certainty. Do not recommend action.\n"
+        f"Target: {target_member.display_name}\n"
+        f"Target messages indexed: {context.target_message_count}\n"
+        f"Configured suspects: {', '.join(str(user_id) for user_id in context.suspect_ids) if context.suspect_ids else 'none'}\n"
+        "Evidence summary:\n"
+        f"{local_summary}"
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You write concise moderation summaries from supplied evidence only. "
+                "Be factual, cautious, and avoid recommending punishment."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        if GROQ_API_KEY:
+            return await request_groq_completion(
+                messages,
+                max_tokens=220,
+                temperature=0.2,
+                model_override=ALTFINDER_EXPLAIN_MODEL or None,
+                fallback_models=ALTFINDER_FALLBACK_MODELS,
+                include_fallback_notice=False,
+            )
+        return await request_ai_completion(
+            messages,
+            max_tokens=220,
+            temperature=0.2,
+            policy_key="altfinder_explain",
+            model_override=(ALTFINDER_EXPLAIN_MODEL or None) if AI_PROVIDER == "groq" else None,
+            fallback_models=ALTFINDER_FALLBACK_MODELS if AI_PROVIDER == "groq" else None,
+            include_fallback_notice=False,
+        )
+    except Exception:
+        return local_summary
+
+
+SOCIALINTEL_TENSION_HINTS = {
+    "wrong",
+    "disagree",
+    "stupid",
+    "hate",
+    "nah",
+    "never",
+    "stop",
+    "shut",
+    "actually",
+    "but",
+    "however",
+    "ridiculous",
+    "trash",
+    "idiot",
+    "no way",
+}
+SOCIALINTEL_DEESCALATION_HINTS = {
+    "fair",
+    "understand",
+    "sorry",
+    "okay",
+    "lets",
+    "let's",
+    "calm",
+    "thanks",
+    "appreciate",
+    "agree to disagree",
+    "all good",
+    "my bad",
+    "please",
+}
+
+
+def _socialintel_compact_excerpt(text: str, limit: int = 140) -> str:
+    cleaned = " ".join((text or "").split()).strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _socialintel_pair_key(left_user_id: int, right_user_id: int) -> str:
+    low, high = sorted((int(left_user_id), int(right_user_id)))
+    return f"{low}:{high}"
+
+
+def _socialintel_get_pair_row(
+    guild_state: dict[str, Any],
+    left_user_id: int,
+    right_user_id: int,
+) -> dict[str, Any]:
+    pairs = guild_state.setdefault("pairs", {})
+    key = _socialintel_pair_key(left_user_id, right_user_id)
+    row = pairs.get(key)
+    if not isinstance(row, dict):
+        low, high = sorted((int(left_user_id), int(right_user_id)))
+        row = {
+            "user_ids": [low, high],
+            "reply_counts": {},
+            "mention_counts": {},
+            "shared_channels": {},
+            "shared_hours": {},
+            "copresence_count": 0,
+            "touch_count": 0,
+            "last_active_ts": 0.0,
+            "samples": [],
+        }
+        pairs[key] = row
+    for field in ("reply_counts", "mention_counts", "shared_channels", "shared_hours"):
+        if not isinstance(row.get(field), dict):
+            row[field] = {}
+    if not isinstance(row.get("samples"), list):
+        row["samples"] = []
+    return row
+
+
+def _socialintel_increment_pair_edge(
+    pair_row: dict[str, Any],
+    field: str,
+    from_user_id: int,
+    to_user_id: int,
+    amount: int,
+) -> None:
+    if amount <= 0:
+        return
+    counter = pair_row.get(field)
+    if not isinstance(counter, dict):
+        counter = {}
+        pair_row[field] = counter
+    key = f"{int(from_user_id)}->{int(to_user_id)}"
+    counter[key] = int(counter.get(key, 0) or 0) + int(amount)
+
+
+def _socialintel_update_pair_interaction(
+    guild_state: dict[str, Any],
+    left_user_id: int,
+    right_user_id: int,
+    *,
+    kind: str,
+    created_ts: float,
+    channel_id: int,
+    hour: int,
+    sample_text: str,
+) -> None:
+    if left_user_id == right_user_id:
+        return
+    pair_row = _socialintel_get_pair_row(guild_state, left_user_id, right_user_id)
+    pair_row["touch_count"] = int(pair_row.get("touch_count", 0) or 0) + 1
+    pair_row["last_active_ts"] = max(float(pair_row.get("last_active_ts", 0.0) or 0.0), created_ts)
+    _altfinder_counter_update(pair_row, "shared_channels", channel_id, 1, 18)
+    _altfinder_counter_update(pair_row, "shared_hours", hour, 1, 24)
+    if kind == "copresence":
+        pair_row["copresence_count"] = int(pair_row.get("copresence_count", 0) or 0) + 1
+    elif kind == "reply":
+        _socialintel_increment_pair_edge(pair_row, "reply_counts", left_user_id, right_user_id, 1)
+    elif kind == "mention":
+        _socialintel_increment_pair_edge(pair_row, "mention_counts", left_user_id, right_user_id, 1)
+    _aicrush_append_unique_sample(pair_row["samples"], sample_text, 8)
+
+
+def _socialintel_track_recent_channel_author(
+    guild_id: int,
+    channel_id: int,
+    author_id: int,
+    created_ts: float,
+) -> list[int]:
+    key = (guild_id, channel_id)
+    queue = SOCIALINTEL_CHANNEL_RECENT_AUTHORS[key]
+    while queue and created_ts - queue[0][0] > AICRUSH_CHANNEL_RECENT_WINDOW_SECONDS:
+        queue.popleft()
+    others = {other_author for _, other_author in queue if other_author != author_id}
+    queue.append((created_ts, author_id))
+    return list(others)
+
+
+def _socialintel_tension_score(text: str) -> float:
+    lowered = " ".join((text or "").lower().split())
+    if not lowered:
+        return 0.0
+    hint_hits = sum(1 for hint in SOCIALINTEL_TENSION_HINTS if hint in lowered)
+    punctuation_score = min(0.3, lowered.count("!") * 0.05 + lowered.count("?") * 0.03)
+    caps_score = min(0.18, sum(1 for ch in text if ch.isupper()) / max(1, len(text)))
+    return min(1.0, (hint_hits * 0.18) + punctuation_score + caps_score)
+
+
+def _socialintel_deescalation_score(text: str) -> float:
+    lowered = " ".join((text or "").lower().split())
+    if not lowered:
+        return 0.0
+    hint_hits = sum(1 for hint in SOCIALINTEL_DEESCALATION_HINTS if hint in lowered)
+    return min(1.0, hint_hits * 0.22)
+
+
+def _socialintel_get_channel_row(
+    guild_state: dict[str, Any],
+    channel: discord.abc.GuildChannel,
+) -> dict[str, Any]:
+    channels = guild_state.setdefault("channels", {})
+    key = str(channel.id)
+    row = channels.get(key)
+    if not isinstance(row, dict):
+        row = {
+            "latest_message_id": 0,
+            "earliest_message_id": 0,
+            "last_message_ts": 0.0,
+            "before_message_id": 0,
+            "fully_scanned": False,
+            "last_backfill_ts": 0.0,
+            "name": getattr(channel, "name", f"channel-{channel.id}"),
+            "kind": "thread" if isinstance(channel, discord.Thread) else "channel",
+            "message_count": 0,
+            "recent_topics": {},
+            "samples": [],
+            "last_open_question_ts": 0.0,
+            "last_open_question_text": "",
+            "last_conflict_ts": 0.0,
+            "last_conflict_text": "",
+            "proactive_last_ts": 0.0,
+        }
+        channels[key] = row
+    if not isinstance(row.get("recent_topics"), dict):
+        row["recent_topics"] = {}
+    if not isinstance(row.get("samples"), list):
+        row["samples"] = []
+    row["name"] = getattr(channel, "name", row.get("name", f"channel-{channel.id}"))
+    row["kind"] = "thread" if isinstance(channel, discord.Thread) else "channel"
+    return row
+
+
+def _socialintel_invalidate_guild_cache(guild_id: int) -> None:
+    for cache_key in list(SOCIALINTEL_RESULT_CACHE.keys()):
+        if cache_key and cache_key[0] == guild_id:
+            SOCIALINTEL_RESULT_CACHE.pop(cache_key, None)
+
+
+def refresh_socialintel_member_directory(guild: discord.Guild) -> None:
+    guild_state = get_guild_socialintel_state(guild.id)
+    for member in guild.members:
+        if member.bot:
+            continue
+        row = _altfinder_get_user_row(guild_state, member.id)
+        _altfinder_apply_user_snapshot(row, member)
+        _altfinder_sync_presence_snapshot(row, member, increment_history=False)
+    _mark_socialintel_dirty()
+
+
+def record_socialintel_presence(member: discord.Member) -> None:
+    if member.bot:
+        return
+    guild_state = get_guild_socialintel_state(member.guild.id)
+    row = _altfinder_get_user_row(guild_state, member.id)
+    _altfinder_apply_user_snapshot(row, member)
+    _altfinder_sync_presence_snapshot(row, member, increment_history=True)
+    _mark_socialintel_dirty()
+    _socialintel_invalidate_guild_cache(member.guild.id)
+
+
+def index_socialintel_message(message: discord.Message, *, backfill: bool = False) -> set[int]:
+    if message.guild is None or message.author.bot:
+        return set()
+    content = message.clean_content.strip()
+    if not content and not message.attachments:
+        return set()
+    if not content and message.attachments:
+        content = "[attachment]"
+
+    guild_state = get_guild_socialintel_state(message.guild.id)
+    created_ts = message.created_at.timestamp()
+    meta = guild_state.setdefault("meta", {})
+    channel_row = _socialintel_get_channel_row(guild_state, message.channel)
+    channel_row["latest_message_id"] = max(int(channel_row.get("latest_message_id", 0) or 0), int(message.id))
+    earliest = int(channel_row.get("earliest_message_id", 0) or 0)
+    channel_row["earliest_message_id"] = int(message.id) if earliest <= 0 else min(earliest, int(message.id))
+    channel_row["last_message_ts"] = max(float(channel_row.get("last_message_ts", 0.0) or 0.0), created_ts)
+    channel_row["message_count"] = int(channel_row.get("message_count", 0) or 0) + 1
+    if backfill:
+        channel_row["last_backfill_ts"] = time.time()
+        meta["last_backfill_ts"] = time.time()
+    else:
+        meta["last_incremental_ts"] = time.time()
+    meta["messages_indexed"] = int(meta.get("messages_indexed", 0) or 0) + 1
+    meta["last_indexed_message_ts"] = max(float(meta.get("last_indexed_message_ts", 0.0) or 0.0), created_ts)
+
+    row = _altfinder_get_user_row(guild_state, message.author.id)
+    _altfinder_apply_user_snapshot(row, message.author)
+    row["message_count"] = int(row.get("message_count", 0) or 0) + 1
+    row["last_message_ts"] = max(float(row.get("last_message_ts", 0.0) or 0.0), created_ts)
+    row["message_total_chars"] = int(row.get("message_total_chars", 0) or 0) + len(content)
+    row["message_total_words"] = int(row.get("message_total_words", 0) or 0) + len(WORD_PATTERN.findall(content))
+    row["question_count"] = int(row.get("question_count", 0) or 0) + (1 if "?" in content else 0)
+    row["exclaim_count"] = int(row.get("exclaim_count", 0) or 0) + (1 if "!" in content else 0)
+    row["emoji_total"] = int(row.get("emoji_total", 0) or 0) + len(EMOJI_PATTERN.findall(content))
+    row["uppercase_chars_total"] = int(row.get("uppercase_chars_total", 0) or 0) + sum(1 for ch in content if ch.isupper())
+    row["link_count"] = int(row.get("link_count", 0) or 0) + (1 if LINK_PATTERN.search(content) else 0)
+    row["attachment_count"] = int(row.get("attachment_count", 0) or 0) + (1 if message.attachments else 0)
+    row["mention_message_count"] = int(row.get("mention_message_count", 0) or 0) + (1 if message.mentions else 0)
+    row["reply_message_count"] = int(row.get("reply_message_count", 0) or 0) + (1 if message.reference else 0)
+    _altfinder_counter_update(row, "top_channels", message.channel.id, 1, 20)
+    message_dt = message.created_at.astimezone(_safe_zoneinfo(get_guild_engagement_timezone(message.guild.id)))
+    _altfinder_counter_update(row, "active_hours", message_dt.hour, 1, 24)
+    _altfinder_counter_update(row, "active_weekdays", message_dt.weekday(), 1, 7)
+    _altfinder_sync_presence_snapshot(row, message.author, increment_history=False)
+    _aicrush_append_unique_sample(row["samples"], content, 14)
+    _aicrush_append_unique_sample(channel_row["samples"], content, 10)
+
+    tokens = _altfinder_extract_valid_tokens(content)
+    row["topic_token_total"] = int(row.get("topic_token_total", 0) or 0) + len(tokens)
+    for token in tokens[:18]:
+        _altfinder_counter_update(row, "topics", token, 1, 42)
+        _altfinder_counter_update(channel_row, "recent_topics", token, 1, 20)
+    for bigram in _altfinder_extract_bigrams(tokens[:24])[:18]:
+        _altfinder_counter_update(row, "bigrams", bigram, 1, 42)
+    if tokens:
+        _altfinder_counter_update(row, "starter_tokens", tokens[0], 1, 24)
+        _altfinder_counter_update(row, "ending_tokens", tokens[-1], 1, 24)
+
+    excerpt = _socialintel_compact_excerpt(content, 180)
+    if "?" in content and len(excerpt) >= 18:
+        channel_row["last_open_question_ts"] = created_ts
+        channel_row["last_open_question_text"] = excerpt
+    if _socialintel_tension_score(content) >= 0.2:
+        channel_row["last_conflict_ts"] = created_ts
+        channel_row["last_conflict_text"] = excerpt
+
+    impacted_ids: set[int] = {message.author.id}
+    mention_ids = {
+        int(member.id)
+        for member in message.mentions
+        if not member.bot and member.id != message.author.id
+    }
+    for mention_id in mention_ids:
+        _altfinder_counter_update(row, "mention_targets", mention_id, 1, 40)
+        _socialintel_update_pair_interaction(
+            guild_state,
+            message.author.id,
+            mention_id,
+            kind="mention",
+            created_ts=created_ts,
+            channel_id=message.channel.id,
+            hour=message_dt.hour,
+            sample_text=content,
+        )
+        impacted_ids.add(mention_id)
+
+    reply_target_id = _aicrush_resolve_reply_target_id(message)
+    if reply_target_id is not None and reply_target_id != message.author.id:
+        _altfinder_counter_update(row, "reply_targets", reply_target_id, 1, 40)
+        _socialintel_update_pair_interaction(
+            guild_state,
+            message.author.id,
+            reply_target_id,
+            kind="reply",
+            created_ts=created_ts,
+            channel_id=message.channel.id,
+            hour=message_dt.hour,
+            sample_text=content,
+        )
+        impacted_ids.add(reply_target_id)
+
+    recent_others = _socialintel_track_recent_channel_author(
+        message.guild.id,
+        message.channel.id,
+        message.author.id,
+        created_ts,
+    )
+    for other_id in recent_others[:12]:
+        _altfinder_counter_update(row, "copresence_targets", other_id, 1, 45)
+        _socialintel_update_pair_interaction(
+            guild_state,
+            message.author.id,
+            other_id,
+            kind="copresence",
+            created_ts=created_ts,
+            channel_id=message.channel.id,
+            hour=message_dt.hour,
+            sample_text=content,
+        )
+        impacted_ids.add(other_id)
+
+    _aicrush_remember_message_author(int(message.id), int(message.author.id), created_ts)
+    _mark_socialintel_dirty()
+    _socialintel_invalidate_guild_cache(message.guild.id)
+    return impacted_ids
+
+
+def get_readable_social_channels(guild: discord.Guild) -> list[discord.abc.MessageableChannel]:
+    channels: list[discord.abc.MessageableChannel] = list(get_readable_text_channels(guild))
+    me = guild.me
+    if me is None:
+        return channels
+    for thread in guild.threads:
+        try:
+            perms = thread.permissions_for(me)
+        except Exception:
+            continue
+        if perms.view_channel and perms.read_message_history:
+            channels.append(thread)
+    return channels
+
+
+async def run_socialintel_backfill(
+    guild: discord.Guild,
+    *,
+    message_budget: int | None = None,
+    time_budget_seconds: float | None = None,
+) -> dict[str, Any]:
+    guild_state = get_guild_socialintel_state(guild.id)
+    channels = get_readable_social_channels(guild)
+    channel_rows = guild_state.setdefault("channels", {})
+    for channel in channels:
+        _socialintel_get_channel_row(guild_state, channel)
+
+    remaining_budget = max(200, int(message_budget or SOCIALINTEL_BACKFILL_MESSAGE_BUDGET))
+    deadline = time.monotonic() + float(time_budget_seconds or SOCIALINTEL_BACKFILL_TIME_BUDGET_SECONDS)
+    fetched_messages: list[discord.Message] = []
+    processed_channels = 0
+    passes = 0
+
+    while remaining_budget > 0 and time.monotonic() < deadline:
+        passes += 1
+        pass_scanned = 0
+        channel_priority = sorted(
+            channels,
+            key=lambda channel: (
+                1 if bool(channel_rows.get(str(channel.id), {}).get("fully_scanned")) else 0,
+                float(channel_rows.get(str(channel.id), {}).get("last_backfill_ts", 0.0) or 0.0),
+            ),
+        )
+        for channel in channel_priority:
+            if remaining_budget <= 0 or time.monotonic() >= deadline:
+                break
+            row = channel_rows.setdefault(str(channel.id), {})
+            if bool(row.get("fully_scanned")):
+                continue
+            per_channel_limit = min(max(50, AICRUSH_SCAN_PER_CHANNEL), remaining_budget)
+            history_kwargs: dict[str, Any] = {"limit": per_channel_limit}
+            before_message_id = int(row.get("before_message_id", 0) or 0)
+            if before_message_id <= 0:
+                before_message_id = int(row.get("earliest_message_id", 0) or 0)
+            if before_message_id > 0:
+                history_kwargs["before"] = discord.Object(id=before_message_id)
+            batch: list[discord.Message] = []
+            try:
+                async for msg in channel.history(**history_kwargs):
+                    if not msg.author.bot:
+                        batch.append(msg)
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+            processed_channels += 1
+            row["last_backfill_ts"] = time.time()
+            if not batch:
+                row["fully_scanned"] = True
+                continue
+            oldest_id = min(int(msg.id) for msg in batch)
+            row["before_message_id"] = oldest_id
+            earliest = int(row.get("earliest_message_id", 0) or 0)
+            row["earliest_message_id"] = oldest_id if earliest <= 0 else min(earliest, oldest_id)
+            if len(batch) < per_channel_limit:
+                row["fully_scanned"] = True
+            fetched_messages.extend(batch)
+            remaining_budget -= len(batch)
+            pass_scanned += len(batch)
+            if (
+                AICRUSH_SCAN_PAUSE_EVERY > 0
+                and AICRUSH_SCAN_PAUSE_SECONDS > 0
+                and pass_scanned % AICRUSH_SCAN_PAUSE_EVERY == 0
+            ):
+                await asyncio.sleep(AICRUSH_SCAN_PAUSE_SECONDS)
+        if pass_scanned <= 0:
+            break
+
+    fetched_messages.sort(key=lambda msg: (msg.created_at.timestamp(), int(msg.id)))
+    for msg in fetched_messages:
+        index_socialintel_message(msg, backfill=True)
+
+    channels_total = len(channels)
+    channels_fully_scanned = sum(
+        1
+        for row in channel_rows.values()
+        if isinstance(row, dict) and bool(row.get("fully_scanned"))
+    )
+    meta = guild_state.setdefault("meta", {})
+    meta["last_backfill_ts"] = time.time()
+    _mark_socialintel_dirty()
+    return {
+        "scanned_messages": len(fetched_messages),
+        "channels_considered": channels_total,
+        "channels_touched": processed_channels,
+        "channels_fully_scanned": channels_fully_scanned,
+        "messages_indexed": int(meta.get("messages_indexed", 0) or 0),
+        "passes": passes,
+    }
+
+
+def _socialintel_user_metrics(row: dict[str, Any]) -> dict[str, Any]:
+    return _altfinder_user_metrics(row)
+
+
+@dataclass
+class SocialIntelContext:
+    target_row: dict[str, Any]
+    target_metrics: dict[str, Any]
+    target_message_count: int
+    scan_coverage: dict[str, Any]
+    candidate_rows: dict[int, dict[str, Any]]
+    current_member_ids: set[int]
+
+
+def collect_socialintel_context(guild: discord.Guild, target_member: discord.Member) -> SocialIntelContext:
+    refresh_socialintel_member_directory(guild)
+    guild_state = get_guild_socialintel_state(guild.id)
+    users = guild_state.get("users", {}) if isinstance(guild_state.get("users"), dict) else {}
+    target_row = _altfinder_get_user_row(guild_state, target_member.id)
+    target_metrics = _socialintel_user_metrics(target_row)
+    current_member_ids = {member.id for member in guild.members if not member.bot}
+    candidate_rows: dict[int, dict[str, Any]] = {}
+    for user_key, row in users.items():
+        if not isinstance(row, dict):
+            continue
+        try:
+            user_id = int(user_key)
+        except (TypeError, ValueError):
+            continue
+        if user_id == target_member.id or user_id not in current_member_ids:
+            continue
+        candidate_rows[user_id] = row
+    channels = guild_state.get("channels", {}) if isinstance(guild_state.get("channels"), dict) else {}
+    meta = guild_state.get("meta", {}) if isinstance(guild_state.get("meta"), dict) else {}
+    scan_coverage = {
+        "channels_total": len(channels),
+        "channels_fully_scanned": sum(
+            1
+            for row in channels.values()
+            if isinstance(row, dict) and bool(row.get("fully_scanned"))
+        ),
+        "messages_indexed": int(meta.get("messages_indexed", 0) or 0),
+        "last_backfill_ts": float(meta.get("last_backfill_ts", 0.0) or 0.0),
+    }
+    return SocialIntelContext(
+        target_row=target_row,
+        target_metrics=target_metrics,
+        target_message_count=int(target_row.get("message_count", 0) or 0),
+        scan_coverage=scan_coverage,
+        candidate_rows=candidate_rows,
+        current_member_ids=current_member_ids,
+    )
+
+
+def _socialintel_pair_stats(
+    guild_state: dict[str, Any],
+    left_user_id: int,
+    right_user_id: int,
+) -> dict[str, Any]:
+    pair_row = _socialintel_get_pair_row(guild_state, left_user_id, right_user_id)
+    reply_counts = pair_row.get("reply_counts", {}) if isinstance(pair_row.get("reply_counts"), dict) else {}
+    mention_counts = pair_row.get("mention_counts", {}) if isinstance(pair_row.get("mention_counts"), dict) else {}
+    return {
+        "pair_row": pair_row,
+        "reply_forward": int(reply_counts.get(f"{left_user_id}->{right_user_id}", 0) or 0),
+        "reply_back": int(reply_counts.get(f"{right_user_id}->{left_user_id}", 0) or 0),
+        "mention_forward": int(mention_counts.get(f"{left_user_id}->{right_user_id}", 0) or 0),
+        "mention_back": int(mention_counts.get(f"{right_user_id}->{left_user_id}", 0) or 0),
+        "copresence_count": int(pair_row.get("copresence_count", 0) or 0),
+        "shared_channels": pair_row.get("shared_channels", {}) if isinstance(pair_row.get("shared_channels"), dict) else {},
+        "shared_hours": pair_row.get("shared_hours", {}) if isinstance(pair_row.get("shared_hours"), dict) else {},
+        "samples": pair_row.get("samples", []) if isinstance(pair_row.get("samples"), list) else [],
+        "touch_count": int(pair_row.get("touch_count", 0) or 0),
+    }
+
+
+def _socialintel_confidence_band(score: float) -> str:
+    if score >= 0.78:
+        return "high"
+    if score >= 0.55:
+        return "medium"
+    return "low"
+
+
+def _socialintel_build_duo_row(
+    guild: discord.Guild,
+    target_member: discord.Member,
+    candidate_id: int,
+    candidate_row: dict[str, Any],
+    context: SocialIntelContext,
+) -> dict[str, Any] | None:
+    candidate_member = guild.get_member(candidate_id)
+    if candidate_member is None or candidate_member.bot:
+        return None
+    target_metrics = context.target_metrics
+    candidate_metrics = _socialintel_user_metrics(candidate_row)
+    candidate_message_count = int(candidate_metrics.get("message_count", 0) or 0)
+    if context.target_message_count < 8 or candidate_message_count < 8:
+        return None
+
+    style_similarity = min(
+        1.0,
+        (_altfinder_scalar_similarity(float(target_metrics["avg_len"]), float(candidate_metrics["avg_len"]), 80.0) * 0.2)
+        + (_altfinder_scalar_similarity(float(target_metrics["avg_words"]), float(candidate_metrics["avg_words"]), 18.0) * 0.12)
+        + (_altfinder_scalar_similarity(float(target_metrics["question_ratio"]), float(candidate_metrics["question_ratio"]), 0.45) * 0.12)
+        + (_altfinder_scalar_similarity(float(target_metrics["exclaim_ratio"]), float(candidate_metrics["exclaim_ratio"]), 0.45) * 0.1)
+        + (_altfinder_scalar_similarity(float(target_metrics["emoji_per_msg"]), float(candidate_metrics["emoji_per_msg"]), 2.0) * 0.08)
+        + (_altfinder_scalar_similarity(float(target_metrics["vocab_diversity"]), float(candidate_metrics["vocab_diversity"]), 0.45) * 0.14)
+        + (_altfinder_counter_overlap(target_metrics["bigrams"], candidate_metrics["bigrams"]) * 0.16)
+        + (_altfinder_counter_overlap(target_metrics["starter_tokens"], candidate_metrics["starter_tokens"]) * 0.08)
+    )
+    schedule_overlap = min(
+        1.0,
+        (_altfinder_counter_overlap(target_metrics["active_hours"], candidate_metrics["active_hours"]) * 0.7)
+        + (_altfinder_counter_overlap(target_metrics["active_weekdays"], candidate_metrics["active_weekdays"]) * 0.3)
+    )
+    presence_overlap = min(
+        1.0,
+        (_altfinder_counter_overlap(target_metrics["presence_hours"], candidate_metrics["presence_hours"]) * 0.55)
+        + (_altfinder_counter_overlap(target_metrics["presence_weekdays"], candidate_metrics["presence_weekdays"]) * 0.2)
+        + (_altfinder_counter_overlap(target_metrics["status_counts"], candidate_metrics["status_counts"]) * 0.15)
+        + (_altfinder_counter_overlap(target_metrics["status_transitions"], candidate_metrics["status_transitions"]) * 0.1)
+    )
+    channel_overlap = _altfinder_counter_overlap(target_metrics["top_channels"], candidate_metrics["top_channels"])
+    topic_overlap = min(
+        1.0,
+        (_altfinder_counter_overlap(target_metrics["topics"], candidate_metrics["topics"]) * 0.72)
+        + (_altfinder_counter_overlap(target_metrics["bigrams"], candidate_metrics["bigrams"]) * 0.28)
+    )
+    question_reply_fit = _altfinder_scalar_similarity(
+        float(target_metrics["question_ratio"]),
+        float(candidate_metrics["reply_rate"]),
+        0.55,
+    )
+    pacing_similarity = min(
+        1.0,
+        (_altfinder_scalar_similarity(float(target_metrics["avg_len"]), float(candidate_metrics["avg_len"]), 65.0) * 0.45)
+        + (_altfinder_scalar_similarity(float(target_metrics["reply_rate"]), float(candidate_metrics["reply_rate"]), 0.45) * 0.2)
+        + (_altfinder_scalar_similarity(float(target_metrics["mention_rate"]), float(candidate_metrics["mention_rate"]), 0.45) * 0.1)
+        + (question_reply_fit * 0.25)
+    )
+    interaction_overlap = min(
+        1.0,
+        (_altfinder_counter_overlap(target_metrics["reply_targets"], candidate_metrics["reply_targets"]) * 0.4)
+        + (_altfinder_counter_overlap(target_metrics["mention_targets"], candidate_metrics["mention_targets"]) * 0.3)
+        + (_altfinder_counter_overlap(target_metrics["copresence_targets"], candidate_metrics["copresence_targets"]) * 0.3)
+    )
+    pair_stats = _socialintel_pair_stats(get_guild_socialintel_state(guild.id), target_member.id, candidate_id)
+    direct_pair_score = min(
+        1.0,
+        ((pair_stats["reply_forward"] + pair_stats["reply_back"]) * 0.12)
+        + ((pair_stats["mention_forward"] + pair_stats["mention_back"]) * 0.08)
+        + (pair_stats["copresence_count"] * 0.025)
+    )
+    heuristic_score = (
+        (style_similarity * 1.35)
+        + (schedule_overlap * 1.05)
+        + (presence_overlap * 0.7)
+        + (channel_overlap * 1.15)
+        + (topic_overlap * 1.25)
+        + (pacing_similarity * 0.95)
+        + (interaction_overlap * 1.2)
+        + (direct_pair_score * 1.05)
+    )
+    if heuristic_score < 1.2 and direct_pair_score < 0.28 and topic_overlap < 0.2:
+        return None
+
+    common_channel_ids = [
+        int(channel_id)
+        for channel_id, _ in _altfinder_counter_common(
+            target_metrics["top_channels"],
+            candidate_metrics["top_channels"],
+            4,
+        )
+        if str(channel_id).isdigit()
+    ]
+    common_hours = [
+        int(hour)
+        for hour, _ in _altfinder_counter_common(
+            target_metrics["active_hours"],
+            candidate_metrics["active_hours"],
+            4,
+        )
+        if str(hour).isdigit()
+    ]
+    return {
+        "candidate_id": candidate_id,
+        "member": candidate_member,
+        "display_label": candidate_member.mention,
+        "plain_label": candidate_member.display_name,
+        "message_count": candidate_message_count,
+        "style_similarity": round(style_similarity, 4),
+        "schedule_overlap": round(schedule_overlap, 4),
+        "presence_overlap": round(presence_overlap, 4),
+        "channel_overlap": round(channel_overlap, 4),
+        "topic_overlap": round(topic_overlap, 4),
+        "pacing_similarity": round(pacing_similarity, 4),
+        "interaction_overlap": round(interaction_overlap, 4),
+        "direct_pair_score": round(direct_pair_score, 4),
+        "heuristic_score": round(heuristic_score, 4),
+        "common_channel_ids": common_channel_ids,
+        "common_hours": common_hours,
+        "pair_stats": pair_stats,
+        "target_texture": _altfinder_sample_texture(target_metrics["samples"], limit=2),
+        "candidate_texture": _altfinder_sample_texture(candidate_metrics["samples"], limit=2),
+    }
+
+
+def build_socialintel_duo_candidate_pool(
+    guild: discord.Guild,
+    target_member: discord.Member,
+    context: SocialIntelContext,
+    limit: int,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for candidate_id, candidate_row in context.candidate_rows.items():
+        built = _socialintel_build_duo_row(guild, target_member, candidate_id, candidate_row, context)
+        if built is not None:
+            rows.append(built)
+    rows.sort(
+        key=lambda row: (
+            float(row.get("heuristic_score", 0.0)),
+            float(row.get("direct_pair_score", 0.0)),
+            float(row.get("interaction_overlap", 0.0)),
+            float(row.get("topic_overlap", 0.0)),
+        ),
+        reverse=True,
+    )
+    return rows[: max(limit, SOCIALINTEL_MAX_RESULTS + 3)]
+
+
+def annotate_socialintel_duo_confidences(
+    candidates: list[dict[str, Any]],
+    target_message_count: int,
+) -> None:
+    if not candidates:
+        return
+    top_score = max(float(candidates[0].get("heuristic_score", 0.0)), 0.01)
+    for row in candidates:
+        evidence_density = min(
+            1.0,
+            (float(row.get("style_similarity", 0.0)) * 0.16)
+            + (float(row.get("schedule_overlap", 0.0)) * 0.16)
+            + (float(row.get("channel_overlap", 0.0)) * 0.14)
+            + (float(row.get("topic_overlap", 0.0)) * 0.18)
+            + (float(row.get("interaction_overlap", 0.0)) * 0.18)
+            + (float(row.get("direct_pair_score", 0.0)) * 0.18)
+        )
+        confidence = min(
+            0.96,
+            (min(1.0, float(row.get("heuristic_score", 0.0)) / top_score) * 0.28)
+            + (min(1.0, float(row.get("heuristic_score", 0.0)) / 7.0) * 0.34)
+            + (evidence_density * 0.38)
+        )
+        if target_message_count < 18 or int(row.get("message_count", 0) or 0) < 18:
+            confidence = min(confidence, 0.66)
+        if target_message_count < 10 or int(row.get("message_count", 0) or 0) < 10:
+            confidence = min(confidence, 0.45)
+        if (
+            float(row.get("direct_pair_score", 0.0)) < 0.18
+            and float(row.get("interaction_overlap", 0.0)) < 0.2
+            and float(row.get("topic_overlap", 0.0)) < 0.22
+        ):
+            confidence = min(confidence, 0.54)
+        row["confidence"] = round(max(0.06, confidence), 4)
+        row["confidence_band"] = _socialintel_confidence_band(confidence)
+
+
+def _socialintel_rank_schema(name: str) -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": name,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "ranked_ids": {"type": "array", "items": {"type": "integer"}},
+                    "summary": {"type": "string"},
+                },
+                "required": ["ranked_ids", "summary"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+async def rerank_socialintel_duo_candidates_with_ai(
+    target_member: discord.Member,
+    *,
+    candidates: list[dict[str, Any]],
+) -> list[int]:
+    shortlist = candidates[:7]
+    if len(shortlist) < 2:
+        return []
+    lines: list[str] = []
+    for row in shortlist:
+        pair_stats = row.get("pair_stats", {}) if isinstance(row.get("pair_stats"), dict) else {}
+        lines.append(
+            f"- id={row['candidate_id']} label={row['plain_label']} "
+            f"score={float(row.get('heuristic_score', 0.0)):.2f} "
+            f"style={float(row.get('style_similarity', 0.0)):.2f} "
+            f"schedule={float(row.get('schedule_overlap', 0.0)):.2f} "
+            f"presence={float(row.get('presence_overlap', 0.0)):.2f} "
+            f"channels={float(row.get('channel_overlap', 0.0)):.2f} "
+            f"topics={float(row.get('topic_overlap', 0.0)):.2f} "
+            f"pacing={float(row.get('pacing_similarity', 0.0)):.2f} "
+            f"interactions={float(row.get('interaction_overlap', 0.0)):.2f} "
+            f"direct_pair={float(row.get('direct_pair_score', 0.0)):.2f} "
+            f"mutual_replies={int(pair_stats.get('reply_forward', 0) or 0) + int(pair_stats.get('reply_back', 0) or 0)}"
+        )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You rank Discord duo compatibility for friendship, teamwork, or debate chemistry. "
+                "Use supplied evidence only. Shared channels alone are weak evidence. Return JSON only."
+            ),
+        },
+        {
+            "role": "user",
+            "content": "Rank these candidates for strongest communication compatibility.\n"
+            f"Target: {target_member.display_name}\n"
+            + "\n".join(lines),
+        },
+    ]
+    try:
+        if GROQ_API_KEY:
+            raw = await request_groq_completion(
+                messages,
+                max_tokens=220,
+                temperature=0.1,
+                model_override=SOCIALINTEL_RANK_MODEL or None,
+                fallback_models=SOCIALINTEL_FALLBACK_MODELS,
+                response_format=_socialintel_rank_schema("socialintel_duo_rank"),
+                include_fallback_notice=False,
+            )
+        else:
+            raw = await request_ai_completion(
+                messages,
+                max_tokens=220,
+                temperature=0.1,
+                policy_key="socialintel_duo_rank",
+                model_override=(SOCIALINTEL_RANK_MODEL or None) if AI_PROVIDER == "groq" else None,
+                fallback_models=SOCIALINTEL_FALLBACK_MODELS if AI_PROVIDER == "groq" else None,
+                response_format=_socialintel_rank_schema("socialintel_duo_rank") if AI_PROVIDER == "groq" else None,
+                include_fallback_notice=False,
+            )
+        payload = _extract_first_json_object(raw)
+        if not isinstance(payload, dict):
+            return []
+        ranked_ids: list[int] = []
+        allowed = {int(row["candidate_id"]) for row in shortlist}
+        raw_ids = payload.get("ranked_ids", [])
+        if isinstance(raw_ids, list):
+            for item in raw_ids:
+                try:
+                    candidate_id = int(item)
+                except (TypeError, ValueError):
+                    continue
+                if candidate_id in allowed and candidate_id not in ranked_ids:
+                    ranked_ids.append(candidate_id)
+        return ranked_ids
+    except Exception:
+        return []
+
+
+def _socialintel_apply_rank_order(
+    candidates: list[dict[str, Any]],
+    ranked_ids: list[int],
+) -> list[dict[str, Any]]:
+    if not ranked_ids:
+        return list(candidates)
+    mapped = {int(row["candidate_id"]): row for row in candidates}
+    ordered: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for candidate_id in ranked_ids:
+        row = mapped.get(int(candidate_id))
+        if row is None:
+            continue
+        ordered.append(row)
+        seen.add(int(candidate_id))
+    for row in candidates:
+        if int(row["candidate_id"]) not in seen:
+            ordered.append(row)
+    return ordered
+
+
+async def collect_messageable_window(
+    channel: discord.abc.MessageableChannel,
+    *,
+    limit: int = 180,
+    after: datetime | None = None,
+) -> list[WindowMessage]:
+    entries: list[WindowMessage] = []
+    try:
+        async for msg in channel.history(limit=limit, after=after, oldest_first=True):
+            entry = _build_window_entry(msg, include_attachment_marker=True)
+            if entry is not None:
+                entries.append(entry)
+    except (discord.Forbidden, discord.HTTPException):
+        return []
+    return entries
+
+
+def _socialintel_metrics_from_entries(
+    entries: list[WindowMessage],
+    user_id: int,
+) -> tuple[dict[str, Any], int]:
+    temp_state: dict[str, Any] = {"users": {}}
+    row = _altfinder_get_user_row(temp_state, user_id)
+    id_to_author = {entry.message_id: entry.author_id for entry in entries}
+    for entry in entries:
+        if entry.author_id != user_id:
+            continue
+        content = entry.content
+        row["message_count"] = int(row.get("message_count", 0) or 0) + 1
+        row["message_total_chars"] = int(row.get("message_total_chars", 0) or 0) + len(content)
+        row["message_total_words"] = int(row.get("message_total_words", 0) or 0) + len(WORD_PATTERN.findall(content))
+        row["question_count"] = int(row.get("question_count", 0) or 0) + (1 if "?" in content else 0)
+        row["exclaim_count"] = int(row.get("exclaim_count", 0) or 0) + (1 if "!" in content else 0)
+        row["emoji_total"] = int(row.get("emoji_total", 0) or 0) + len(EMOJI_PATTERN.findall(content))
+        row["uppercase_chars_total"] = int(row.get("uppercase_chars_total", 0) or 0) + sum(1 for ch in content if ch.isupper())
+        row["link_count"] = int(row.get("link_count", 0) or 0) + (1 if LINK_PATTERN.search(content) else 0)
+        row["attachment_count"] = int(row.get("attachment_count", 0) or 0) + (1 if entry.has_attachments else 0)
+        row["mention_message_count"] = int(row.get("mention_message_count", 0) or 0) + (1 if entry.mention_ids else 0)
+        row["reply_message_count"] = int(row.get("reply_message_count", 0) or 0) + (1 if entry.reference_message_id else 0)
+        _altfinder_counter_update(row, "top_channels", entry.channel_id, 1, 16)
+        dt = datetime.fromtimestamp(entry.created_at_ts, tz=timezone.utc).astimezone(_safe_zoneinfo("UTC"))
+        _altfinder_counter_update(row, "active_hours", dt.hour, 1, 24)
+        _altfinder_counter_update(row, "active_weekdays", dt.weekday(), 1, 7)
+        tokens = _altfinder_extract_valid_tokens(content)
+        row["topic_token_total"] = int(row.get("topic_token_total", 0) or 0) + len(tokens)
+        for token in tokens[:18]:
+            _altfinder_counter_update(row, "topics", token, 1, 40)
+        for bigram in _altfinder_extract_bigrams(tokens[:24])[:18]:
+            _altfinder_counter_update(row, "bigrams", bigram, 1, 40)
+        if tokens:
+            _altfinder_counter_update(row, "starter_tokens", tokens[0], 1, 24)
+            _altfinder_counter_update(row, "ending_tokens", tokens[-1], 1, 24)
+        _aicrush_append_unique_sample(row["samples"], content, 10)
+        for mention_id in entry.mention_ids[:6]:
+            _altfinder_counter_update(row, "mention_targets", mention_id, 1, 32)
+        if entry.reference_message_id and entry.reference_message_id in id_to_author:
+            reply_target_id = id_to_author[entry.reference_message_id]
+            if reply_target_id != user_id:
+                _altfinder_counter_update(row, "reply_targets", reply_target_id, 1, 32)
+    return _socialintel_user_metrics(row), int(row.get("message_count", 0) or 0)
+
+
+def resolve_channel_or_thread(
+    guild: discord.Guild,
+    raw: str | None,
+    *,
+    default_channel: discord.abc.GuildChannel | None = None,
+) -> discord.TextChannel | discord.Thread | None:
+    if not raw:
+        if isinstance(default_channel, (discord.TextChannel, discord.Thread)):
+            return default_channel
+        return None
+    cleaned = raw.strip()
+    mention_match = re.search(r"<#(\d+)>", cleaned)
+    channel_id = 0
+    if mention_match:
+        channel_id = int(mention_match.group(1))
+    elif cleaned.isdigit():
+        channel_id = int(cleaned)
+    if channel_id > 0:
+        getter = getattr(guild, "get_channel_or_thread", None)
+        if callable(getter):
+            resolved = getter(channel_id)
+            if isinstance(resolved, (discord.TextChannel, discord.Thread)):
+                return resolved
+        resolved = guild.get_channel(channel_id)
+        if isinstance(resolved, (discord.TextChannel, discord.Thread)):
+            return resolved
+        bot_resolved = bot.get_channel(channel_id)
+        if isinstance(bot_resolved, (discord.TextChannel, discord.Thread)):
+            return bot_resolved
+    lowered = cleaned.lower().lstrip("#")
+    for channel in [*guild.text_channels, *guild.threads]:
+        if lowered == channel.name.lower():
+            return channel
+    return None
+
+
+async def resolve_message_from_context(
+    ctx: commands.Context,
+    message_ref: str | None,
+) -> discord.Message | None:
+    reference = getattr(getattr(ctx, "message", None), "reference", None)
+    if reference and reference.message_id:
+        resolved = getattr(reference, "resolved", None)
+        if isinstance(resolved, discord.Message):
+            return resolved
+        if isinstance(ctx.channel, (discord.TextChannel, discord.Thread)):
+            try:
+                return await ctx.channel.fetch_message(reference.message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+    if not message_ref:
+        return None
+    match = DISCORD_MESSAGE_LINK_RE.search(message_ref.strip())
+    if not match or ctx.guild is None:
+        return None
+    guild_id, channel_id, message_id = match.groups()
+    if str(ctx.guild.id) != str(guild_id):
+        return None
+    channel = resolve_channel_or_thread(ctx.guild, channel_id)
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return None
+    try:
+        return await channel.fetch_message(int(message_id))
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+
+def _translation_cleanup_spacing(text: str) -> str:
+    compact = " ".join((text or "").split()).strip()
+    if not compact:
+        return ""
+    compact = re.sub(r"\s+([?.!,])", r"\1", compact)
+    compact = re.sub(r"\bhinglish\b", "Hinglish", compact, flags=re.IGNORECASE)
+    compact = re.sub(r"\bi am\b", "I am", compact, flags=re.IGNORECASE)
+    compact = re.sub(r"\bi\b", "I", compact)
+    if compact[:1].islower():
+        compact = compact[:1].upper() + compact[1:]
+    return compact
+
+
+def _translation_strip_prefixes(text: str) -> str:
+    compact = (text or "").strip()
+    if not compact:
+        return ""
+    compact = re.sub(r"^\s*(translation|translated text|english)\s*:\s*", "", compact, flags=re.IGNORECASE)
+    compact = compact.strip("`\"' ")
+    lines = [line.strip("`\"' ") for line in compact.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    if len(lines) == 1:
+        return lines[0]
+    # Prefer the first concise line when the model adds commentary despite instructions.
+    for line in lines:
+        if len(line) <= 220:
+            return line
+    return lines[0]
+
+
+def _translation_rewrite_patterns(normalized_text: str) -> str:
+    compact = " ".join((normalized_text or "").split()).strip()
+    if not compact:
+        return compact
+    compact = re.sub(
+        r"^naam change kiya firse$",
+        "changed the name again",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    teach_match = re.match(
+        r"^(?P<object>.+?)\s+sikhao\s+(?P<target>use|usse|usko)$",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    if teach_match:
+        obj = teach_match.group("object").strip()
+        if obj:
+            return f"teach them {obj}"
+    return compact
+
+
+def _translate_text_local(text: str) -> tuple[str, str, str]:
+    normalized = (text or "").strip()
+    if not normalized:
+        return "", "unknown", "No text to translate."
+
+    working = _translation_rewrite_patterns(normalize_aicrush_text(normalized))
+    replaced_hits = 0
+    for source, target in TRANSLATION_LOCAL_PHRASES:
+        if source in working:
+            count_before = working.count(source)
+            working = working.replace(source, target)
+            replaced_hits += count_before
+
+    tokens = WORD_PATTERN.findall(working)
+    translated_tokens: list[str] = []
+    for token in tokens:
+        mapped = TRANSLATION_LOCAL_WORDS.get(token.lower())
+        if mapped:
+            translated_tokens.extend(mapped.split())
+            replaced_hits += 1
+        else:
+            translated_tokens.append(token)
+
+    if not translated_tokens:
+        return normalized, "unknown", "No local translation evidence."
+
+    translated = _translation_cleanup_spacing(" ".join(translated_tokens))
+    normalized_source = normalize_aicrush_text(normalized)
+    if translated.lower() == normalized_source and replaced_hits == 0:
+        return normalized, "likely English", "No strong non-English markers found."
+    if replaced_hits <= 1:
+        return translated, "mixed/uncertain", "Light local glossary match only."
+    return translated, "Hinglish/romanized Hindi", "Local glossary fallback from visible wording."
+
+
+async def translate_text_to_english(text: str) -> dict[str, str]:
+    local_translation, local_source, local_note = _translate_text_local(text)
+    local_payload = {
+        "source_language": local_source,
+        "translated_text": local_translation or text.strip(),
+        "confidence_note": local_note,
+    }
+    if not is_ai_configured():
+        return local_payload
+
+    prompt = (
+        "Translate the user's message into natural English.\n"
+        "Rules:\n"
+        "- Input may be Hindi, Hinglish, romanized Hindi, or mixed English.\n"
+        "- Keep the meaning exact.\n"
+        "- Expand slang naturally when possible.\n"
+        "- Return only the translated English text.\n"
+        "- Do not add labels, quotes, notes, or explanations.\n\n"
+        f"Input: {text[:1200]}"
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a precise translation assistant for Discord chat. "
+                "You translate mixed-language text into English. "
+                "Return only the translated English text."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        raw = await request_ai_completion(
+            messages,
+            max_tokens=140,
+            temperature=0.05,
+            policy_key="translate",
+            include_fallback_notice=False,
+        )
+        ai_text = _translation_cleanup_spacing(_translation_strip_prefixes(raw))
+        normalized_input = normalize_aicrush_text(text)
+        normalized_local = normalize_aicrush_text(local_payload["translated_text"])
+        normalized_ai = normalize_aicrush_text(ai_text)
+        if not ai_text:
+            return local_payload
+        # If the model echoes the input back unchanged while local fallback found a translation,
+        # prefer the local translation instead of pretending nothing changed.
+        if normalized_ai == normalized_input and normalized_local != normalized_input:
+            return local_payload
+        if len(ai_text) > max(220, len(text) * 4):
+            return local_payload
+        return {
+            "source_language": "translated via ai",
+            "translated_text": ai_text[:900],
+            "confidence_note": "",
+        }
+    except Exception:
+        return local_payload
+
+
+def is_message_addressed_to_bot(message: discord.Message) -> bool:
+    if bot.user is None:
+        return False
+    raw = (message.content or "").strip()
+    if not raw:
+        return False
+    if re.match(rf"^<@!?{bot.user.id}>(?:\s*[:,\-]?\s*)?.*$", raw, flags=re.IGNORECASE):
+        return True
+
+    lowered = raw.lower()
+    names: set[str] = {"bell", bot.user.name.lower()}
+    if isinstance(message.guild, discord.Guild):
+        me = message.guild.me
+        if me and me.display_name:
+            names.add(me.display_name.lower())
+    for name in sorted(names, key=len, reverse=True):
+        if re.match(rf"^{re.escape(name)}\b(?:\s*[:,\-]?\s*)?.*$", lowered):
+            return True
+    return False
+
+
+async def get_referenced_message(message: discord.Message) -> discord.Message | None:
+    reference = getattr(message, "reference", None)
+    if reference is None or reference.message_id is None:
+        return None
+    resolved = getattr(reference, "resolved", None)
+    if isinstance(resolved, discord.Message):
+        return resolved
+    if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
+        return None
+    try:
+        return await message.channel.fetch_message(reference.message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+
+def is_reply_translation_request(text: str) -> bool:
+    normalized = " ".join((text or "").lower().split()).strip(" .!?")
+    if not normalized:
+        return True
+    if normalized in {
+        "translate",
+        "translation",
+        "meaning",
+        "meaning pls",
+        "meaning please",
+        "english",
+        "in english",
+        "to english",
+        "what does this mean",
+        "what's the meaning",
+        "what is the meaning",
+        "what does this say",
+    }:
+        return True
+    return (
+        re.search(r"\btranslate\b", normalized) is not None
+        or "in english" in normalized
+        or "to english" in normalized
+        or re.search(r"\bmeaning\b", normalized) is not None
+    )
+
+
+async def maybe_handle_reply_translation_request(message: discord.Message, addressed_text: str | None) -> bool:
+    if not is_message_addressed_to_bot(message):
+        return False
+    if addressed_text and not is_reply_translation_request(addressed_text):
+        return False
+    referenced = await get_referenced_message(message)
+    if referenced is None or referenced.author.bot:
+        return False
+    source_text = (referenced.clean_content or "").strip()
+    if not source_text:
+        await message.channel.send("The replied message has no text content to translate.")
+        return True
+    if not await enforce_fun_rate_limit_message(message):
+        return True
+    async with message.channel.typing():
+        payload = await translate_text_to_english(source_text)
+    translated_text = str(payload.get("translated_text", "") or "").strip() or source_text
+    await send_chunked(message.channel, translated_text)
+    return True
+
+
+def _socialintel_author_label(guild: discord.Guild, user_id: int) -> str:
+    member = guild.get_member(user_id)
+    if member is not None:
+        return member.display_name
+    guild_state = get_guild_socialintel_state(guild.id)
+    users = guild_state.get("users", {}) if isinstance(guild_state.get("users"), dict) else {}
+    row = users.get(str(user_id))
+    if isinstance(row, dict):
+        label = str(row.get("display_name", "") or row.get("username", "") or "").strip()
+        if label:
+            return label
+    return f"user {user_id}"
+
+
+def _socialintel_recent_topic_words(entries: list[WindowMessage], limit: int = 5) -> list[str]:
+    words: list[str] = []
+    for entry in entries:
+        for token in _altfinder_extract_valid_tokens(entry.content):
+            words.append(token)
+    return [token for token, _ in Counter(words).most_common(limit)]
+
+
+def _socialintel_local_replycraft(
+    source_message: discord.Message,
+    style_text: str,
+) -> dict[str, str]:
+    topic_tokens = _altfinder_extract_valid_tokens(source_message.clean_content)
+    topic = topic_tokens[0] if topic_tokens else "that"
+    opener = "Thanks for the context"
+    if "?" in source_message.clean_content:
+        opener = "Fair question"
+    elif "!" in source_message.clean_content:
+        opener = "You make a strong point"
+    return {
+        "safe_tone": "measured",
+        "safe_reply": f"{opener}. I think the key part is {topic}, and I’d answer it a bit more carefully.",
+        "playful_tone": "light banter",
+        "playful_reply": f"{opener} - low-key this whole thing hinges on {topic}, and that is where the real chaos starts.",
+        "bold_tone": "direct",
+        "bold_reply": f"Hot take: {topic} is the actual point here, and I’d rather say that directly than dance around it.",
+        "confidence_note": f"Built from visible channel context plus your style fingerprint ({style_text}).",
+    }
+
+
+def _socialintel_scan_coverage(guild_id: int) -> dict[str, Any]:
+    guild_state = get_guild_socialintel_state(guild_id)
+    channels = guild_state.get("channels", {}) if isinstance(guild_state.get("channels"), dict) else {}
+    meta = guild_state.get("meta", {}) if isinstance(guild_state.get("meta"), dict) else {}
+    channels_total = len(channels)
+    channels_fully_scanned = sum(
+        1
+        for row in channels.values()
+        if isinstance(row, dict) and bool(row.get("fully_scanned"))
+    )
+    return {
+        "channels_total": channels_total,
+        "channels_fully_scanned": channels_fully_scanned,
+        "messages_indexed": int(meta.get("messages_indexed", 0) or 0),
+        "last_backfill_ts": float(meta.get("last_backfill_ts", 0.0) or 0.0),
+        "last_incremental_ts": float(meta.get("last_incremental_ts", 0.0) or 0.0),
+        "last_indexed_message_ts": float(meta.get("last_indexed_message_ts", 0.0) or 0.0),
+    }
+
+
+def _socialintel_needs_backfill(guild_id: int) -> bool:
+    coverage = _socialintel_scan_coverage(guild_id)
+    channels_total = int(coverage.get("channels_total", 0) or 0)
+    channels_fully_scanned = int(coverage.get("channels_fully_scanned", 0) or 0)
+    last_backfill_ts = float(coverage.get("last_backfill_ts", 0.0) or 0.0)
+    if channels_total <= 0:
+        return True
+    if channels_fully_scanned < channels_total:
+        return True
+    if last_backfill_ts <= 0:
+        return True
+    return False
+
+
+async def maybe_run_socialintel_backfill(
+    guild: discord.Guild,
+    *,
+    force: bool = False,
+    message_budget: int | None = None,
+    time_budget_seconds: float | None = None,
+) -> dict[str, Any]:
+    coverage = _socialintel_scan_coverage(guild.id)
+    if not force and not _socialintel_needs_backfill(guild.id):
+        return {
+            "scanned_messages": 0,
+            "channels_considered": int(coverage.get("channels_total", 0) or 0),
+            "channels_touched": 0,
+            "channels_fully_scanned": int(coverage.get("channels_fully_scanned", 0) or 0),
+            "messages_indexed": int(coverage.get("messages_indexed", 0) or 0),
+            "passes": 0,
+        }
+    lock = SOCIALINTEL_LOCKS[(guild.id, 0)]
+    async with lock:
+        coverage = _socialintel_scan_coverage(guild.id)
+        if not force and not _socialintel_needs_backfill(guild.id):
+            return {
+                "scanned_messages": 0,
+                "channels_considered": int(coverage.get("channels_total", 0) or 0),
+                "channels_touched": 0,
+                "channels_fully_scanned": int(coverage.get("channels_fully_scanned", 0) or 0),
+                "messages_indexed": int(coverage.get("messages_indexed", 0) or 0),
+                "passes": 0,
+            }
+        return await run_socialintel_backfill(
+            guild,
+            message_budget=message_budget or SOCIALINTEL_COMMAND_MAX_BACKFILL_MESSAGES,
+            time_budget_seconds=time_budget_seconds or SOCIALINTEL_COMMAND_MAX_BACKFILL_SECONDS,
+        )
+
+
+def _socialintel_duo_score_percent(heuristic_score: float) -> int:
+    return max(1, min(99, int(round(min(1.0, float(heuristic_score) / 7.0) * 100))))
+
+
+def _socialintel_style_text(metrics: dict[str, Any]) -> str:
+    parts: list[str] = []
+    avg_len = float(metrics.get("avg_len", 0.0) or 0.0)
+    question_ratio = float(metrics.get("question_ratio", 0.0) or 0.0)
+    exclaim_ratio = float(metrics.get("exclaim_ratio", 0.0) or 0.0)
+    emoji_per_msg = float(metrics.get("emoji_per_msg", 0.0) or 0.0)
+    vocab_diversity = float(metrics.get("vocab_diversity", 0.0) or 0.0)
+    if avg_len >= 90:
+        parts.append("long-form")
+    elif avg_len <= 34:
+        parts.append("short-form")
+    else:
+        parts.append("mid-length")
+    if question_ratio >= 0.28:
+        parts.append("question-heavy")
+    elif exclaim_ratio >= 0.24:
+        parts.append("high-energy")
+    else:
+        parts.append("steady")
+    if emoji_per_msg >= 0.45:
+        parts.append("emoji-friendly")
+    if vocab_diversity >= 0.26:
+        parts.append("varied vocabulary")
+    return ", ".join(parts[:4]) or "light visible history"
+
+
+def _socialintel_counter_current_hour_fit(counter: dict[str, Any], hour: int) -> float:
+    if not isinstance(counter, dict) or not counter:
+        return 0.0
+    max_count = max(int(value or 0) for value in counter.values())
+    if max_count <= 0:
+        return 0.0
+    return min(1.0, int(counter.get(str(hour), 0) or 0) / max_count)
+
+
+def _socialintel_weekday_label(day_index: int) -> str:
+    mapping = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    if 0 <= int(day_index) < len(mapping):
+        return mapping[int(day_index)]
+    return str(day_index)
+
+
+def _socialintel_channel_label(channel: discord.abc.GuildChannel) -> str:
+    if isinstance(channel, discord.Thread):
+        return f"thread:{channel.name}"
+    return f"#{channel.name}"
+
+
+def _socialintel_counter_labels(counter: dict[str, Any], limit: int = 3) -> list[str]:
+    if not isinstance(counter, dict):
+        return []
+    ordered = sorted(counter.items(), key=lambda item: int(item[1] or 0), reverse=True)
+    return [str(key) for key, _ in ordered[:limit]]
+
+
+def _socialintel_duo_reason_bits(guild: discord.Guild, row: dict[str, Any]) -> list[str]:
+    bits: list[str] = []
+    if float(row.get("direct_pair_score", 0.0)) >= 0.34:
+        bits.append("clear direct reply or mention chemistry")
+    if float(row.get("topic_overlap", 0.0)) >= 0.34:
+        bits.append("topic overlap is strong")
+    if float(row.get("channel_overlap", 0.0)) >= 0.34:
+        bits.append("they keep showing up in the same places")
+    if float(row.get("schedule_overlap", 0.0)) >= 0.34:
+        bits.append("their active hours line up well")
+    if float(row.get("style_similarity", 0.0)) >= 0.42:
+        bits.append("their message style is compatible")
+    common_channels = row.get("common_channel_ids", [])
+    if not bits and isinstance(common_channels, list) and common_channels:
+        bits.append(
+            "shared channels are visible, but deeper direct evidence is still limited"
+        )
+    return bits[:3]
+
+
+def _socialintel_replycraft_schema(name: str) -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": name,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "safe_tone": {"type": "string"},
+                    "safe_reply": {"type": "string"},
+                    "playful_tone": {"type": "string"},
+                    "playful_reply": {"type": "string"},
+                    "bold_tone": {"type": "string"},
+                    "bold_reply": {"type": "string"},
+                    "confidence_note": {"type": "string"},
+                },
+                "required": [
+                    "safe_tone",
+                    "safe_reply",
+                    "playful_tone",
+                    "playful_reply",
+                    "bold_tone",
+                    "bold_reply",
+                    "confidence_note",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+async def _socialintel_message_neighborhood(
+    source_message: discord.Message,
+    *,
+    before_limit: int = 5,
+    after_limit: int = 5,
+) -> list[WindowMessage]:
+    if not isinstance(source_message.channel, (discord.TextChannel, discord.Thread)):
+        entry = _build_window_entry(source_message, include_attachment_marker=True)
+        return [entry] if entry is not None else []
+    before_entries: list[WindowMessage] = []
+    after_entries: list[WindowMessage] = []
+    try:
+        async for msg in source_message.channel.history(
+            limit=before_limit,
+            before=discord.Object(id=source_message.id),
+            oldest_first=False,
+        ):
+            entry = _build_window_entry(msg, include_attachment_marker=True)
+            if entry is not None:
+                before_entries.append(entry)
+    except (discord.Forbidden, discord.HTTPException):
+        before_entries = []
+    try:
+        async for msg in source_message.channel.history(
+            limit=after_limit,
+            after=discord.Object(id=source_message.id),
+            oldest_first=True,
+        ):
+            entry = _build_window_entry(msg, include_attachment_marker=True)
+            if entry is not None:
+                after_entries.append(entry)
+    except (discord.Forbidden, discord.HTTPException):
+        after_entries = []
+    center_entry = _build_window_entry(source_message, include_attachment_marker=True)
+    entries = list(reversed(before_entries))
+    if center_entry is not None:
+        entries.append(center_entry)
+    entries.extend(after_entries)
+    return entries
+
+
+async def _socialintel_generate_replycraft(
+    source_message: discord.Message,
+    *,
+    requester_metrics: dict[str, Any],
+    recent_entries: list[WindowMessage],
+) -> dict[str, str]:
+    style_text = _socialintel_style_text(requester_metrics)
+    local = _socialintel_local_replycraft(source_message, style_text)
+    if not is_ai_configured():
+        return local
+    recent_lines = [
+        f"{entry.author_display_name}: {_socialintel_compact_excerpt(entry.content, 110)}"
+        for entry in recent_entries[-8:]
+    ]
+    prompt = (
+        "Draft three short Discord replies to the target message.\n"
+        "Rules:\n"
+        "- Use only the visible evidence below.\n"
+        "- Do not invent context.\n"
+        "- Do not quote long message spans.\n"
+        "- Keep each reply under 180 characters.\n"
+        "- Match the requester's style loosely without copying anyone verbatim.\n"
+        "- Return JSON only.\n\n"
+        f"Requester style: {style_text}\n"
+        f"Target author: {get_user_display_name(source_message.author)}\n"
+        f"Target message: {_socialintel_compact_excerpt(source_message.clean_content or '[attachment]', 180)}\n"
+        "Recent visible context:\n"
+        + "\n".join(recent_lines)
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You draft evidence-grounded Discord reply options. "
+                "Return strict JSON only."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        raw = await request_ai_completion(
+            messages,
+            max_tokens=260,
+            temperature=0.45,
+            policy_key="replycraft",
+            model_override=(SOCIALINTEL_EXPLAIN_MODEL or None) if AI_PROVIDER == "groq" else None,
+            fallback_models=SOCIALINTEL_FALLBACK_MODELS if AI_PROVIDER == "groq" else None,
+            response_format=_socialintel_replycraft_schema("replycraft_payload") if AI_PROVIDER == "groq" else None,
+            include_fallback_notice=False,
+        )
+        payload = _extract_first_json_object(raw)
+        if not isinstance(payload, dict):
+            return local
+        parsed: dict[str, str] = {}
+        for key, fallback_value in local.items():
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                parsed[key] = " ".join(value.split())[:220]
+            else:
+                parsed[key] = fallback_value
+        return parsed
+    except Exception:
+        return local
+
+
+def _socialintel_thread_focus(channel_row: dict[str, Any]) -> tuple[str | None, str]:
+    question_ts = float(channel_row.get("last_open_question_ts", 0.0) or 0.0)
+    conflict_ts = float(channel_row.get("last_conflict_ts", 0.0) or 0.0)
+    question_text = str(channel_row.get("last_open_question_text", "") or "").strip()
+    conflict_text = str(channel_row.get("last_conflict_text", "") or "").strip()
+    if conflict_ts >= question_ts and len(conflict_text) >= 18:
+        return "conflict", conflict_text
+    if len(question_text) >= 18:
+        return "question", question_text
+    return None, ""
+
+
+def _socialintel_build_threadrevive_prompts(
+    channel_row: dict[str, Any],
+    *,
+    limit: int = 3,
+) -> list[str]:
+    focus_kind, focus_text = _socialintel_thread_focus(channel_row)
+    if not focus_text:
+        return []
+    topic_words = _socialintel_counter_labels(
+        channel_row.get("recent_topics", {}) if isinstance(channel_row.get("recent_topics"), dict) else {},
+        limit=3,
+    )
+    topic_text = ", ".join(topic_words) if topic_words else "the last open thread"
+    if focus_kind == "conflict":
+        prompts = [
+            f"Quick revive: this stalled around `{focus_text}`. What has changed since then?",
+            f"Reset the debate in one line: what is your strongest take on {topic_text} now?",
+            f"If this moves forward today, what is the practical next step instead of repeating the same loop?",
+        ]
+    else:
+        prompts = [
+            f"Follow-up for the thread: `{focus_text}`",
+            f"On {topic_text}, what is the clearest answer or example people have now?",
+            f"What changed enough here that this question deserves a fresh answer today?",
+        ]
+    return prompts[: max(1, limit)]
+
+
+def _socialintel_channel_is_sendable(
+    channel: discord.TextChannel | discord.Thread,
+    me: discord.Member | None,
+) -> bool:
+    if me is None:
+        return False
+    try:
+        perms = channel.permissions_for(me)
+    except Exception:
+        return False
+    if isinstance(channel, discord.Thread):
+        if channel.archived:
+            return False
+        return bool(
+            perms.view_channel
+            and (
+                getattr(perms, "send_messages_in_threads", False)
+                or getattr(perms, "send_messages", False)
+            )
+        )
+    return bool(perms.view_channel and perms.send_messages)
+
+
+async def run_threadrevive_proactive_tick() -> None:
+    if not THREADREVIVE_PROACTIVE_ENABLED:
+        return
+    now_ts = time.time()
+    min_idle_seconds = max(60, THREADREVIVE_PROACTIVE_MIN_IDLE_MINUTES * 60)
+    for guild in bot.guilds:
+        guild_state = get_guild_socialintel_state(guild.id)
+        channels = guild_state.get("channels", {})
+        if not isinstance(channels, dict) or not channels:
+            continue
+        me = guild.me
+        ranked_rows = sorted(
+            (
+                (channel_id, row)
+                for channel_id, row in channels.items()
+                if isinstance(row, dict)
+            ),
+            key=lambda item: max(
+                float(item[1].get("last_conflict_ts", 0.0) or 0.0),
+                float(item[1].get("last_open_question_ts", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        for channel_id, row in ranked_rows:
+            if int(row.get("message_count", 0) or 0) < 8:
+                continue
+            if now_ts - float(row.get("last_message_ts", 0.0) or 0.0) < min_idle_seconds:
+                continue
+            if now_ts - float(row.get("proactive_last_ts", 0.0) or 0.0) < THREADREVIVE_PROACTIVE_COOLDOWN_SECONDS:
+                continue
+            prompts = _socialintel_build_threadrevive_prompts(row, limit=1)
+            if not prompts:
+                continue
+            channel = resolve_channel_or_thread(guild, str(channel_id))
+            if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+                continue
+            if not _socialintel_channel_is_sendable(channel, me):
+                continue
+            focus_kind, focus_text = _socialintel_thread_focus(row)
+            if not focus_text:
+                continue
+            try:
+                await channel.send(
+                    "Thread revive:\n"
+                    f"- Context hook: `{_socialintel_compact_excerpt(focus_text, 160)}`\n"
+                    f"- Prompt: {prompts[0]}"
+                )
+            except discord.HTTPException:
+                continue
+            row["proactive_last_ts"] = now_ts
+            _mark_socialintel_dirty()
+            break
+
+
+def _socialintel_jumpin_reason(
+    *,
+    activity_score: float,
+    topic_overlap: float,
+    known_contact_ratio: float,
+    time_fit: float,
+    contact_labels: list[str],
+    topic_words: list[str],
+) -> str:
+    parts: list[str] = []
+    if activity_score >= 0.72:
+        parts.append("live activity is strong")
+    if known_contact_ratio >= 0.25 and contact_labels:
+        parts.append("people you already interact with are active")
+    if topic_overlap >= 0.22 and topic_words:
+        parts.append(f"the channel is circling around {', '.join(topic_words[:2])}")
+    if time_fit >= 0.45:
+        parts.append("this fits your usual active window")
+    return ", ".join(parts[:3]) or "recent traffic is visible, but evidence is still light"
+
+
+def _socialintel_jumpin_opener(
+    *,
+    topic_words: list[str],
+    requester_metrics: dict[str, Any],
+    contact_labels: list[str],
+) -> str:
+    question_ratio = float(requester_metrics.get("question_ratio", 0.0) or 0.0)
+    exclaim_ratio = float(requester_metrics.get("exclaim_ratio", 0.0) or 0.0)
+    if topic_words:
+        topic_text = ", ".join(topic_words[:2])
+        if question_ratio >= exclaim_ratio:
+            return f"Quick question on {topic_text}: what changed most recently?"
+        if contact_labels:
+            return f"I saw {topic_text} come up here again. What is the strongest take right now?"
+        return f"What is the current read on {topic_text}?"
+    if contact_labels:
+        return "What is the latest angle here that is actually worth replying to?"
+    return "What is the one update in here that matters most right now?"
+
+
+async def _socialintel_build_jumpin_rows(
+    guild: discord.Guild,
+    member: discord.Member,
+) -> list[dict[str, Any]]:
+    context = collect_socialintel_context(guild, member)
+    requester_metrics = context.target_metrics
+    if context.target_message_count < 8:
+        return []
+    now_dt = _guild_now(guild.id)
+    cutoff_dt = _utc_now() - timedelta(hours=6)
+    interaction_target_ids: set[int] = set()
+    for field in ("reply_targets", "mention_targets", "copresence_targets"):
+        counter = requester_metrics.get(field, {})
+        if not isinstance(counter, dict):
+            continue
+        for key, _ in sorted(counter.items(), key=lambda item: int(item[1] or 0), reverse=True)[:18]:
+            if str(key).isdigit():
+                interaction_target_ids.add(int(key))
+    guild_state = get_guild_socialintel_state(guild.id)
+    channel_rows = guild_state.get("channels", {}) if isinstance(guild_state.get("channels"), dict) else {}
+    candidate_rows: list[dict[str, Any]] = []
+    sorted_channel_rows = sorted(
+        (
+            (channel_id, row)
+            for channel_id, row in channel_rows.items()
+            if isinstance(row, dict)
+        ),
+        key=lambda item: float(item[1].get("last_message_ts", 0.0) or 0.0),
+        reverse=True,
+    )[:14]
+    for channel_id, row in sorted_channel_rows:
+        channel = resolve_channel_or_thread(guild, str(channel_id))
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            continue
+        if not _socialintel_channel_is_sendable(channel, guild.me):
+            continue
+        entries = await collect_messageable_window(channel, limit=40, after=cutoff_dt)
+        if len(entries) < 3:
+            continue
+        unique_authors: list[int] = []
+        for entry in entries:
+            if entry.author_id not in unique_authors:
+                unique_authors.append(entry.author_id)
+        recent_contacts = [
+            author_id for author_id in unique_authors
+            if author_id in interaction_target_ids and author_id != member.id
+        ]
+        topic_words = _socialintel_recent_topic_words(entries, limit=4)
+        topic_counter: dict[str, int] = {}
+        for token in topic_words:
+            topic_counter[str(token)] = topic_counter.get(str(token), 0) + 1
+        recent_topic_counter = row.get("recent_topics", {}) if isinstance(row.get("recent_topics"), dict) else {}
+        topic_overlap = _altfinder_counter_overlap(
+            requester_metrics.get("topics", {}) if isinstance(requester_metrics.get("topics"), dict) else {},
+            recent_topic_counter or topic_counter,
+        )
+        last_message_ts = float(row.get("last_message_ts", 0.0) or 0.0)
+        idle_minutes = max(0.0, (now_dt.timestamp() - last_message_ts) / 60.0)
+        if idle_minutes <= 10:
+            activity_score = 1.0
+        elif idle_minutes <= 30:
+            activity_score = 0.86
+        elif idle_minutes <= 120:
+            activity_score = 0.66
+        elif idle_minutes <= 360:
+            activity_score = 0.38
+        else:
+            activity_score = 0.14
+        activity_score = min(1.0, activity_score + min(0.22, len(entries) / 60.0))
+        known_contact_ratio = len(recent_contacts) / max(1, len(unique_authors))
+        time_fit = _socialintel_counter_current_hour_fit(
+            requester_metrics.get("active_hours", {}) if isinstance(requester_metrics.get("active_hours"), dict) else {},
+            now_dt.hour,
+        )
+        presence_fit = _socialintel_counter_current_hour_fit(
+            requester_metrics.get("presence_hours", {}) if isinstance(requester_metrics.get("presence_hours"), dict) else {},
+            now_dt.hour,
+        )
+        score = (
+            (activity_score * 1.35)
+            + (topic_overlap * 1.22)
+            + (known_contact_ratio * 1.18)
+            + (time_fit * 0.82)
+            + (presence_fit * 0.45)
+        )
+        if score < 0.7:
+            continue
+        contact_labels = [_socialintel_author_label(guild, author_id) for author_id in recent_contacts[:3]]
+        candidate_rows.append(
+            {
+                "channel": channel,
+                "score": round(score, 4),
+                "topic_words": topic_words,
+                "reason": _socialintel_jumpin_reason(
+                    activity_score=activity_score,
+                    topic_overlap=topic_overlap,
+                    known_contact_ratio=known_contact_ratio,
+                    time_fit=max(time_fit, presence_fit),
+                    contact_labels=contact_labels,
+                    topic_words=topic_words,
+                ),
+                "opener": _socialintel_jumpin_opener(
+                    topic_words=topic_words,
+                    requester_metrics=requester_metrics,
+                    contact_labels=contact_labels,
+                ),
+            }
+        )
+    candidate_rows.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+    return candidate_rows[:3]
+
+
+def _socialintel_compare_metric(left: float, right: float, scale: float) -> float:
+    return 1.0 - _altfinder_scalar_similarity(left, right, scale)
+
+
+def _socialintel_recent_peak_label(counter: dict[str, Any], *, kind: str) -> str:
+    labels = _socialintel_counter_labels(counter, limit=3)
+    if not labels:
+        return "limited data"
+    if kind == "hours":
+        return _altfinder_format_hours([int(label) for label in labels if str(label).isdigit()])
+    if kind == "weekdays":
+        return ", ".join(_socialintel_weekday_label(int(label)) for label in labels if str(label).isdigit())
+    return ", ".join(labels)
+
+
+def _socialintel_profile_drift_score(row: dict[str, Any]) -> tuple[float, str]:
+    signatures = row.get("profile_signatures", {}) if isinstance(row.get("profile_signatures"), dict) else {}
+    distinct = len(signatures)
+    if distinct <= 1:
+        return 0.0, "single stable visible profile signature"
+    if distinct == 2:
+        return 0.42, "more than one visible profile signature has appeared"
+    return 0.72, "multiple visible profile signatures have appeared"
+
+
+def _socialintel_channel_names_from_counter(guild: discord.Guild, counter: dict[str, Any], limit: int = 3) -> str:
+    ids: list[int] = []
+    if isinstance(counter, dict):
+        for key, _ in sorted(counter.items(), key=lambda item: int(item[1] or 0), reverse=True)[:limit]:
+            if str(key).isdigit():
+                ids.append(int(key))
+    return _altfinder_channel_names(guild, ids) if ids else "limited overlap"
+
+
+def _socialintel_target_names_from_counter(
+    guild: discord.Guild,
+    counter: dict[str, Any],
+    limit: int = 3,
+) -> str:
+    labels: list[str] = []
+    if not isinstance(counter, dict):
+        return "limited overlap"
+    for key, _ in sorted(counter.items(), key=lambda item: int(item[1] or 0), reverse=True)[:limit]:
+        if not str(key).isdigit():
+            continue
+        labels.append(_socialintel_author_label(guild, int(key)))
+    return ", ".join(labels) if labels else "limited overlap"
+
+
+async def _socialintel_build_driftcheck_report(
+    guild: discord.Guild,
+    member: discord.Member,
+) -> dict[str, Any] | None:
+    context = collect_socialintel_context(guild, member)
+    baseline_metrics = context.target_metrics
+    baseline_count = context.target_message_count
+    recent_messages, recent_entries = await collect_recent_user_messages_guild(guild, member.id, 90)
+    recent_metrics, recent_count = _socialintel_metrics_from_entries(recent_entries, member.id)
+    if baseline_count < 24 or recent_count < 16:
+        return None
+    style_drift = min(
+        1.0,
+        (
+            _socialintel_compare_metric(float(baseline_metrics.get("avg_len", 0.0)), float(recent_metrics.get("avg_len", 0.0)), 70.0) * 0.24
+            + _socialintel_compare_metric(float(baseline_metrics.get("question_ratio", 0.0)), float(recent_metrics.get("question_ratio", 0.0)), 0.45) * 0.16
+            + _socialintel_compare_metric(float(baseline_metrics.get("exclaim_ratio", 0.0)), float(recent_metrics.get("exclaim_ratio", 0.0)), 0.45) * 0.14
+            + _socialintel_compare_metric(float(baseline_metrics.get("emoji_per_msg", 0.0)), float(recent_metrics.get("emoji_per_msg", 0.0)), 1.8) * 0.14
+            + _socialintel_compare_metric(float(baseline_metrics.get("vocab_diversity", 0.0)), float(recent_metrics.get("vocab_diversity", 0.0)), 0.35) * 0.12
+            + (1.0 - _altfinder_counter_overlap(
+                baseline_metrics.get("bigrams", {}) if isinstance(baseline_metrics.get("bigrams"), dict) else {},
+                recent_metrics.get("bigrams", {}) if isinstance(recent_metrics.get("bigrams"), dict) else {},
+            )) * 0.2
+        )
+    )
+    activity_drift = min(
+        1.0,
+        (
+            (1.0 - _altfinder_counter_overlap(
+                baseline_metrics.get("active_hours", {}) if isinstance(baseline_metrics.get("active_hours"), dict) else {},
+                recent_metrics.get("active_hours", {}) if isinstance(recent_metrics.get("active_hours"), dict) else {},
+            )) * 0.72
+            + (1.0 - _altfinder_counter_overlap(
+                baseline_metrics.get("active_weekdays", {}) if isinstance(baseline_metrics.get("active_weekdays"), dict) else {},
+                recent_metrics.get("active_weekdays", {}) if isinstance(recent_metrics.get("active_weekdays"), dict) else {},
+            )) * 0.28
+        )
+    )
+    channel_drift = 1.0 - _altfinder_counter_overlap(
+        baseline_metrics.get("top_channels", {}) if isinstance(baseline_metrics.get("top_channels"), dict) else {},
+        recent_metrics.get("top_channels", {}) if isinstance(recent_metrics.get("top_channels"), dict) else {},
+    )
+    interaction_drift = min(
+        1.0,
+        (
+            (1.0 - _altfinder_counter_overlap(
+                baseline_metrics.get("reply_targets", {}) if isinstance(baseline_metrics.get("reply_targets"), dict) else {},
+                recent_metrics.get("reply_targets", {}) if isinstance(recent_metrics.get("reply_targets"), dict) else {},
+            )) * 0.4
+            + (1.0 - _altfinder_counter_overlap(
+                baseline_metrics.get("mention_targets", {}) if isinstance(baseline_metrics.get("mention_targets"), dict) else {},
+                recent_metrics.get("mention_targets", {}) if isinstance(recent_metrics.get("mention_targets"), dict) else {},
+            )) * 0.32
+            + (1.0 - _altfinder_counter_overlap(
+                baseline_metrics.get("copresence_targets", {}) if isinstance(baseline_metrics.get("copresence_targets"), dict) else {},
+                recent_metrics.get("copresence_targets", {}) if isinstance(recent_metrics.get("copresence_targets"), dict) else {},
+            )) * 0.28
+        )
+    )
+    current_hour = _guild_now(guild.id).hour
+    current_status = str(context.target_row.get("last_status", "offline") or "offline")
+    presence_hour_fit = _socialintel_counter_current_hour_fit(
+        baseline_metrics.get("presence_hours", {}) if isinstance(baseline_metrics.get("presence_hours"), dict) else {},
+        current_hour,
+    )
+    presence_status_fit = 0.0
+    status_counts = baseline_metrics.get("status_counts", {}) if isinstance(baseline_metrics.get("status_counts"), dict) else {}
+    if isinstance(status_counts, dict) and status_counts:
+        max_status = max(int(value or 0) for value in status_counts.values())
+        if max_status > 0:
+            presence_status_fit = min(1.0, int(status_counts.get(current_status, 0) or 0) / max_status)
+    presence_drift = min(1.0, ((1.0 - presence_hour_fit) * 0.55) + ((1.0 - presence_status_fit) * 0.45))
+    profile_drift, profile_note = _socialintel_profile_drift_score(context.target_row)
+    anomaly_score = min(
+        0.98,
+        (style_drift * 0.28)
+        + (activity_drift * 0.18)
+        + (channel_drift * 0.18)
+        + (interaction_drift * 0.18)
+        + (presence_drift * 0.08)
+        + (profile_drift * 0.10)
+    )
+    return {
+        "recent_messages": recent_messages,
+        "baseline_count": baseline_count,
+        "recent_count": recent_count,
+        "anomaly_score": round(anomaly_score, 4),
+        "band": _socialintel_confidence_band(anomaly_score),
+        "style_drift": round(style_drift, 4),
+        "activity_drift": round(activity_drift, 4),
+        "channel_drift": round(channel_drift, 4),
+        "interaction_drift": round(interaction_drift, 4),
+        "presence_drift": round(presence_drift, 4),
+        "profile_drift": round(profile_drift, 4),
+        "profile_note": profile_note,
+        "baseline_metrics": baseline_metrics,
+        "recent_metrics": recent_metrics,
+        "current_status": current_status,
+    }
+
+
+def _socialintel_arc_message_score(entry: WindowMessage) -> float:
+    score = _socialintel_tension_score(entry.content)
+    if entry.reference_message_id is not None:
+        score += 0.08
+    if entry.mention_ids:
+        score += min(0.18, len(entry.mention_ids) * 0.05)
+    return min(1.0, score)
+
+
+def _socialintel_arc_report_lines(
+    guild: discord.Guild,
+    entries: list[WindowMessage],
+) -> dict[str, Any] | None:
+    if len(entries) < 8:
+        return None
+    scored = [
+        {
+            "entry": entry,
+            "tension": _socialintel_arc_message_score(entry),
+            "calm": _socialintel_deescalation_score(entry.content),
+        }
+        for entry in entries
+    ]
+    hot = [row for row in scored if float(row["tension"]) >= 0.22]
+    if not hot:
+        return None
+    starter = min(hot, key=lambda row: float(row["entry"].created_at_ts))
+    starter_ts = float(starter["entry"].created_at_ts)
+    escalator_scores: Counter[int] = Counter()
+    deescalator_scores: Counter[int] = Counter()
+    pivot_rows: list[dict[str, Any]] = []
+    unresolved: list[str] = []
+    evidence_lines: list[str] = []
+    seen_pivots: set[int] = set()
+    for row in scored:
+        entry = row["entry"]
+        if float(entry.created_at_ts) < starter_ts:
+            continue
+        escalator_scores[entry.author_id] += float(row["tension"])
+        deescalator_scores[entry.author_id] += float(row["calm"])
+        if row["tension"] >= 0.24 or row["calm"] >= 0.22:
+            if len(evidence_lines) < 5:
+                stamp = datetime.fromtimestamp(entry.created_at_ts, tz=_safe_zoneinfo(get_guild_engagement_timezone(guild.id))).strftime("%H:%M")
+                evidence_lines.append(
+                    f"[{stamp}] {_socialintel_author_label(guild, entry.author_id)}: `{_socialintel_compact_excerpt(entry.content, 110)}`"
+                )
+        if entry.message_id not in seen_pivots and (row["calm"] >= 0.22 or ("?" in entry.content and row["tension"] >= 0.18)):
+            seen_pivots.add(entry.message_id)
+            pivot_rows.append(row)
+        if "?" in entry.content and len(unresolved) < 3:
+            unresolved.append(_socialintel_compact_excerpt(entry.content, 120))
+    top_escalators = [
+        f"{_socialintel_author_label(guild, user_id)} ({score:.2f})"
+        for user_id, score in escalator_scores.most_common(3)
+        if score >= 0.24
+    ]
+    top_deescalators = [
+        f"{_socialintel_author_label(guild, user_id)} ({score:.2f})"
+        for user_id, score in deescalator_scores.most_common(3)
+        if score >= 0.18
+    ]
+    if not unresolved:
+        recent_questions = [row["entry"] for row in scored[-8:] if "?" in row["entry"].content]
+        unresolved = [_socialintel_compact_excerpt(entry.content, 120) for entry in recent_questions[:2]]
+    return {
+        "starter": starter["entry"],
+        "escalators": top_escalators,
+        "deescalators": top_deescalators,
+        "pivots": [
+            f"{_socialintel_author_label(guild, row['entry'].author_id)}: `{_socialintel_compact_excerpt(row['entry'].content, 110)}`"
+            for row in pivot_rows[:3]
+        ],
+        "unresolved": unresolved[:3],
+        "evidence_lines": evidence_lines[:5],
+    }
 
 
 def strip_bot_address_prefix(message: discord.Message) -> str | None:
@@ -1274,6 +9821,35 @@ def parse_conversation_summary_count(text: str) -> int | None:
     if count_match is not None:
         return int(count_match.group(1))
     return 100
+
+
+def parse_catchup_hours_request(text: str) -> int | None:
+    lowered = text.lower()
+    if "catchup" not in lowered and "catch up" not in lowered:
+        return None
+
+    match = re.search(r"\b(\d{1,3})\s*(?:h|hr|hrs|hour|hours)\b", lowered)
+    if match is None:
+        match = re.search(r"\bcatch\s*up\b.*?\b(\d{1,3})\b", lowered)
+    if match is None:
+        match = re.search(r"\bcatchup\b.*?\b(\d{1,3})\b", lowered)
+    hours = int(match.group(1)) if match else 24
+    return max(1, min(hours, CATCHUP_MAX_HOURS))
+
+
+def parse_serverinsights_hours_request(text: str) -> int | None:
+    lowered = text.lower()
+    if (
+        "serverinsights" not in lowered
+        and "server insights" not in lowered
+        and "engagement insights" not in lowered
+    ):
+        return None
+    match = re.search(r"\b(\d{1,3})\s*(?:h|hr|hrs|hour|hours)\b", lowered)
+    if match is None:
+        match = re.search(r"\b(?:for|last|past)\s+(\d{1,3})\b", lowered)
+    hours = int(match.group(1)) if match else 72
+    return max(6, min(hours, INSIGHTS_MAX_HOURS))
 
 
 def parse_psych_action_and_seed(raw: str | None) -> tuple[str, str | None]:
@@ -1593,6 +10169,7 @@ async def _build_psych_phase_reply(
         messages,
         max_tokens=PSYCH_MAX_TOKENS,
         temperature=0.35,
+        policy_key="psych",
     )
     reply, updated_notes = _parse_psych_ai_payload(raw, current_notes)
     _apply_psych_turn_update(
@@ -2055,6 +10632,2360 @@ async def send_server_info_embed(channel: discord.abc.Messageable, guild: discor
     await channel.send(embed=embed)
 
 
+def normalize_leaderboard_mode(raw: str | None) -> Literal["daily", "weekly", "alltime"]:
+    normalized = (raw or "alltime").strip().lower()
+    if normalized in {"day", "today", "daily"}:
+        return "daily"
+    if normalized in {"week", "weekly"}:
+        return "weekly"
+    return "alltime"
+
+
+def _resolve_member_display(guild: discord.Guild, user_id: int) -> str:
+    member = guild.get_member(user_id)
+    if member is not None:
+        return member.display_name
+    return f"User {user_id}"
+
+
+def build_leaderboard_rows(
+    guild: discord.Guild,
+    mode: Literal["daily", "weekly", "alltime"],
+    *,
+    limit: int = 10,
+) -> list[tuple[int, str, int]]:
+    guild_state = get_guild_engagement_state(guild.id)
+    users = guild_state.get("users")
+    if not isinstance(users, dict):
+        return []
+    day_key = _guild_day_key(guild.id)
+    week_key = _guild_week_key(guild.id)
+    rows: list[tuple[int, str, int]] = []
+    for raw_user_id, state in users.items():
+        if not isinstance(state, dict):
+            continue
+        try:
+            user_id = int(raw_user_id)
+        except (TypeError, ValueError):
+            continue
+        score = get_metric_for_user(state, mode, day_key=day_key, week_key=week_key)
+        if score <= 0:
+            continue
+        rows.append((user_id, _resolve_member_display(guild, user_id), score))
+    rows.sort(key=lambda item: item[2], reverse=True)
+    return rows[: max(1, limit)]
+
+
+def get_user_rank_position(guild: discord.Guild, user_id: int, mode: Literal["daily", "weekly", "alltime"]) -> tuple[int, int]:
+    guild_state = get_guild_engagement_state(guild.id)
+    users = guild_state.get("users")
+    if not isinstance(users, dict):
+        return 0, 0
+    day_key = _guild_day_key(guild.id)
+    week_key = _guild_week_key(guild.id)
+    scored: list[tuple[int, int]] = []
+    for raw_user_id, state in users.items():
+        if not isinstance(state, dict):
+            continue
+        try:
+            uid = int(raw_user_id)
+        except (TypeError, ValueError):
+            continue
+        value = get_metric_for_user(state, mode, day_key=day_key, week_key=week_key)
+        if value <= 0:
+            continue
+        scored.append((uid, value))
+    if not scored:
+        return 0, 0
+    scored.sort(key=lambda item: item[1], reverse=True)
+    for idx, (uid, _) in enumerate(scored, start=1):
+        if uid == user_id:
+            return idx, len(scored)
+    return 0, len(scored)
+
+
+def get_user_quest_view(guild_id: int, user_id: int) -> tuple[str, list[str], int, int]:
+    user_state = get_user_engagement_state(guild_id, user_id)
+    quests, progress, completed = get_user_daily_quests(guild_id, user_state)
+    lines: list[str] = []
+    completed_count = 0
+    total_reward = 0
+    for quest in quests:
+        quest_id = str(quest.get("id", ""))
+        metric = str(quest.get("type", ""))
+        target = int(quest.get("target", 1))
+        reward = int(quest.get("reward", 0))
+        current = int(progress.get(metric, 0))
+        done = quest_id in completed
+        if done:
+            completed_count += 1
+            total_reward += reward
+        marker = "âœ…" if done else "â–«ï¸"
+        lines.append(
+            f"{marker} {quest.get('name', quest_id)} - `{current}/{target}` (+{reward} XP)"
+        )
+    return _guild_day_key(guild_id), lines, completed_count, total_reward
+
+
+def get_rank_snapshot(guild_id: int, user_id: int) -> dict[str, int]:
+    state = get_user_engagement_state(guild_id, user_id)
+    daily = state.get("daily", {})
+    weekly = state.get("weekly", {})
+    return {
+        "xp": int(state.get("xp", 0)),
+        "streak": int(state.get("streak", 0)),
+        "best_streak": int(state.get("best_streak", 0)),
+        "daily_xp": int(daily.get("xp", 0)) if isinstance(daily, dict) and daily.get("day") == _guild_day_key(guild_id) else 0,
+        "weekly_points": int(weekly.get("points", 0)) if isinstance(weekly, dict) and weekly.get("key") == _guild_week_key(guild_id) else 0,
+        "event_points": int(state.get("event_points", 0)),
+    }
+
+
+async def process_event_message(message: discord.Message) -> None:
+    session = EVENT_SESSIONS.get(message.guild.id)
+    if not session:
+        return
+    if int(session.get("channel_id", 0)) != message.channel.id:
+        return
+    if message.author.bot:
+        return
+    if message.content.startswith(PREFIX):
+        return
+
+    cooldown_key = (message.guild.id, message.author.id)
+    now = time.monotonic()
+    last = EVENT_MESSAGE_COOLDOWNS.get(cooldown_key, 0.0)
+    if now - last < 12:
+        return
+    EVENT_MESSAGE_COOLDOWNS[cooldown_key] = now
+
+    scores = session.setdefault("scores", {})
+    if not isinstance(scores, dict):
+        scores = {}
+        session["scores"] = scores
+
+    user_key = str(message.author.id)
+    points = int(scores.get(user_key, 0))
+    event_type = str(session.get("type", "hottake"))
+    gained = 1
+    if event_type == "trivia":
+        answers = session.get("answers")
+        normalized = _normalize_content_for_xp(message.content)
+        if isinstance(answers, set) and any(answer in normalized for answer in answers):
+            gained = 3
+        else:
+            gained = 1
+    scores[user_key] = min(14, points + gained)
+    _mark_engagement_dirty()
+
+
+def _default_business_user_state() -> dict[str, Any]:
+    return {
+        "cash": float(BUSINESS_STARTER_CASH),
+        "portfolio": {},
+        "commodity_portfolio": {},
+        "crypto_portfolio": {},
+        "properties": [],
+        "business_ids": [],
+        "loans": [],
+        "daily": {"day": "", "streak": 0},
+        "income_total": 0.0,
+        "weekly_income": 0.0,
+        "weekly_realized_gains_short": 0.0,
+        "weekly_realized_gains_long": 0.0,
+        "tax_liability": 0.0,
+        "taxes_paid_total": 0.0,
+        "realized_pnl": {},
+        "salary_tier": 1,
+        "credit_score": 650,
+        "last_networth": float(BUSINESS_STARTER_CASH),
+        "cooldowns": {},
+        "flags": {"trade_limited": False},
+        "frozen": False,
+        "created_ts": time.time(),
+    }
+
+
+def _default_stock_catalog() -> dict[str, dict[str, Any]]:
+    stocks: dict[str, dict[str, Any]] = {}
+    selected = BUSINESS_SYMBOL_POOL[: max(6, min(BUSINESS_STOCK_COUNT, len(BUSINESS_SYMBOL_POOL)))]
+    for idx, (symbol, name, sector) in enumerate(selected):
+        base_price = round(85 + (idx * 11.7) + random.uniform(-14, 18), 2)
+        stocks[symbol] = {
+            "symbol": symbol,
+            "name": name,
+            "sector": sector,
+            "price": max(8.0, base_price),
+            "volatility": round(0.010 + random.random() * 0.02, 4),
+            "trend": round(random.uniform(-0.004, 0.004), 4),
+            "history": [max(8.0, base_price)],
+        }
+    return stocks
+
+
+def _default_commodity_catalog() -> dict[str, dict[str, Any]]:
+    assets: dict[str, dict[str, Any]] = {}
+    for symbol, name, sector, base_price, base_vol in BUSINESS_COMMODITY_POOL:
+        price = round(base_price * random.uniform(0.90, 1.12), 2)
+        assets[symbol] = {
+            "symbol": symbol,
+            "name": name,
+            "sector": sector,
+            "price": max(1.0, price),
+            "volatility": round(max(0.006, base_vol + random.uniform(-0.003, 0.004)), 4),
+            "trend": round(random.uniform(-0.0035, 0.0035), 4),
+            "history": [max(1.0, price)],
+        }
+    return assets
+
+
+def _default_crypto_catalog() -> dict[str, dict[str, Any]]:
+    assets: dict[str, dict[str, Any]] = {}
+    for symbol, name, base_price, base_vol in BUSINESS_CRYPTO_POOL:
+        price = round(base_price * random.uniform(0.78, 1.25), 2)
+        assets[symbol] = {
+            "symbol": symbol,
+            "name": name,
+            "sector": "crypto",
+            "price": max(0.5, price),
+            "volatility": round(max(0.018, base_vol + random.uniform(-0.01, 0.015)), 4),
+            "trend": round(random.uniform(-0.01, 0.01), 4),
+            "history": [max(0.5, price)],
+        }
+    return assets
+
+
+def _default_business_profiles() -> dict[str, dict[str, float]]:
+    return {
+        "restaurant": {"revenue": 2600.0, "payroll": 320.0, "maintenance": 190.0, "expand_cost": 7800.0},
+        "tech": {"revenue": 3300.0, "payroll": 420.0, "maintenance": 220.0, "expand_cost": 9200.0},
+        "retail": {"revenue": 2400.0, "payroll": 280.0, "maintenance": 170.0, "expand_cost": 7000.0},
+        "studio": {"revenue": 2100.0, "payroll": 250.0, "maintenance": 160.0, "expand_cost": 6400.0},
+        "logistics": {"revenue": 3600.0, "payroll": 540.0, "maintenance": 260.0, "expand_cost": 10400.0},
+        "farm": {"revenue": 1900.0, "payroll": 220.0, "maintenance": 140.0, "expand_cost": 5900.0},
+    }
+
+
+def _default_income_tax_brackets() -> list[dict[str, Any]]:
+    return [
+        {"up_to": 5000.0, "rate": 0.00},
+        {"up_to": 25000.0, "rate": 0.08},
+        {"up_to": 80000.0, "rate": 0.15},
+        {"up_to": 200000.0, "rate": 0.24},
+        {"up_to": None, "rate": 0.32},
+    ]
+
+
+def _default_plot_catalog() -> dict[str, dict[str, Any]]:
+    zones: list[tuple[str, int, float]] = [
+        ("urban", 12, 76000.0),
+        ("suburban", 12, 46000.0),
+        ("rural", 12, 23000.0),
+    ]
+    plots: dict[str, dict[str, Any]] = {}
+    index = 1
+    for zone, count, base in zones:
+        for _ in range(count):
+            plot_id = f"P{index:03d}"
+            price = round(base * random.uniform(0.85, 1.18), 2)
+            plots[plot_id] = {
+                "id": plot_id,
+                "zone": zone,
+                "base_price": price,
+                "owner_id": None,
+                "tier": 0,
+                "listed_price": None,
+                "auction_lock": None,
+            }
+            index += 1
+    return plots
+
+
+def _default_business_state() -> dict[str, Any]:
+    return {
+        "schema_version": int(BUSINESS_SCHEMA_VERSION),
+        "users": {},
+        "market": {
+            "stocks": _default_stock_catalog(),
+            "history": [],
+            "active_event": None,
+            "last_news": "Markets opened steady.",
+        },
+        "commodities": {
+            "assets": _default_commodity_catalog(),
+            "history": [],
+            "last_news": "Commodity desk opened steady.",
+        },
+        "crypto": {
+            "assets": _default_crypto_catalog(),
+            "history": [],
+            "last_news": "Crypto book opened volatile.",
+        },
+        "real_estate": {
+            "plots": _default_plot_catalog(),
+            "listed_properties": {},
+        },
+        "businesses": {
+            "profiles": _default_business_profiles(),
+            "registry": {},
+        },
+        "auctions": {"active": {}},
+        "trades": {"open": {}},
+        "ledger": [],
+        "tax": {
+            "income_tax_enabled": bool(BUSINESS_INCOME_TAX_ENABLED),
+            "income_brackets": _default_income_tax_brackets(),
+            "capital_gains_short_rate": float(BUSINESS_CAPITAL_GAINS_SHORT_RATE),
+            "capital_gains_long_rate": float(BUSINESS_CAPITAL_GAINS_LONG_RATE),
+            "last_weekly_cycle_key": "",
+        },
+        "credit": {
+            "min_score": 500,
+            "max_score": 850,
+        },
+        "market_halts": {
+            "assets": {},
+            "market": {"remaining_ticks": 0, "reason": "", "triggered_ts": 0.0},
+            "last_index_value": 0.0,
+        },
+        "governance": {
+            "transaction_fee_rate": float(BUSINESS_TRANSACTION_FEE_RATE),
+            "property_tax_rate": float(BUSINESS_PROPERTY_TAX_RATE),
+            "property_maintenance_rate": float(BUSINESS_PROPERTY_MAINTENANCE_RATE),
+            "market_paused": False,
+            "frozen_users": [],
+        },
+        "meta": {
+            "next_ids": {
+                "tx": 1,
+                "loan": 1,
+                "trade": 1,
+                "auction": 1,
+                "biz": 1,
+            },
+            "last_tick_hour_key": "",
+            "last_market_tick_key": "",
+            "last_world_event_tick_key": "",
+            "last_weekly_cycle_key": "",
+            "last_tick_ts": 0.0,
+            "event_count_day_key": "",
+            "event_count_today": 0,
+        },
+    }
+
+
+def _sanitize_business_state(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        payload = {}
+    base = _default_business_state()
+    for key in (
+        "schema_version",
+        "users",
+        "market",
+        "commodities",
+        "crypto",
+        "real_estate",
+        "businesses",
+        "auctions",
+        "trades",
+        "ledger",
+        "tax",
+        "credit",
+        "market_halts",
+        "governance",
+        "meta",
+    ):
+        if key not in payload:
+            payload[key] = base[key]
+
+    if not isinstance(payload["users"], dict):
+        payload["users"] = {}
+    if not isinstance(payload["market"], dict):
+        payload["market"] = base["market"]
+    if not isinstance(payload["market"].get("stocks"), dict) or not payload["market"]["stocks"]:
+        payload["market"]["stocks"] = base["market"]["stocks"]
+    if not isinstance(payload["market"].get("history"), list):
+        payload["market"]["history"] = []
+    if not isinstance(payload["commodities"], dict):
+        payload["commodities"] = base["commodities"]
+    if not isinstance(payload["commodities"].get("assets"), dict) or not payload["commodities"]["assets"]:
+        payload["commodities"]["assets"] = base["commodities"]["assets"]
+    if not isinstance(payload["commodities"].get("history"), list):
+        payload["commodities"]["history"] = []
+    if not isinstance(payload["crypto"], dict):
+        payload["crypto"] = base["crypto"]
+    if not isinstance(payload["crypto"].get("assets"), dict) or not payload["crypto"]["assets"]:
+        payload["crypto"]["assets"] = base["crypto"]["assets"]
+    if not isinstance(payload["crypto"].get("history"), list):
+        payload["crypto"]["history"] = []
+    if not isinstance(payload["real_estate"], dict):
+        payload["real_estate"] = base["real_estate"]
+    if not isinstance(payload["real_estate"].get("plots"), dict) or not payload["real_estate"]["plots"]:
+        payload["real_estate"]["plots"] = base["real_estate"]["plots"]
+    if not isinstance(payload["real_estate"].get("listed_properties"), dict):
+        payload["real_estate"]["listed_properties"] = {}
+    if not isinstance(payload["businesses"], dict):
+        payload["businesses"] = base["businesses"]
+    if not isinstance(payload["businesses"].get("profiles"), dict):
+        payload["businesses"]["profiles"] = base["businesses"]["profiles"]
+    if not isinstance(payload["businesses"].get("registry"), dict):
+        payload["businesses"]["registry"] = {}
+    if not isinstance(payload["auctions"], dict):
+        payload["auctions"] = {"active": {}}
+    if not isinstance(payload["auctions"].get("active"), dict):
+        payload["auctions"]["active"] = {}
+    if not isinstance(payload["trades"], dict):
+        payload["trades"] = {"open": {}}
+    if not isinstance(payload["trades"].get("open"), dict):
+        payload["trades"]["open"] = {}
+    if not isinstance(payload["ledger"], list):
+        payload["ledger"] = []
+    if not isinstance(payload["tax"], dict):
+        payload["tax"] = base["tax"]
+    if not isinstance(payload["tax"].get("income_brackets"), list):
+        payload["tax"]["income_brackets"] = base["tax"]["income_brackets"]
+    if not isinstance(payload["credit"], dict):
+        payload["credit"] = base["credit"]
+    for key, default_value in base["credit"].items():
+        if key not in payload["credit"]:
+            payload["credit"][key] = default_value
+    if not isinstance(payload["market_halts"], dict):
+        payload["market_halts"] = base["market_halts"]
+    if not isinstance(payload["market_halts"].get("assets"), dict):
+        payload["market_halts"]["assets"] = {}
+    if not isinstance(payload["market_halts"].get("market"), dict):
+        payload["market_halts"]["market"] = base["market_halts"]["market"]
+    if "last_index_value" not in payload["market_halts"]:
+        payload["market_halts"]["last_index_value"] = 0.0
+    if not isinstance(payload["governance"], dict):
+        payload["governance"] = base["governance"]
+    governance = payload["governance"]
+    for key, default_value in base["governance"].items():
+        if key not in governance:
+            governance[key] = default_value
+    if not isinstance(governance.get("frozen_users"), list):
+        governance["frozen_users"] = []
+    if not isinstance(payload["meta"], dict):
+        payload["meta"] = base["meta"]
+    meta = payload["meta"]
+    if not isinstance(meta.get("next_ids"), dict):
+        meta["next_ids"] = base["meta"]["next_ids"]
+    for key, default_value in base["meta"]["next_ids"].items():
+        if key not in meta["next_ids"]:
+            meta["next_ids"][key] = default_value
+    if "last_tick_hour_key" not in meta:
+        meta["last_tick_hour_key"] = ""
+    if "last_market_tick_key" not in meta:
+        meta["last_market_tick_key"] = ""
+    if "last_world_event_tick_key" not in meta:
+        meta["last_world_event_tick_key"] = ""
+    if "last_weekly_cycle_key" not in meta:
+        meta["last_weekly_cycle_key"] = ""
+    if "last_tick_ts" not in meta:
+        meta["last_tick_ts"] = 0.0
+    if "event_count_day_key" not in meta:
+        meta["event_count_day_key"] = ""
+    if "event_count_today" not in meta:
+        meta["event_count_today"] = 0
+
+    defaults = _default_business_user_state()
+    for user_key, user in list(payload["users"].items()):
+        if not isinstance(user, dict):
+            payload["users"][user_key] = _default_business_user_state()
+            continue
+        for field, default_value in defaults.items():
+            if field not in user:
+                user[field] = default_value
+        if not isinstance(user.get("portfolio"), dict):
+            user["portfolio"] = {}
+        if not isinstance(user.get("commodity_portfolio"), dict):
+            user["commodity_portfolio"] = {}
+        if not isinstance(user.get("crypto_portfolio"), dict):
+            user["crypto_portfolio"] = {}
+        if not isinstance(user.get("properties"), list):
+            user["properties"] = []
+        if not isinstance(user.get("business_ids"), list):
+            user["business_ids"] = []
+        if not isinstance(user.get("loans"), list):
+            user["loans"] = []
+        if not isinstance(user.get("daily"), dict):
+            user["daily"] = {"day": "", "streak": 0}
+        if not isinstance(user.get("flags"), dict):
+            user["flags"] = {"trade_limited": False}
+        if not isinstance(user.get("cooldowns"), dict):
+            user["cooldowns"] = {}
+        if not isinstance(user.get("realized_pnl"), dict):
+            user["realized_pnl"] = {}
+        user["credit_score"] = int(max(500, min(850, int(user.get("credit_score", 650) or 650))))
+
+    try:
+        current_schema = int(payload.get("schema_version", 1) or 1)
+    except (TypeError, ValueError):
+        current_schema = 1
+    payload["schema_version"] = int(max(BUSINESS_SCHEMA_VERSION, current_schema))
+    return payload
+
+
+def load_business_state() -> None:
+    global BUSINESS_STATE, BUSINESS_STATE_DIRTY
+    payload = read_json(BUSINESS_STATE_FILE)
+    BUSINESS_STATE = _sanitize_business_state(payload)
+    BUSINESS_STATE_DIRTY = False
+
+
+def _mark_business_dirty() -> None:
+    global BUSINESS_STATE_DIRTY
+    BUSINESS_STATE_DIRTY = True
+
+
+async def flush_business_state(force: bool = False) -> None:
+    global BUSINESS_STATE_DIRTY
+    if not force and not BUSINESS_STATE_DIRTY:
+        return
+    async with BUSINESS_STATE_LOCK:
+        if not force and not BUSINESS_STATE_DIRTY:
+            return
+        try:
+            persisted = write_json(BUSINESS_STATE_FILE, BUSINESS_STATE)
+            if persisted:
+                BUSINESS_STATE_DIRTY = False
+        except Exception:
+            pass
+
+
+def get_business_state() -> dict[str, Any]:
+    global BUSINESS_STATE
+    if not BUSINESS_STATE:
+        BUSINESS_STATE = _default_business_state()
+        _mark_business_dirty()
+    BUSINESS_STATE = _sanitize_business_state(BUSINESS_STATE)
+    return BUSINESS_STATE
+
+
+def _business_next_id(namespace: str) -> str:
+    state = get_business_state()
+    meta = state["meta"]["next_ids"]
+    current = int(meta.get(namespace, 1))
+    meta[namespace] = current + 1
+    _mark_business_dirty()
+    prefix = {
+        "tx": "TX",
+        "loan": "LN",
+        "trade": "TRD",
+        "auction": "AUC",
+        "biz": "BIZ",
+    }.get(namespace, "ID")
+    return f"{prefix}-{current:06d}"
+
+
+def _business_money(value: float) -> str:
+    return f"{value:,.0f}"
+
+
+def _business_now_ts() -> float:
+    return time.time()
+
+
+def _business_hour_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
+
+
+def _business_clamp_float(value: float, low: float, high: float) -> float:
+    return max(low, min(high, float(value)))
+
+
+def _business_get_ai_dynamic(state: dict[str, Any] | None = None) -> dict[str, Any]:
+    root = state or get_business_state()
+    governance = root.get("governance", {})
+    dynamic = governance.get("ai_dynamic", {})
+    if not isinstance(dynamic, dict):
+        dynamic = {}
+        governance["ai_dynamic"] = dynamic
+    return dynamic
+
+
+def _extract_first_json_object(raw_text: str) -> dict[str, Any] | None:
+    text = (raw_text or "").strip()
+    if not text:
+        return None
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        return None
+    candidate = match.group(0).strip()
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _build_business_local_tip(user_id: int) -> str:
+    user = _business_get_user(user_id)
+    cash = float(user.get("cash", 0.0))
+    debt = _business_debt_total(user)
+    stock_value = _business_portfolio_value(user)
+    property_value = _business_property_value(user)
+    if debt > max(5000.0, cash * 0.8):
+        return "Advisor: prioritize debt repayment this cycle; keep at least 20% cash buffer before new buys."
+    if cash < max(5000.0, (stock_value + property_value) * 0.08):
+        return "Advisor: you're asset-heavy with low liquidity. Hold a stronger cash buffer before upgrading properties."
+    if property_value <= 0 and stock_value <= 0:
+        return "Advisor: start with a diversified base, e.g., one low-volatility stock and one suburban plot."
+    if property_value > stock_value * 2.5:
+        return "Advisor: rebalance a little into stocks to reduce vacancy and maintenance risk concentration."
+    return "Advisor: stable position. Scale gradually and avoid single-asset exposure spikes."
+
+
+async def _business_get_personalized_tip(
+    guild_id: int,
+    user_id: int,
+    *,
+    context: str,
+) -> str:
+    if not BUSINESS_AI_PERSONALIZATION_ENABLED or not is_ai_configured():
+        return _build_business_local_tip(user_id)
+
+    cache_key = ("biz_tip", guild_id, user_id)
+    cached = BUSINESS_AI_TEXT_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and now - cached[0] < BUSINESS_AI_PERSONALIZATION_CACHE_SECONDS:
+        return cached[1]
+
+    user = _business_get_user(user_id)
+    cash = float(user.get("cash", 0.0))
+    debt = _business_debt_total(user)
+    stock_value = _business_portfolio_value(user)
+    property_value = _business_property_value(user)
+    net = _business_networth(user_id)
+    flags = user.get("flags", {}) if isinstance(user.get("flags"), dict) else {}
+    market_news = str(get_business_state().get("market", {}).get("last_news", ""))
+    prompt = (
+        "Generate one short personalized advisor line for a Discord business game player.\n"
+        "Rules: <= 26 words, specific and practical, fun tone, no generic fluff.\n"
+        "Do not mention being an AI. No markdown.\n\n"
+        f"Context: {context}\n"
+        f"Cash: {cash:.2f}\n"
+        f"Debt: {debt:.2f}\n"
+        f"Stock value: {stock_value:.2f}\n"
+        f"Property value: {property_value:.2f}\n"
+        f"Net worth: {net:.2f}\n"
+        f"Flags: {flags}\n"
+        f"Market: {market_news[:180]}"
+    )
+    try:
+        tip = await request_fun_ai(
+            prompt,
+            max_tokens=BUSINESS_AI_MAX_TOKENS,
+            temperature=0.7,
+            policy_key="business_tip",
+            fun_mode=get_guild_fun_mode(guild_id),
+        )
+        tip = " ".join(str(tip).split()).strip()
+        if not tip:
+            raise RuntimeError("empty tip")
+    except Exception:
+        tip = _build_business_local_tip(user_id)
+
+    BUSINESS_AI_TEXT_CACHE[cache_key] = (now, tip)
+    if len(BUSINESS_AI_TEXT_CACHE) > 700:
+        oldest = sorted(BUSINESS_AI_TEXT_CACHE.items(), key=lambda kv: kv[1][0])[:140]
+        for key, _ in oldest:
+            BUSINESS_AI_TEXT_CACHE.pop(key, None)
+    return tip
+
+
+async def _business_refresh_ai_dynamic() -> dict[str, Any] | None:
+    if not BUSINESS_AI_TUNING_ENABLED or not is_ai_configured():
+        return None
+
+    now_ts = _business_now_ts()
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        dynamic = dict(_business_get_ai_dynamic(state))
+        last_update = float(dynamic.get("updated_ts", 0.0) or 0.0)
+        if now_ts - last_update < (BUSINESS_AI_DIRECTOR_INTERVAL_HOURS * 3600):
+            return dynamic
+        stocks = dict(state.get("market", {}).get("stocks", {}))
+        last_news = str(state.get("market", {}).get("last_news", ""))[:180]
+
+    sector_changes: dict[str, list[float]] = defaultdict(list)
+    mover_lines: list[str] = []
+    for symbol, row in stocks.items():
+        if not isinstance(row, dict):
+            continue
+        history = row.get("history", [])
+        if not isinstance(history, list) or len(history) < 2:
+            continue
+        prev = float(history[-2] or 0.0)
+        curr = float(history[-1] or 0.0)
+        if prev <= 0:
+            continue
+        change = (curr - prev) / prev
+        sector = str(row.get("sector", "other"))
+        sector_changes[sector].append(change)
+        mover_lines.append(f"{symbol}:{change:+.3f}")
+    mover_lines = mover_lines[:18]
+    sector_summary = {
+        sector: (sum(values) / max(1, len(values)))
+        for sector, values in sector_changes.items()
+    }
+
+    prompt = (
+        "You are an economy director for a Discord business sim.\n"
+        "Return STRICT JSON only with keys:\n"
+        "headline (string <= 70 chars), market_bias (-0.03..0.03), event_chance_shift (-0.08..0.08),\n"
+        "transaction_fee_shift (-0.002..0.002), property_tax_shift (-0.002..0.002),\n"
+        "maintenance_shift (-0.002..0.002), daily_claim_shift_pct (-0.25..0.25),\n"
+        "sector_bias (object mapping sector to -0.03..0.03).\n"
+        "Goal: make gameplay fun, varied, and fair.\n\n"
+        f"Current market news: {last_news}\n"
+        f"Recent movers: {', '.join(mover_lines) if mover_lines else 'none'}\n"
+        f"Sector summary: {json.dumps(sector_summary)[:320]}\n"
+    )
+
+    try:
+        raw = await request_ai_completion(
+            [{"role": "user", "content": prompt}],
+            max_tokens=max(140, BUSINESS_AI_MAX_TOKENS + 60),
+            temperature=0.55,
+            policy_key="business_director",
+        )
+    except Exception:
+        return dynamic
+
+    payload = _extract_first_json_object(raw)
+    if payload is None:
+        return dynamic
+
+    parsed_sector_bias: dict[str, float] = {}
+    raw_sector_bias = payload.get("sector_bias", {})
+    if isinstance(raw_sector_bias, dict):
+        for key, value in raw_sector_bias.items():
+            try:
+                parsed_sector_bias[str(key).lower()] = _business_clamp_float(float(value), -0.03, 0.03)
+            except (TypeError, ValueError):
+                continue
+
+    updated = {
+        "headline": str(payload.get("headline", "Market mood shifted")).strip()[:70],
+        "market_bias": _business_clamp_float(float(payload.get("market_bias", 0.0) or 0.0), -0.03, 0.03),
+        "event_chance_shift": _business_clamp_float(
+            float(payload.get("event_chance_shift", 0.0) or 0.0), -0.08, 0.08
+        ),
+        "transaction_fee_shift": _business_clamp_float(
+            float(payload.get("transaction_fee_shift", 0.0) or 0.0), -0.002, 0.002
+        ),
+        "property_tax_shift": _business_clamp_float(
+            float(payload.get("property_tax_shift", 0.0) or 0.0), -0.002, 0.002
+        ),
+        "maintenance_shift": _business_clamp_float(
+            float(payload.get("maintenance_shift", 0.0) or 0.0), -0.002, 0.002
+        ),
+        "daily_claim_shift_pct": _business_clamp_float(
+            float(payload.get("daily_claim_shift_pct", 0.0) or 0.0), -0.25, 0.25
+        ),
+        "sector_bias": parsed_sector_bias,
+        "updated_ts": now_ts,
+    }
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        state["governance"]["ai_dynamic"] = updated
+        _mark_business_dirty()
+    return updated
+
+
+def _business_get_user(user_id: int) -> dict[str, Any]:
+    state = get_business_state()
+    users = state["users"]
+    key = str(user_id)
+    user = users.get(key)
+    if not isinstance(user, dict):
+        user = _default_business_user_state()
+        users[key] = user
+        _mark_business_dirty()
+    defaults = _default_business_user_state()
+    for field, default_value in defaults.items():
+        if field not in user:
+            user[field] = default_value
+    if not isinstance(user.get("portfolio"), dict):
+        user["portfolio"] = {}
+    if not isinstance(user.get("commodity_portfolio"), dict):
+        user["commodity_portfolio"] = {}
+    if not isinstance(user.get("crypto_portfolio"), dict):
+        user["crypto_portfolio"] = {}
+    if not isinstance(user.get("properties"), list):
+        user["properties"] = []
+    if not isinstance(user.get("business_ids"), list):
+        user["business_ids"] = []
+    if not isinstance(user.get("loans"), list):
+        user["loans"] = []
+    if not isinstance(user.get("daily"), dict):
+        user["daily"] = {"day": "", "streak": 0}
+    if not isinstance(user.get("flags"), dict):
+        user["flags"] = {"trade_limited": False}
+    else:
+        user["flags"].setdefault("trade_limited", False)
+    if not isinstance(user.get("cooldowns"), dict):
+        user["cooldowns"] = {}
+    if not isinstance(user.get("realized_pnl"), dict):
+        user["realized_pnl"] = {}
+    user["credit_score"] = int(max(500, min(850, int(user.get("credit_score", 650) or 650))))
+    user["tax_liability"] = float(user.get("tax_liability", 0.0) or 0.0)
+    user["weekly_income"] = float(user.get("weekly_income", 0.0) or 0.0)
+    user["weekly_realized_gains_short"] = float(user.get("weekly_realized_gains_short", 0.0) or 0.0)
+    user["weekly_realized_gains_long"] = float(user.get("weekly_realized_gains_long", 0.0) or 0.0)
+    user["salary_tier"] = max(1, int(user.get("salary_tier", 1) or 1))
+    return user
+
+
+def _business_is_user_frozen(user_id: int) -> bool:
+    state = get_business_state()
+    user = _business_get_user(user_id)
+    if bool(user.get("frozen")):
+        return True
+    frozen_users = state["governance"].get("frozen_users", [])
+    return str(user_id) in {str(v) for v in frozen_users}
+
+
+def _business_set_user_frozen(user_id: int, frozen: bool) -> None:
+    state = get_business_state()
+    user = _business_get_user(user_id)
+    user["frozen"] = bool(frozen)
+    frozen_users = {str(v) for v in state["governance"].get("frozen_users", [])}
+    if frozen:
+        frozen_users.add(str(user_id))
+    else:
+        frozen_users.discard(str(user_id))
+    state["governance"]["frozen_users"] = sorted(frozen_users)
+    _mark_business_dirty()
+
+
+def _business_get_stock(symbol: str) -> dict[str, Any] | None:
+    return _business_get_asset("stock", symbol)
+
+
+def _business_holding_field(asset_type: str) -> str | None:
+    normalized = asset_type.strip().lower()
+    if normalized == "stock":
+        return "portfolio"
+    if normalized == "commodity":
+        return "commodity_portfolio"
+    if normalized == "crypto":
+        return "crypto_portfolio"
+    return None
+
+
+def _business_get_asset_book(asset_type: str) -> dict[str, dict[str, Any]]:
+    state = get_business_state()
+    normalized = asset_type.strip().lower()
+    if normalized == "stock":
+        return state["market"]["stocks"]
+    if normalized == "commodity":
+        return state.get("commodities", {}).get("assets", {})
+    if normalized == "crypto":
+        return state.get("crypto", {}).get("assets", {})
+    return {}
+
+
+def _business_get_asset(asset_type: str, symbol: str) -> dict[str, Any] | None:
+    return _business_get_asset_book(asset_type).get(symbol.upper())
+
+
+def _business_resolve_trade_asset(token: str) -> tuple[str | None, str | None]:
+    normalized_token = token.strip().upper()
+    if not normalized_token:
+        return None, None
+    token_clean = re.sub(r"[^a-z0-9]", "", token.strip().lower())
+    for asset_type in ("stock", "commodity", "crypto"):
+        if asset_type == "commodity" and not BUSINESS_ENABLE_COMMODITIES:
+            continue
+        if asset_type == "crypto" and not BUSINESS_ENABLE_CRYPTO:
+            continue
+        book = _business_get_asset_book(asset_type)
+        if normalized_token in book:
+            return asset_type, normalized_token
+        for symbol, row in book.items():
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name", "")).lower()
+            compact_name = re.sub(r"[^a-z0-9]", "", name)
+            if token_clean and (token_clean == compact_name or token_clean in compact_name):
+                return asset_type, str(symbol).upper()
+            if token_clean and token_clean == str(symbol).lower():
+                return asset_type, str(symbol).upper()
+    return None, None
+
+
+def _business_plot_value(plot: dict[str, Any]) -> float:
+    base = float(plot.get("base_price", 0.0) or 0.0)
+    tier = int(plot.get("tier", 0) or 0)
+    return max(0.0, base * (1 + (tier * 0.35)))
+
+
+def _business_portfolio_value(user: dict[str, Any]) -> float:
+    return _business_asset_portfolio_value(user, "stock")
+
+
+def _business_asset_portfolio_value(user: dict[str, Any], asset_type: str) -> float:
+    total = 0.0
+    field = _business_holding_field(asset_type)
+    if field is None:
+        return 0.0
+    portfolio = user.get(field, {})
+    if not isinstance(portfolio, dict):
+        return 0.0
+    for symbol, holding in portfolio.items():
+        if not isinstance(holding, dict):
+            continue
+        qty = max(0, int(holding.get("qty", 0)))
+        asset = _business_get_asset(asset_type, str(symbol))
+        if qty <= 0 or asset is None:
+            continue
+        total += qty * float(asset.get("price", 0.0))
+    return total
+
+
+def _business_property_value(user: dict[str, Any]) -> float:
+    state = get_business_state()
+    plots = state["real_estate"]["plots"]
+    total = 0.0
+    for plot_id in user.get("properties", []):
+        plot = plots.get(str(plot_id))
+        if not isinstance(plot, dict):
+            continue
+        total += _business_plot_value(plot)
+    return total
+
+
+def _business_debt_total(user: dict[str, Any]) -> float:
+    debt = 0.0
+    for loan in user.get("loans", []):
+        if not isinstance(loan, dict):
+            continue
+        if str(loan.get("status", "active")) in {"paid", "closed"}:
+            continue
+        debt += max(0.0, float(loan.get("balance", 0.0)))
+    return debt
+
+
+def _business_business_equity_value(user: dict[str, Any]) -> float:
+    state = get_business_state()
+    registry = state.get("businesses", {}).get("registry", {})
+    if not isinstance(registry, dict):
+        return 0.0
+    total = 0.0
+    for biz_id in list(user.get("business_ids", [])):
+        biz = registry.get(str(biz_id))
+        if not isinstance(biz, dict):
+            continue
+        if str(biz.get("status", "active")) != "active":
+            continue
+        level = max(1, int(biz.get("level", 1) or 1))
+        employees = max(0, int(biz.get("employees", 0) or 0))
+        base = float(biz.get("base_value", 0.0) or 0.0)
+        debt = max(0.0, float(biz.get("debt", 0.0) or 0.0))
+        total += max(0.0, (base * (1 + ((level - 1) * 0.45))) + (employees * 420.0) - debt)
+    return total
+
+
+def _business_progressive_income_tax(income: float) -> float:
+    if income <= 0:
+        return 0.0
+    state = get_business_state()
+    tax = state.get("tax", {})
+    if not isinstance(tax, dict) or not bool(tax.get("income_tax_enabled", BUSINESS_INCOME_TAX_ENABLED)):
+        return 0.0
+    brackets = tax.get("income_brackets", [])
+    if not isinstance(brackets, list) or not brackets:
+        brackets = _default_income_tax_brackets()
+    remaining = float(income)
+    last_limit = 0.0
+    owed = 0.0
+    for bracket in brackets:
+        if not isinstance(bracket, dict):
+            continue
+        up_to = bracket.get("up_to")
+        rate = _business_clamp_float(float(bracket.get("rate", 0.0) or 0.0), 0.0, 0.8)
+        if up_to is None:
+            owed += max(0.0, remaining) * rate
+            remaining = 0.0
+            break
+        try:
+            cap = float(up_to)
+        except (TypeError, ValueError):
+            continue
+        if cap <= last_limit:
+            continue
+        slab = min(max(0.0, remaining), max(0.0, cap - last_limit))
+        owed += slab * rate
+        remaining -= slab
+        last_limit = cap
+        if remaining <= 0:
+            break
+    return max(0.0, owed)
+
+
+def _business_capital_gains_rate(held_seconds: float) -> float:
+    state = get_business_state()
+    tax = state.get("tax", {})
+    short_rate = _business_clamp_float(
+        float(tax.get("capital_gains_short_rate", BUSINESS_CAPITAL_GAINS_SHORT_RATE) or BUSINESS_CAPITAL_GAINS_SHORT_RATE),
+        0.0,
+        0.8,
+    )
+    long_rate = _business_clamp_float(
+        float(tax.get("capital_gains_long_rate", BUSINESS_CAPITAL_GAINS_LONG_RATE) or BUSINESS_CAPITAL_GAINS_LONG_RATE),
+        0.0,
+        0.8,
+    )
+    long_hold_seconds = float(BUSINESS_CAPITAL_GAINS_LONG_HOLD_DAYS) * 24 * 3600
+    return long_rate if held_seconds >= long_hold_seconds else short_rate
+
+
+def _business_apply_credit_score_delta(user: dict[str, Any], delta: int) -> None:
+    current = int(user.get("credit_score", 650) or 650)
+    user["credit_score"] = int(max(500, min(850, current + int(delta))))
+
+
+def _business_networth(user_id: int) -> float:
+    user = _business_get_user(user_id)
+    cash = max(0.0, float(user.get("cash", 0.0)))
+    portfolio = _business_portfolio_value(user)
+    commodities = _business_asset_portfolio_value(user, "commodity")
+    crypto = _business_asset_portfolio_value(user, "crypto")
+    properties = _business_property_value(user)
+    businesses = _business_business_equity_value(user)
+    debt = _business_debt_total(user)
+    net = cash + portfolio + commodities + crypto + properties + businesses - debt
+    user["last_networth"] = float(net)
+    return float(net)
+
+
+def _business_rates_for_guild(guild_id: int | None = None) -> dict[str, float]:
+    state = get_business_state()
+    governance = state.get("governance", {})
+    dynamic = _business_get_ai_dynamic(state)
+    rates = {
+        "transaction_fee_rate": float(governance.get("transaction_fee_rate", BUSINESS_TRANSACTION_FEE_RATE))
+        + float(dynamic.get("transaction_fee_shift", 0.0) or 0.0),
+        "property_tax_rate": float(governance.get("property_tax_rate", BUSINESS_PROPERTY_TAX_RATE))
+        + float(dynamic.get("property_tax_shift", 0.0) or 0.0),
+        "property_maintenance_rate": float(
+            governance.get("property_maintenance_rate", BUSINESS_PROPERTY_MAINTENANCE_RATE)
+        ),
+    }
+    rates["property_maintenance_rate"] += float(dynamic.get("maintenance_shift", 0.0) or 0.0)
+    if guild_id is not None:
+        overrides = get_guild_business_tax_overrides(guild_id)
+        for key, value in overrides.items():
+            rates[key] = max(0.0, float(value))
+    rates["transaction_fee_rate"] = _business_clamp_float(rates["transaction_fee_rate"], 0.0, 0.25)
+    rates["property_tax_rate"] = _business_clamp_float(rates["property_tax_rate"], 0.0, 0.25)
+    rates["property_maintenance_rate"] = _business_clamp_float(
+        rates["property_maintenance_rate"], 0.0, 0.25
+    )
+    return rates
+
+
+def _business_market_paused(guild_id: int | None = None) -> bool:
+    state = get_business_state()
+    global_pause = bool(state.get("governance", {}).get("market_paused", False))
+    if guild_id is None:
+        return global_pause
+    return global_pause or get_guild_business_market_paused(guild_id)
+
+
+def _business_add_ledger_entry(
+    *,
+    action: str,
+    user_id: int | None = None,
+    amount: float = 0.0,
+    details: dict[str, Any] | None = None,
+    rollback: dict[str, Any] | None = None,
+) -> str:
+    state = get_business_state()
+    tx_id = _business_next_id("tx")
+    entry = {
+        "id": tx_id,
+        "ts": _business_now_ts(),
+        "action": action,
+        "user_id": user_id,
+        "amount": float(amount),
+        "details": details or {},
+    }
+    ledger = state["ledger"]
+    ledger.append(entry)
+    if len(ledger) > BUSINESS_LEDGER_MAX_ENTRIES:
+        overflow = len(ledger) - BUSINESS_LEDGER_MAX_ENTRIES
+        del ledger[:overflow]
+    if rollback:
+        BUSINESS_TX_ROLLBACK_CACHE[tx_id] = rollback
+        if len(BUSINESS_TX_ROLLBACK_CACHE) > 1500:
+            oldest = sorted(BUSINESS_TX_ROLLBACK_CACHE.keys())[:250]
+            for key in oldest:
+                BUSINESS_TX_ROLLBACK_CACHE.pop(key, None)
+    _mark_business_dirty()
+    return tx_id
+
+
+def _business_add_stock_to_user(user: dict[str, Any], symbol: str, qty: int, total_cost: float) -> None:
+    _business_add_asset_to_user(user, "stock", symbol, qty, total_cost)
+
+
+def _business_add_asset_to_user(
+    user: dict[str, Any],
+    asset_type: str,
+    symbol: str,
+    qty: int,
+    total_cost: float,
+) -> None:
+    if qty <= 0:
+        return
+    field = _business_holding_field(asset_type)
+    if field is None:
+        return
+    portfolio = user.setdefault(field, {})
+    if not isinstance(portfolio, dict):
+        portfolio = {}
+        user[field] = portfolio
+    normalized_symbol = symbol.upper().strip()
+    holding = portfolio.get(normalized_symbol)
+    if not isinstance(holding, dict):
+        holding = {"qty": 0, "avg_cost": 0.0, "first_bought_ts": _business_now_ts(), "realized_pnl": 0.0}
+        portfolio[normalized_symbol] = holding
+    old_qty = max(0, int(holding.get("qty", 0)))
+    old_avg = max(0.0, float(holding.get("avg_cost", 0.0)))
+    new_qty = old_qty + qty
+    if new_qty <= 0:
+        holding["qty"] = 0
+        holding["avg_cost"] = 0.0
+        return
+    old_total = old_qty * old_avg
+    holding["qty"] = int(new_qty)
+    holding["avg_cost"] = float((old_total + max(0.0, total_cost)) / new_qty)
+    if old_qty <= 0:
+        holding["first_bought_ts"] = _business_now_ts()
+    if "realized_pnl" not in holding:
+        holding["realized_pnl"] = 0.0
+
+
+def _business_remove_stock_from_user(user: dict[str, Any], symbol: str, qty: int) -> bool:
+    return _business_remove_asset_from_user(user, "stock", symbol, qty)
+
+
+def _business_remove_asset_from_user(
+    user: dict[str, Any],
+    asset_type: str,
+    symbol: str,
+    qty: int,
+) -> bool:
+    if qty <= 0:
+        return False
+    field = _business_holding_field(asset_type)
+    if field is None:
+        return False
+    portfolio = user.setdefault(field, {})
+    if not isinstance(portfolio, dict):
+        return False
+    holding = portfolio.get(symbol.upper().strip())
+    if not isinstance(holding, dict):
+        return False
+    old_qty = int(holding.get("qty", 0))
+    if old_qty < qty:
+        return False
+    new_qty = old_qty - qty
+    holding["qty"] = new_qty
+    if new_qty <= 0:
+        portfolio.pop(symbol.upper().strip(), None)
+    return True
+
+
+def _business_asset_halt_key(asset_type: str, symbol: str) -> str:
+    return f"{asset_type.strip().lower()}:{symbol.strip().upper()}"
+
+
+def _business_market_halt_remaining() -> int:
+    state = get_business_state()
+    market_halt = state.get("market_halts", {}).get("market", {})
+    if not isinstance(market_halt, dict):
+        return 0
+    return max(0, int(market_halt.get("remaining_ticks", 0) or 0))
+
+
+def _business_is_market_halted() -> bool:
+    return _business_market_halt_remaining() > 0
+
+
+def _business_is_asset_halted(asset_type: str, symbol: str) -> bool:
+    state = get_business_state()
+    halts = state.get("market_halts", {}).get("assets", {})
+    if not isinstance(halts, dict):
+        return False
+    row = halts.get(_business_asset_halt_key(asset_type, symbol))
+    if not isinstance(row, dict):
+        return False
+    return int(row.get("remaining_ticks", 0) or 0) > 0
+
+
+def _business_register_asset_halt(asset_type: str, symbol: str, *, reason: str) -> None:
+    state = get_business_state()
+    market_halts = state.setdefault("market_halts", {})
+    halts = market_halts.setdefault("assets", {})
+    halts[_business_asset_halt_key(asset_type, symbol)] = {
+        "remaining_ticks": 2,
+        "reason": reason[:120],
+        "triggered_ts": _business_now_ts(),
+    }
+    _mark_business_dirty()
+
+
+def _business_register_market_halt(reason: str, *, ticks: int = 1) -> None:
+    state = get_business_state()
+    market_halts = state.setdefault("market_halts", {})
+    market_halt = market_halts.setdefault("market", {})
+    market_halt["remaining_ticks"] = max(int(market_halt.get("remaining_ticks", 0) or 0), int(max(1, ticks)))
+    market_halt["reason"] = reason[:140]
+    market_halt["triggered_ts"] = _business_now_ts()
+    _mark_business_dirty()
+
+
+def _business_decay_halts_each_tick() -> None:
+    state = get_business_state()
+    market_halts = state.setdefault("market_halts", {})
+    changed = False
+    assets = market_halts.get("assets", {})
+    if isinstance(assets, dict):
+        for key in list(assets.keys()):
+            row = assets.get(key)
+            if not isinstance(row, dict):
+                assets.pop(key, None)
+                changed = True
+                continue
+            remaining = int(row.get("remaining_ticks", 0) or 0) - 1
+            if remaining <= 0:
+                assets.pop(key, None)
+            else:
+                row["remaining_ticks"] = remaining
+            changed = True
+    market_halt = market_halts.get("market", {})
+    if isinstance(market_halt, dict):
+        remaining = int(market_halt.get("remaining_ticks", 0) or 0)
+        if remaining > 0:
+            market_halt["remaining_ticks"] = max(0, remaining - 1)
+            changed = True
+    if changed:
+        _mark_business_dirty()
+
+
+def _business_buy_order_spread(asset_type: str) -> float:
+    normalized = asset_type.strip().lower()
+    if normalized == "crypto":
+        return 0.006
+    if normalized == "commodity":
+        return 0.004
+    return 0.003
+
+
+def _business_sell_order_spread(asset_type: str) -> float:
+    return _business_buy_order_spread(asset_type)
+
+
+def _business_trade_hold_penalty_rate(asset_type: str, held_seconds: float) -> float:
+    if held_seconds >= 20 * 60:
+        return 0.0
+    normalized = asset_type.strip().lower()
+    if normalized == "crypto":
+        return 0.022
+    if normalized == "commodity":
+        return 0.016
+    return 0.012
+
+
+def _business_execute_asset_buy(
+    *,
+    user_id: int,
+    guild_id: int | None,
+    asset_type: str,
+    symbol: str,
+    qty: int,
+    source: str,
+) -> tuple[bool, str, float]:
+    normalized_type = asset_type.strip().lower()
+    normalized_symbol = symbol.strip().upper()
+    if qty < 1:
+        return False, "Quantity must be positive.", 0.0
+    user = _business_get_user(user_id)
+    if bool(user.get("flags", {}).get("trade_limited")):
+        return False, "Trading is restricted on your account due to debt stress.", 0.0
+    asset_row = _business_get_asset(normalized_type, normalized_symbol)
+    if not isinstance(asset_row, dict):
+        return False, f"Unknown {normalized_type} symbol `{normalized_symbol}`.", 0.0
+    if _business_market_paused(guild_id):
+        return False, "Market is currently paused by admins.", 0.0
+    if _business_is_market_halted():
+        return False, "Market is temporarily halted this tick due to volatility.", 0.0
+    if _business_is_asset_halted(normalized_type, normalized_symbol):
+        return False, f"`{normalized_symbol}` is temporarily halted this tick.", 0.0
+
+    price = float(asset_row.get("price", 0.0))
+    rates = _business_rates_for_guild(guild_id)
+    spread = _business_buy_order_spread(normalized_type)
+    gross = qty * price * (1 + spread)
+    fee = gross * max(0.0, float(rates["transaction_fee_rate"]))
+    total = gross + fee
+    cash = float(user.get("cash", 0.0))
+    if cash < total:
+        return False, f"Insufficient cash. Need `{_business_money(total)}`.", 0.0
+    net_before = _business_networth(user_id)
+    exposure = (qty * price) / max(1.0, net_before)
+    if exposure > 0.85:
+        return False, "Order rejected: single order exposure too high (>85% of net worth).", 0.0
+
+    user["cash"] = cash - total
+    _business_add_asset_to_user(user, normalized_type, normalized_symbol, qty, gross)
+    rollback_data = None
+    if normalized_type == "stock":
+        rollback_data = {
+            "type": "stock_buy",
+            "user_id": user_id,
+            "symbol": normalized_symbol,
+            "qty": qty,
+            "cash_delta": total,
+        }
+    _business_add_ledger_entry(
+        action=f"{normalized_type}_buy",
+        user_id=user_id,
+        amount=-total,
+        details={"symbol": normalized_symbol, "qty": qty, "price": price, "fee": fee, "source": source},
+        rollback=rollback_data,
+    )
+    _mark_business_dirty()
+    return True, f"Bought `{qty}` `{normalized_symbol}`.", total
+
+
+def _business_execute_asset_sell(
+    *,
+    user_id: int,
+    guild_id: int | None,
+    asset_type: str,
+    symbol: str,
+    qty: int,
+    source: str,
+) -> tuple[bool, str, float]:
+    normalized_type = asset_type.strip().lower()
+    normalized_symbol = symbol.strip().upper()
+    if qty < 1:
+        return False, "Quantity must be positive.", 0.0
+    user = _business_get_user(user_id)
+    asset_row = _business_get_asset(normalized_type, normalized_symbol)
+    if not isinstance(asset_row, dict):
+        return False, f"Unknown {normalized_type} symbol `{normalized_symbol}`.", 0.0
+    if _business_market_paused(guild_id):
+        return False, "Market is currently paused by admins.", 0.0
+    if _business_is_market_halted():
+        return False, "Market is temporarily halted this tick due to volatility.", 0.0
+    if _business_is_asset_halted(normalized_type, normalized_symbol):
+        return False, f"`{normalized_symbol}` is temporarily halted this tick.", 0.0
+
+    field = _business_holding_field(normalized_type)
+    if field is None:
+        return False, "Unsupported asset type.", 0.0
+    portfolio = user.get(field, {})
+    holding = portfolio.get(normalized_symbol) if isinstance(portfolio, dict) else None
+    if not isinstance(holding, dict) or int(holding.get("qty", 0)) < qty:
+        return False, f"You do not hold enough `{normalized_symbol}`.", 0.0
+
+    price = float(asset_row.get("price", 0.0))
+    rates = _business_rates_for_guild(guild_id)
+    spread = _business_sell_order_spread(normalized_type)
+    gross = qty * price * (1 - spread)
+    fee = gross * max(0.0, float(rates["transaction_fee_rate"]))
+    net = max(0.0, gross - fee)
+    avg_cost = max(0.0, float(holding.get("avg_cost", 0.0)))
+    cost_basis = avg_cost * qty
+    gain = max(0.0, gross - cost_basis)
+    held_seconds = max(0.0, _business_now_ts() - float(holding.get("first_bought_ts", _business_now_ts())))
+    penalty_rate = _business_trade_hold_penalty_rate(normalized_type, held_seconds)
+    rapid_flip_penalty = net * penalty_rate
+    capital_gains_rate = _business_capital_gains_rate(held_seconds)
+    gains_tax = gain * capital_gains_rate if gain > 0 else 0.0
+
+    if not _business_remove_asset_from_user(user, normalized_type, normalized_symbol, qty):
+        return False, "Could not execute sell order.", 0.0
+    user["cash"] = float(user.get("cash", 0.0)) + max(0.0, net - rapid_flip_penalty)
+    if gain > 0:
+        user["tax_liability"] = float(user.get("tax_liability", 0.0)) + gains_tax
+        if held_seconds >= (BUSINESS_CAPITAL_GAINS_LONG_HOLD_DAYS * 24 * 3600):
+            user["weekly_realized_gains_long"] = float(user.get("weekly_realized_gains_long", 0.0)) + gain
+        else:
+            user["weekly_realized_gains_short"] = float(user.get("weekly_realized_gains_short", 0.0)) + gain
+    realized = user.setdefault("realized_pnl", {})
+    if isinstance(realized, dict):
+        realized_key = f"{normalized_type}:{normalized_symbol}"
+        realized[realized_key] = float(realized.get(realized_key, 0.0)) + (
+            gross - cost_basis - fee - rapid_flip_penalty
+        )
+    rollback_data = None
+    if normalized_type == "stock":
+        rollback_data = {
+            "type": "stock_sell",
+            "user_id": user_id,
+            "symbol": normalized_symbol,
+            "qty": qty,
+            "cash_delta": -max(0.0, net - rapid_flip_penalty),
+        }
+    _business_add_ledger_entry(
+        action=f"{normalized_type}_sell",
+        user_id=user_id,
+        amount=max(0.0, net - rapid_flip_penalty),
+        details={
+            "symbol": normalized_symbol,
+            "qty": qty,
+            "price": price,
+            "fee": fee,
+            "rapid_flip_penalty": rapid_flip_penalty,
+            "gains_tax_added": gains_tax,
+            "source": source,
+        },
+        rollback=rollback_data,
+    )
+    _mark_business_dirty()
+    return True, f"Sold `{qty}` `{normalized_symbol}`.", max(0.0, net - rapid_flip_penalty)
+
+
+def _business_user_open_trade_count(user_id: int) -> int:
+    state = get_business_state()
+    offers = state["trades"]["open"]
+    uid = str(user_id)
+    count = 0
+    for offer in offers.values():
+        if not isinstance(offer, dict):
+            continue
+        if str(offer.get("from_user_id")) == uid or str(offer.get("to_user_id")) == uid:
+            count += 1
+    return count
+
+
+def _business_user_open_auction_count(user_id: int) -> int:
+    state = get_business_state()
+    auctions = state["auctions"]["active"]
+    uid = str(user_id)
+    count = 0
+    for auc in auctions.values():
+        if not isinstance(auc, dict):
+            continue
+        if str(auc.get("seller_id")) == uid:
+            count += 1
+    return count
+
+
+def _business_repay_loans_from_cash(user_id: int, amount: float, *, source: str) -> tuple[float, int]:
+    if amount <= 0:
+        return 0.0, 0
+    user = _business_get_user(user_id)
+    loans = user.get("loans", [])
+    if not isinstance(loans, list) or not loans:
+        return 0.0, 0
+    remaining = min(amount, max(0.0, float(user.get("cash", 0.0))))
+    if remaining <= 0:
+        return 0.0, 0
+    paid = 0.0
+    closed = 0
+    for loan in sorted(loans, key=lambda x: float(x.get("issued_ts", 0.0)) if isinstance(x, dict) else 0.0):
+        if not isinstance(loan, dict):
+            continue
+        if str(loan.get("status", "active")) in {"paid", "closed"}:
+            continue
+        balance = max(0.0, float(loan.get("balance", 0.0)))
+        if balance <= 0:
+            loan["status"] = "paid"
+            closed += 1
+            continue
+        payment = min(balance, remaining)
+        if payment <= 0:
+            break
+        loan["balance"] = round(balance - payment, 4)
+        paid += payment
+        remaining -= payment
+        if loan["balance"] <= 0.01:
+            loan["balance"] = 0.0
+            loan["status"] = "paid"
+            closed += 1
+        else:
+            if str(loan.get("status", "active")) not in {"active", "current"}:
+                loan["status"] = "current"
+    if paid > 0:
+        user["cash"] = max(0.0, float(user.get("cash", 0.0)) - paid)
+        flags = user.setdefault("flags", {})
+        if isinstance(flags, dict):
+            flags["trade_limited"] = _business_debt_total(user) > (_business_networth(user_id) * BUSINESS_MAX_DEBT_TO_NETWORTH)
+        bonus = 1 + min(4, closed)
+        _business_apply_credit_score_delta(user, bonus)
+        _business_add_ledger_entry(
+            action="loan_repay",
+            user_id=user_id,
+            amount=-paid,
+            details={"source": source, "closed_loans": closed},
+        )
+        _mark_business_dirty()
+    return paid, closed
+
+
+def _business_liquidate_assets(user_id: int, needed_amount: float) -> float:
+    state = get_business_state()
+    user = _business_get_user(user_id)
+    recovered = 0.0
+    for asset_type in ("stock", "commodity", "crypto"):
+        book = _business_get_asset_book(asset_type)
+        field = _business_holding_field(asset_type)
+        if field is None:
+            continue
+        portfolio = user.get(field, {})
+        if not isinstance(portfolio, dict):
+            continue
+        holdings = sorted(
+            (
+                (symbol, int(holding.get("qty", 0)), float(book.get(symbol, {}).get("price", 0.0)))
+                for symbol, holding in portfolio.items()
+                if isinstance(holding, dict)
+            ),
+            key=lambda row: row[1] * row[2],
+            reverse=True,
+        )
+        for symbol, qty, price in holdings:
+            if recovered >= needed_amount:
+                break
+            if qty <= 0 or price <= 0:
+                continue
+            sell_qty = qty
+            discount = 0.90 if asset_type == "crypto" else 0.92
+            proceeds = sell_qty * price * discount
+            if recovered + proceeds > needed_amount:
+                required = max(1, int((needed_amount - recovered) / max(1.0, price * discount)))
+                sell_qty = min(qty, required)
+                proceeds = sell_qty * price * discount
+            if _business_remove_asset_from_user(user, asset_type, symbol, sell_qty):
+                recovered += proceeds
+        if recovered >= needed_amount:
+            break
+
+    if recovered < needed_amount and BUSINESS_ENABLE_PRIVATE_BUSINESSES:
+        registry = state.get("businesses", {}).get("registry", {})
+        if isinstance(registry, dict):
+            owned_ids = [str(x) for x in user.get("business_ids", [])]
+            ranked_biz: list[tuple[str, float]] = []
+            for biz_id in owned_ids:
+                biz = registry.get(biz_id)
+                if not isinstance(biz, dict):
+                    continue
+                if str(biz.get("status", "active")) != "active":
+                    continue
+                level = max(1, int(biz.get("level", 1) or 1))
+                employees = max(0, int(biz.get("employees", 0) or 0))
+                debt = max(0.0, float(biz.get("debt", 0.0) or 0.0))
+                value = max(0.0, float(biz.get("base_value", 0.0) or 0.0) * (1 + ((level - 1) * 0.4)) + (employees * 300.0) - debt)
+                ranked_biz.append((biz_id, value))
+            ranked_biz.sort(key=lambda row: row[1], reverse=True)
+            for biz_id, value in ranked_biz:
+                if recovered >= needed_amount:
+                    break
+                biz = registry.get(biz_id)
+                if not isinstance(biz, dict):
+                    continue
+                liquidation = value * 0.62
+                biz["status"] = "liquidated"
+                biz["cash_reserve"] = 0.0
+                user["business_ids"] = [x for x in user.get("business_ids", []) if str(x) != str(biz_id)]
+                recovered += liquidation
+
+    if recovered < needed_amount:
+        plots = state["real_estate"]["plots"]
+        owned = sorted(
+            [
+                plots.get(plot_id)
+                for plot_id in list(user.get("properties", []))
+                if isinstance(plots.get(plot_id), dict)
+            ],
+            key=lambda p: _business_plot_value(p),
+            reverse=True,
+        )
+        for plot in owned:
+            if recovered >= needed_amount:
+                break
+            if plot is None:
+                continue
+            if plot.get("auction_lock"):
+                continue
+            value = _business_plot_value(plot) * 0.85
+            plot["owner_id"] = None
+            plot["tier"] = 0
+            plot["listed_price"] = None
+            user["properties"] = [pid for pid in user.get("properties", []) if pid != plot.get("id")]
+            recovered += value
+    if recovered > 0:
+        user["cash"] = max(0.0, float(user.get("cash", 0.0)) + recovered)
+        _business_add_ledger_entry(
+            action="forced_liquidation",
+            user_id=user_id,
+            amount=recovered,
+            details={"reason": "debt_recovery"},
+        )
+        _mark_business_dirty()
+    return recovered
+
+
+def _business_generate_world_event() -> dict[str, Any]:
+    templates: list[dict[str, Any]] = [
+        {
+            "name": "Risk-On Rally",
+            "stock_shift": random.uniform(0.006, 0.020),
+            "commodity_shift": random.uniform(-0.004, 0.008),
+            "crypto_shift": random.uniform(0.010, 0.050),
+            "duration_ticks": random.randint(3, 8),
+            "sector": None,
+        },
+        {
+            "name": "Macro Panic",
+            "stock_shift": random.uniform(-0.030, -0.010),
+            "commodity_shift": random.uniform(-0.012, 0.005),
+            "crypto_shift": random.uniform(-0.055, -0.020),
+            "duration_ticks": random.randint(2, 5),
+            "sector": None,
+        },
+        {
+            "name": "Energy Shock",
+            "stock_shift": random.uniform(-0.015, 0.006),
+            "commodity_shift": random.uniform(0.012, 0.045),
+            "crypto_shift": random.uniform(-0.018, 0.012),
+            "duration_ticks": random.randint(3, 6),
+            "sector": "energy",
+        },
+        {
+            "name": "Tech Acceleration",
+            "stock_shift": random.uniform(0.008, 0.030),
+            "commodity_shift": random.uniform(-0.010, 0.008),
+            "crypto_shift": random.uniform(0.005, 0.028),
+            "duration_ticks": random.randint(3, 7),
+            "sector": "tech",
+        },
+        {
+            "name": "Rate Hike Wave",
+            "stock_shift": random.uniform(-0.022, -0.006),
+            "commodity_shift": random.uniform(-0.006, 0.006),
+            "crypto_shift": random.uniform(-0.040, -0.010),
+            "duration_ticks": random.randint(2, 4),
+            "sector": "finance",
+        },
+    ]
+    event = dict(random.choice(templates))
+    event["created_ts"] = _business_now_ts()
+    event["remaining_ticks"] = int(event.get("duration_ticks", 3))
+    return event
+
+
+def _business_run_world_event_tick() -> str:
+    state = get_business_state()
+    meta = state["meta"]
+    day_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if str(meta.get("event_count_day_key", "")) != day_key:
+        meta["event_count_day_key"] = day_key
+        meta["event_count_today"] = 0
+    if int(meta.get("event_count_today", 0) or 0) >= BUSINESS_EVENT_MAX_PER_DAY:
+        note = "World desk held events due to daily cap."
+        state["market"]["last_news"] = note
+        _mark_business_dirty()
+        return note
+    event = _business_generate_world_event()
+    state["market"]["active_event"] = event
+    meta["event_count_today"] = int(meta.get("event_count_today", 0) or 0) + 1
+    note = f"World Event: {event['name']} ({event['remaining_ticks']} ticks)"
+    state["market"]["last_news"] = note
+    _mark_business_dirty()
+    return note
+
+
+def _business_apply_market_group_tick(
+    *,
+    asset_type: str,
+    assets: dict[str, Any],
+    ai_market_bias: float,
+    ai_sector_bias: dict[str, float],
+    event: dict[str, Any] | None,
+) -> tuple[str, float, float]:
+    movers: list[tuple[str, float]] = []
+    prev_sum = 0.0
+    curr_sum = 0.0
+    count = 0
+
+    if asset_type == "crypto":
+        move_cap = 0.36
+        ai_weight = 1.15
+        trend_jitter = 0.008
+    elif asset_type == "commodity":
+        move_cap = 0.18
+        ai_weight = 0.72
+        trend_jitter = 0.004
+    else:
+        move_cap = 0.22
+        ai_weight = 1.0
+        trend_jitter = 0.004
+
+    event_shift = 0.0
+    event_sector = None
+    if isinstance(event, dict):
+        key = f"{asset_type}_shift"
+        event_shift = float(event.get(key, 0.0) or 0.0)
+        event_sector = event.get("sector")
+
+    for symbol, row in assets.items():
+        if not isinstance(row, dict):
+            continue
+        prev_price = max(0.001, float(row.get("price", 0.001)))
+        drift = float(row.get("trend", 0.0) or 0.0)
+        vol = max(0.001, float(row.get("volatility", 0.02) or 0.02))
+        sector = str(row.get("sector", "")).lower()
+        move = random.gauss(drift, vol)
+        move += ai_market_bias * ai_weight
+        move += float(ai_sector_bias.get(sector, 0.0))
+        if event_shift != 0.0:
+            if event_sector is None or str(event_sector).lower() == sector:
+                move += event_shift
+            else:
+                move += event_shift * 0.35
+        move = _business_clamp_float(move, -move_cap, move_cap)
+        new_price = max(0.5 if asset_type == "crypto" else 1.0, round(prev_price * (1 + move), 2))
+        row["price"] = new_price
+        row["trend"] = _business_clamp_float((drift * 0.66) + random.uniform(-trend_jitter, trend_jitter), -0.05, 0.05)
+        history = row.get("history")
+        if not isinstance(history, list):
+            history = []
+            row["history"] = history
+        history.append(new_price)
+        if len(history) > 96:
+            del history[:-96]
+        change_pct = ((new_price - prev_price) / prev_price) * 100.0
+        movers.append((str(symbol), change_pct))
+        prev_sum += prev_price
+        curr_sum += new_price
+        count += 1
+        if change_pct <= -float(BUSINESS_CIRCUIT_BREAKER_DROP_PCT):
+            _business_register_asset_halt(asset_type, str(symbol), reason=f"Drop {change_pct:.1f}%")
+
+    movers.sort(key=lambda row: abs(row[1]), reverse=True)
+    top = ", ".join(f"{sym} {pct:+.1f}%" for sym, pct in movers[:3]) if movers else "No major moves."
+    prev_avg = (prev_sum / count) if count > 0 else 0.0
+    curr_avg = (curr_sum / count) if count > 0 else 0.0
+    return top, prev_avg, curr_avg
+
+
+def _business_tick_apply_market() -> str | None:
+    state = get_business_state()
+    if _business_market_paused():
+        return "Market paused by admins."
+
+    _business_decay_halts_each_tick()
+    market = state["market"]
+    commodities = state.get("commodities", {})
+    crypto = state.get("crypto", {})
+    ai_dynamic = _business_get_ai_dynamic(state)
+    ai_headline = str(ai_dynamic.get("headline", "") or "").strip()
+    ai_market_bias = _business_clamp_float(float(ai_dynamic.get("market_bias", 0.0) or 0.0), -0.03, 0.03)
+    ai_sector_bias_raw = ai_dynamic.get("sector_bias", {})
+    ai_sector_bias: dict[str, float] = {}
+    if isinstance(ai_sector_bias_raw, dict):
+        for key, value in ai_sector_bias_raw.items():
+            try:
+                ai_sector_bias[str(key).lower()] = _business_clamp_float(float(value), -0.03, 0.03)
+            except (TypeError, ValueError):
+                continue
+
+    event_note = None
+    event = market.get("active_event")
+    if isinstance(event, dict):
+        event["remaining_ticks"] = int(event.get("remaining_ticks", 0) or 0) - 1
+        if int(event["remaining_ticks"]) <= 0:
+            event_note = f"Event ended: {event.get('name', 'unknown')}"
+            market["active_event"] = None
+            event = None
+
+    stocks = market.get("stocks", {})
+    stock_top, stock_prev, stock_curr = _business_apply_market_group_tick(
+        asset_type="stock",
+        assets=stocks if isinstance(stocks, dict) else {},
+        ai_market_bias=ai_market_bias,
+        ai_sector_bias=ai_sector_bias,
+        event=event if isinstance(event, dict) else None,
+    )
+    commodity_assets = commodities.get("assets", {})
+    commodity_top = "Commodities disabled."
+    if BUSINESS_ENABLE_COMMODITIES and isinstance(commodity_assets, dict):
+        commodity_top, _, _ = _business_apply_market_group_tick(
+            asset_type="commodity",
+            assets=commodity_assets,
+            ai_market_bias=ai_market_bias * 0.7,
+            ai_sector_bias=ai_sector_bias,
+            event=event if isinstance(event, dict) else None,
+        )
+    crypto_assets = crypto.get("assets", {})
+    crypto_top = "Crypto disabled."
+    if BUSINESS_ENABLE_CRYPTO and isinstance(crypto_assets, dict):
+        crypto_top, _, _ = _business_apply_market_group_tick(
+            asset_type="crypto",
+            assets=crypto_assets,
+            ai_market_bias=ai_market_bias * 1.2,
+            ai_sector_bias=ai_sector_bias,
+            event=event if isinstance(event, dict) else None,
+        )
+
+    if stock_prev > 0 and stock_curr > 0:
+        index_drop_pct = ((stock_curr - stock_prev) / stock_prev) * 100.0
+        state["market_halts"]["last_index_value"] = round(stock_curr, 3)
+        if index_drop_pct <= -float(BUSINESS_MARKET_HALT_DROP_PCT):
+            _business_register_market_halt(
+                f"Index drop {index_drop_pct:.1f}% exceeded {BUSINESS_MARKET_HALT_DROP_PCT:.0f}%"
+            )
+
+    note = event_note or "Market tick settled."
+    if isinstance(event, dict):
+        note = f"World Event: {event.get('name', 'unknown')}"
+    if ai_headline:
+        note = f"{ai_headline}. {note}"
+    market["last_news"] = f"{note} Stocks: {stock_top}"
+    commodities["last_news"] = f"{note} Commodities: {commodity_top}"
+    crypto["last_news"] = f"{note} Crypto: {crypto_top}"
+
+    now_ts = _business_now_ts()
+    market_history = market.get("history")
+    if not isinstance(market_history, list):
+        market_history = []
+        market["history"] = market_history
+    market_history.append({"ts": now_ts, "news": market["last_news"]})
+    if len(market_history) > 300:
+        del market_history[:-300]
+    for container, key in ((commodities, "history"), (crypto, "history")):
+        history = container.get(key)
+        if not isinstance(history, list):
+            history = []
+            container[key] = history
+        history.append({"ts": now_ts, "news": str(container.get("last_news", ""))[:240]})
+        if len(history) > 260:
+            del history[:-260]
+
+    _mark_business_dirty()
+    return market["last_news"]
+
+
+def _business_tick_apply_properties_and_loans() -> None:
+    state = get_business_state()
+    plots = state["real_estate"]["plots"]
+    users = state["users"]
+    rates = _business_rates_for_guild(None)
+    maintenance_rate = max(0.0, float(rates["property_maintenance_rate"]))
+    tax_rate = max(0.0, float(rates["property_tax_rate"]))
+    tick_hours = max(0.05, float(BUSINESS_MARKET_TICK_MINUTES) / 60.0)
+
+    zone_yield = {"urban": 0.00165, "suburban": 0.0012, "rural": 0.00085}
+    now_ts = _business_now_ts()
+
+    for user_key, user in users.items():
+        if not isinstance(user, dict):
+            continue
+        uid = int(user_key) if str(user_key).isdigit() else 0
+        income = 0.0
+        expenses = 0.0
+        for plot_id in list(user.get("properties", [])):
+            plot = plots.get(str(plot_id))
+            if not isinstance(plot, dict):
+                continue
+            if str(plot.get("owner_id")) != str(user_key):
+                continue
+            value = _business_plot_value(plot)
+            tier = int(plot.get("tier", 0))
+            multiplier = 1 + (tier * 0.58)
+            yield_rate = zone_yield.get(str(plot.get("zone", "rural")), 0.0008) * multiplier * tick_hours
+            vacancy_roll = random.random()
+            is_vacant = vacancy_roll < max(0.02, 0.11 - (tier * 0.012))
+            rent = 0.0 if is_vacant else (value * yield_rate)
+            maintenance = value * maintenance_rate * tick_hours
+            property_tax = max(0.0, rent) * tax_rate
+            delta = rent - maintenance - property_tax
+            income += rent
+            expenses += (maintenance + property_tax)
+            user["cash"] = float(user.get("cash", 0.0)) + delta
+
+        loans = user.get("loans", [])
+        if isinstance(loans, list):
+            for loan in loans:
+                if not isinstance(loan, dict):
+                    continue
+                if str(loan.get("status", "active")) in {"paid", "closed"}:
+                    continue
+                balance = max(0.0, float(loan.get("balance", 0.0)))
+                step_rate = max(0.0, float(loan.get("rate", BUSINESS_HOURLY_INTEREST_RATE)))
+                interest_multiplier = pow(1 + step_rate, tick_hours)
+                balance *= interest_multiplier
+                due_ts = float(loan.get("due_ts", 0.0))
+                overdue_minutes = int(loan.get("overdue_minutes", 0))
+                if now_ts > due_ts > 0:
+                    overdue_minutes += int(BUSINESS_MARKET_TICK_MINUTES)
+                    balance *= (1 + (0.0025 * max(0.25, tick_hours)))
+                overdue_hours = int(overdue_minutes // 60)
+                loan["overdue_minutes"] = overdue_minutes
+                loan["overdue_hours"] = overdue_hours
+                if overdue_hours > BUSINESS_LOAN_GRACE_HOURS + 24:
+                    loan["status"] = "default_watch"
+                elif overdue_hours > BUSINESS_LOAN_GRACE_HOURS:
+                    loan["status"] = "stressed"
+                elif overdue_hours > 0:
+                    loan["status"] = "overdue"
+                else:
+                    loan["status"] = "current"
+                loan["balance"] = round(balance, 4)
+                loan["last_tick_ts"] = now_ts
+
+            debt = _business_debt_total(user)
+            net = max(1.0, _business_networth(uid)) if uid > 0 else 1.0
+            flags = user.setdefault("flags", {})
+            if isinstance(flags, dict):
+                flags["trade_limited"] = debt > (net * BUSINESS_MAX_DEBT_TO_NETWORTH) or any(
+                    int(loan.get("overdue_hours", 0)) > BUSINESS_LOAN_GRACE_HOURS
+                    for loan in loans
+                    if isinstance(loan, dict) and str(loan.get("status", "active")) not in {"paid", "closed"}
+                )
+            if float(user.get("cash", 0.0)) < 0 and uid > 0:
+                needed = abs(float(user.get("cash", 0.0))) + (debt * 0.08)
+                recovered = _business_liquidate_assets(uid, needed)
+                if recovered > 0:
+                    _business_repay_loans_from_cash(uid, recovered * 0.45, source="auto_recovery")
+
+        tick_net_income = max(0.0, income - expenses)
+        user["income_total"] = float(user.get("income_total", 0.0)) + tick_net_income
+        user["weekly_income"] = float(user.get("weekly_income", 0.0)) + tick_net_income
+    _mark_business_dirty()
+
+
+async def _business_expire_trades_and_auctions() -> None:
+    state = get_business_state()
+    now_ts = _business_now_ts()
+    offers = state["trades"]["open"]
+    expired_trade_ids = [
+        trade_id
+        for trade_id, offer in offers.items()
+        if isinstance(offer, dict) and now_ts >= float(offer.get("expires_ts", 0.0))
+    ]
+    for trade_id in expired_trade_ids:
+        offers.pop(trade_id, None)
+
+    expired_auctions: list[tuple[str, int]] = []
+    for auction_id, auc in state["auctions"]["active"].items():
+        if not isinstance(auc, dict):
+            continue
+        if now_ts < float(auc.get("end_ts", 0.0)):
+            continue
+        expired_auctions.append((auction_id, int(auc.get("channel_id", 0) or 0)))
+    _mark_business_dirty()
+    for auction_id, channel_id in expired_auctions:
+        summary = await _business_settle_auction(auction_id, reason="expired")
+        channel = bot.get_channel(channel_id)
+        if isinstance(channel, discord.TextChannel):
+            try:
+                await channel.send(f"ðŸ {summary}")
+            except discord.HTTPException:
+                pass
+
+
+def _business_time_bucket_key(minutes: int) -> str:
+    window = max(1, int(minutes))
+    bucket = int(datetime.now(timezone.utc).timestamp() // (window * 60))
+    return str(bucket)
+
+
+def _business_cycle_bucket_key(days: int) -> str:
+    window = max(1, int(days))
+    bucket = int(datetime.now(timezone.utc).timestamp() // (window * 24 * 3600))
+    return str(bucket)
+
+
+def _business_settle_private_businesses() -> tuple[int, float]:
+    if not BUSINESS_ENABLE_PRIVATE_BUSINESSES:
+        return 0, 0.0
+    state = get_business_state()
+    registry = state.get("businesses", {}).get("registry", {})
+    profiles = state.get("businesses", {}).get("profiles", {})
+    if not isinstance(registry, dict) or not isinstance(profiles, dict):
+        return 0, 0.0
+    settled = 0
+    moved_cash = 0.0
+    for biz_id, biz in list(registry.items()):
+        if not isinstance(biz, dict):
+            continue
+        if str(biz.get("status", "active")) != "active":
+            continue
+        owner_id = int(biz.get("owner_id", 0) or 0)
+        if owner_id <= 0:
+            continue
+        owner = _business_get_user(owner_id)
+        biz_type = str(biz.get("type", "retail")).lower()
+        profile = profiles.get(biz_type) if isinstance(profiles.get(biz_type), dict) else profiles.get("retail", {})
+        if not isinstance(profile, dict):
+            profile = {}
+        level = max(1, int(biz.get("level", 1) or 1))
+        employees = max(0, int(biz.get("employees", 0) or 0))
+        revenue_base = float(profile.get("revenue", 2000.0) or 2000.0)
+        payroll_unit = float(profile.get("payroll", 260.0) or 260.0)
+        maintenance_base = float(profile.get("maintenance", 180.0) or 180.0)
+        gross = revenue_base * (1 + ((level - 1) * 0.35)) * (1 + (employees * 0.10))
+        gross *= random.uniform(0.88, 1.16)
+        payroll = payroll_unit * employees
+        maintenance = maintenance_base * max(1, level)
+        debt_interest = max(0.0, float(biz.get("debt", 0.0) or 0.0)) * 0.01
+        pre_tax = gross - payroll - maintenance - debt_interest
+        transfer_ratio = 0.74 if pre_tax > 0 else 0.0
+        payout = pre_tax * transfer_ratio
+        reserve_delta = pre_tax - payout
+        owner["cash"] = float(owner.get("cash", 0.0)) + payout
+        owner["weekly_income"] = float(owner.get("weekly_income", 0.0)) + max(0.0, payout)
+        owner["income_total"] = float(owner.get("income_total", 0.0)) + max(0.0, payout)
+        biz["cash_reserve"] = float(biz.get("cash_reserve", 0.0) or 0.0) + reserve_delta
+        if pre_tax < 0:
+            biz["debt"] = max(0.0, float(biz.get("debt", 0.0) or 0.0) + abs(pre_tax) * 0.75)
+            biz["stress_cycles"] = int(biz.get("stress_cycles", 0) or 0) + 1
+        else:
+            biz["stress_cycles"] = max(0, int(biz.get("stress_cycles", 0) or 0) - 1)
+            if float(biz.get("debt", 0.0) or 0.0) > 0 and float(biz.get("cash_reserve", 0.0) or 0.0) > 0:
+                repay = min(float(biz["debt"]), float(biz["cash_reserve"]) * 0.35)
+                biz["debt"] = max(0.0, float(biz["debt"]) - repay)
+                biz["cash_reserve"] = max(0.0, float(biz["cash_reserve"]) - repay)
+        threshold = max(12000.0, float(profile.get("expand_cost", 7000.0) or 7000.0) * (1 + (level * 0.5)))
+        if float(biz.get("debt", 0.0) or 0.0) > threshold and int(biz.get("stress_cycles", 0) or 0) >= 2:
+            biz["status"] = "liquidated"
+            liquidation_cash = max(0.0, float(biz.get("cash_reserve", 0.0) or 0.0) * 0.45)
+            owner["cash"] = float(owner.get("cash", 0.0)) + liquidation_cash
+            owner["business_ids"] = [x for x in owner.get("business_ids", []) if str(x) != str(biz_id)]
+            _business_add_ledger_entry(
+                action="business_liquidation",
+                user_id=owner_id,
+                amount=liquidation_cash,
+                details={"biz_id": str(biz_id), "debt": float(biz.get("debt", 0.0) or 0.0)},
+            )
+        settled += 1
+        moved_cash += payout
+    if settled > 0:
+        _mark_business_dirty()
+    return settled, moved_cash
+
+
+def _business_apply_weekly_tax_credit_cycle() -> tuple[int, float]:
+    state = get_business_state()
+    tax_state = state.get("tax", {})
+    if not isinstance(tax_state, dict):
+        tax_state = {}
+        state["tax"] = tax_state
+    users = state.get("users", {})
+    if not isinstance(users, dict):
+        return 0, 0.0
+    filings = 0
+    total_tax_added = 0.0
+    short_rate = _business_clamp_float(
+        float(tax_state.get("capital_gains_short_rate", BUSINESS_CAPITAL_GAINS_SHORT_RATE) or BUSINESS_CAPITAL_GAINS_SHORT_RATE),
+        0.0,
+        0.8,
+    )
+    long_rate = _business_clamp_float(
+        float(tax_state.get("capital_gains_long_rate", BUSINESS_CAPITAL_GAINS_LONG_RATE) or BUSINESS_CAPITAL_GAINS_LONG_RATE),
+        0.0,
+        0.8,
+    )
+    for user in users.values():
+        if not isinstance(user, dict):
+            continue
+        weekly_income = float(user.get("weekly_income", 0.0) or 0.0)
+        short_gains = float(user.get("weekly_realized_gains_short", 0.0) or 0.0)
+        long_gains = float(user.get("weekly_realized_gains_long", 0.0) or 0.0)
+        income_tax = _business_progressive_income_tax(max(0.0, weekly_income))
+        gains_tax = max(0.0, short_gains) * short_rate + max(0.0, long_gains) * long_rate
+        added = income_tax + gains_tax
+        if added > 0:
+            user["tax_liability"] = float(user.get("tax_liability", 0.0)) + added
+            total_tax_added += added
+            filings += 1
+        loans = user.get("loans", [])
+        has_overdue = False
+        severe = False
+        if isinstance(loans, list):
+            for loan in loans:
+                if not isinstance(loan, dict):
+                    continue
+                status = str(loan.get("status", "current"))
+                if status in {"overdue", "stressed", "default_watch"}:
+                    has_overdue = True
+                if status in {"stressed", "default_watch"}:
+                    severe = True
+        if severe:
+            _business_apply_credit_score_delta(user, -8)
+        elif has_overdue:
+            _business_apply_credit_score_delta(user, -4)
+        elif _business_debt_total(user) > 0:
+            _business_apply_credit_score_delta(user, 2)
+        user["weekly_income"] = 0.0
+        user["weekly_realized_gains_short"] = 0.0
+        user["weekly_realized_gains_long"] = 0.0
+    tax_state["last_weekly_cycle_key"] = _business_cycle_bucket_key(BUSINESS_WEEKLY_CYCLE_DAYS)
+    if filings > 0:
+        _mark_business_dirty()
+    return filings, total_tax_added
+
+
+async def run_business_hourly_tick(force: bool = False) -> bool:
+    if not BUSINESS_ENABLED:
+        return False
+    async with BUSINESS_TICK_LOCK:
+        market_key = _business_time_bucket_key(BUSINESS_MARKET_TICK_MINUTES)
+        event_key = _business_time_bucket_key(BUSINESS_WORLD_EVENT_INTERVAL_MINUTES)
+        weekly_key = _business_cycle_bucket_key(BUSINESS_WEEKLY_CYCLE_DAYS)
+        async with BUSINESS_STATE_LOCK:
+            state = get_business_state()
+            meta = state["meta"]
+            should_market = force or str(meta.get("last_market_tick_key", "")) != market_key
+            should_event = force or str(meta.get("last_world_event_tick_key", "")) != event_key
+            should_weekly = force or str(meta.get("last_weekly_cycle_key", "")) != weekly_key
+            if not should_market and not should_event and not should_weekly:
+                return False
+        if should_event:
+            try:
+                await _business_refresh_ai_dynamic()
+            except Exception as error:
+                print(f"[BUSINESS AI DIRECTOR ERROR] {error}")
+        async with BUSINESS_STATE_LOCK:
+            state = get_business_state()
+            meta = state["meta"]
+            if should_event and str(meta.get("last_world_event_tick_key", "")) != event_key:
+                meta["last_world_event_tick_key"] = event_key
+                _business_run_world_event_tick()
+            if should_market and str(meta.get("last_market_tick_key", "")) != market_key:
+                meta["last_market_tick_key"] = market_key
+                meta["last_tick_hour_key"] = _business_hour_key()
+                meta["last_tick_ts"] = _business_now_ts()
+                _business_tick_apply_market()
+                _business_tick_apply_properties_and_loans()
+            if should_weekly and str(meta.get("last_weekly_cycle_key", "")) != weekly_key:
+                meta["last_weekly_cycle_key"] = weekly_key
+                _business_settle_private_businesses()
+                _business_apply_weekly_tax_credit_cycle()
+            _mark_business_dirty()
+    return True
+
+
+def _business_take_daily_claim(user_id: int, guild_id: int | None = None) -> tuple[bool, float, int]:
+    user = _business_get_user(user_id)
+    now_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily = user.get("daily")
+    if not isinstance(daily, dict):
+        daily = {"day": "", "streak": 0}
+        user["daily"] = daily
+    if str(daily.get("day", "")) == now_day:
+        return False, 0.0, int(daily.get("streak", 0))
+    prev_day = str(daily.get("day", ""))
+    streak = int(daily.get("streak", 0))
+    if prev_day:
+        try:
+            prev_dt = datetime.strptime(prev_day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            delta_days = (datetime.now(timezone.utc).date() - prev_dt.date()).days
+            if delta_days == 1:
+                streak += 1
+            else:
+                streak = 1
+        except Exception:
+            streak = 1
+    else:
+        streak = 1
+    dynamic = _business_get_ai_dynamic(get_business_state())
+    shift_pct = _business_clamp_float(
+        float(dynamic.get("daily_claim_shift_pct", 0.0) or 0.0),
+        -0.25,
+        0.25,
+    )
+    base_claim = float(BUSINESS_DAILY_CLAIM) * (1 + shift_pct)
+    bonus_base = float(BUSINESS_DAILY_CLAIM_STREAK_BONUS) * (1 + (shift_pct * 0.45))
+    bonus = max(0.0, (streak - 1) * bonus_base)
+    amount = float(max(200.0, base_claim + bonus))
+    user["cash"] = float(user.get("cash", 0.0)) + amount
+    daily["day"] = now_day
+    daily["streak"] = streak
+    _business_add_ledger_entry(
+        action="daily_claim",
+        user_id=user_id,
+        amount=amount,
+        details={"streak": streak, "claim_shift_pct": shift_pct, "guild_id": guild_id},
+    )
+    _mark_business_dirty()
+    return True, amount, streak
+
+
+def _business_issue_loan(user_id: int, amount: float) -> tuple[bool, str]:
+    if amount <= 0:
+        return False, "Loan amount must be positive."
+    user = _business_get_user(user_id)
+    debt = _business_debt_total(user)
+    net = max(1.0, _business_networth(user_id))
+    credit_score = int(user.get("credit_score", 650) or 650)
+    debt_ratio = (debt + amount) / net
+    if debt_ratio > BUSINESS_MAX_DEBT_TO_NETWORTH:
+        return False, (
+            f"Loan denied. Debt ratio would be `{debt_ratio:.2f}` "
+            f"(max `{BUSINESS_MAX_DEBT_TO_NETWORTH:.2f}`)."
+        )
+    cap_multiplier = _business_clamp_float(0.60 + ((credit_score - 500) / 500), 0.55, 1.35)
+    cap = max(15000.0, net * cap_multiplier)
+    if amount > cap:
+        return False, f"Loan denied. Your current max is `{_business_money(cap)}`."
+    if credit_score < 540 and amount > (cap * 0.65):
+        return False, "Loan denied for risk. Repay current debt and improve credit score first."
+
+    score_penalty = max(0.0, (680 - credit_score) / 900)
+    loan_rate = float(BUSINESS_HOURLY_INTEREST_RATE) * (1 + score_penalty)
+    loan_rate = _business_clamp_float(loan_rate, 0.0004, 0.01)
+
+    loan_id = _business_next_id("loan")
+    issued = _business_now_ts()
+    loan = {
+        "id": loan_id,
+        "principal": float(amount),
+        "balance": float(amount),
+        "rate": float(loan_rate),
+        "issued_ts": issued,
+        "due_ts": issued + (7 * 24 * 3600),
+        "status": "current",
+        "overdue_hours": 0,
+        "overdue_minutes": 0,
+        "last_tick_ts": issued,
+    }
+    user.setdefault("loans", []).append(loan)
+    user["cash"] = float(user.get("cash", 0.0)) + amount
+    _business_apply_credit_score_delta(user, -2)
+    _business_add_ledger_entry(
+        action="loan_take",
+        user_id=user_id,
+        amount=amount,
+        details={"loan_id": loan_id},
+    )
+    _mark_business_dirty()
+    return True, loan_id
+
+
+async def _business_settle_auction(auction_id: str, *, reason: str) -> str:
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        auctions = state["auctions"]["active"]
+        auction = auctions.get(auction_id)
+        if not isinstance(auction, dict):
+            return "Auction not found."
+
+        seller_id = int(auction.get("seller_id", 0))
+        seller = _business_get_user(seller_id)
+        winner_id = int(auction.get("highest_bidder", 0) or 0)
+        bid_amount = float(auction.get("highest_bid", 0.0) or 0.0)
+        asset_type = str(auction.get("asset_type", ""))
+        asset_ref = str(auction.get("asset_ref", ""))
+        qty = int(auction.get("qty", 0) or 0)
+
+        winner_ok = winner_id > 0
+        if winner_ok:
+            winner = _business_get_user(winner_id)
+            winner_ok = float(winner.get("cash", 0.0)) >= bid_amount
+        else:
+            winner = None
+
+        summary = ""
+        if winner_ok and winner is not None and bid_amount > 0:
+            rates = _business_rates_for_guild(int(auction.get("guild_id", 0) or 0))
+            fee = bid_amount * max(0.0, float(rates["transaction_fee_rate"]))
+            winner["cash"] = float(winner.get("cash", 0.0)) - bid_amount
+            seller["cash"] = float(seller.get("cash", 0.0)) + max(0.0, bid_amount - fee)
+
+            if asset_type == "stock":
+                _business_add_stock_to_user(winner, asset_ref, qty, bid_amount)
+            elif asset_type == "property":
+                plot = state["real_estate"]["plots"].get(asset_ref)
+                if isinstance(plot, dict):
+                    plot["owner_id"] = str(winner_id)
+                    plot["listed_price"] = None
+                    plot["auction_lock"] = None
+                    winner_props = winner.setdefault("properties", [])
+                    if asset_ref not in winner_props:
+                        winner_props.append(asset_ref)
+                    seller["properties"] = [pid for pid in seller.get("properties", []) if pid != asset_ref]
+            _business_add_ledger_entry(
+                action="auction_settle",
+                user_id=winner_id,
+                amount=-bid_amount,
+                details={
+                    "auction_id": auction_id,
+                    "seller_id": seller_id,
+                    "asset_type": asset_type,
+                    "asset_ref": asset_ref,
+                    "qty": qty,
+                    "reason": reason,
+                },
+            )
+            summary = (
+                f"Auction `{auction_id}` won by <@{winner_id}> for `{_business_money(bid_amount)}`."
+            )
+        else:
+            if asset_type == "stock":
+                _business_add_stock_to_user(seller, asset_ref, qty, 0.0)
+            elif asset_type == "property":
+                plot = state["real_estate"]["plots"].get(asset_ref)
+                if isinstance(plot, dict):
+                    plot["owner_id"] = str(seller_id)
+                    plot["auction_lock"] = None
+                    seller_props = seller.setdefault("properties", [])
+                    if asset_ref not in seller_props:
+                        seller_props.append(asset_ref)
+            summary = f"Auction `{auction_id}` ended with no valid winner."
+
+        auctions.pop(auction_id, None)
+        _mark_business_dirty()
+        return summary
+
+
+async def _business_require_access(
+    ctx: commands.Context,
+    *,
+    require_mod: bool = False,
+    check_cooldown: bool = True,
+    mutate: bool = False,
+    allow_when_disabled: bool = False,
+) -> bool:
+    if ctx.guild is None:
+        await ctx.send("Business commands can only be used in a server.")
+        return False
+    if not allow_when_disabled and not get_guild_business_enabled(ctx.guild.id):
+        await ctx.send("Business mode is disabled in this server.")
+        return False
+    if require_mod:
+        if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+            await ctx.send("Only moderators can use this command.")
+            return False
+    elif check_cooldown:
+        now = time.monotonic()
+        last = BUSINESS_LAST_COMMAND_TS.get(ctx.author.id, 0.0)
+        if now - last < BUSINESS_COMMAND_COOLDOWN_SECONDS:
+            await ctx.send(
+                f"Slow down. Business command cooldown: `{BUSINESS_COMMAND_COOLDOWN_SECONDS}`s.",
+                delete_after=4,
+            )
+            return False
+        BUSINESS_LAST_COMMAND_TS[ctx.author.id] = now
+
+    if mutate and _business_is_user_frozen(ctx.author.id):
+        await ctx.send("Your business account is frozen by moderators.")
+        return False
+    return True
+
+
 async def purge_recent_bot_webhook_messages(
     channel: discord.TextChannel, trigger_message: discord.Message | None = None
 ) -> int:
@@ -2080,7 +13011,1357 @@ async def generate_argument_opening(topic: str, side: Literal["PRO", "ANTI"]) ->
         f"Topic: {topic}\n"
         f"Side: {side}"
     )
-    return await request_fun_ai(prompt, max_tokens=260, temperature=0.85)
+    return await request_fun_ai(
+        prompt,
+        max_tokens=260,
+        temperature=0.85,
+        policy_key="argument",
+    )
+
+
+BUSINESS_HELP_KB: list[dict[str, object]] = [
+    {
+        "id": "quickstart",
+        "title": "Quickstart: First 15 Minutes",
+        "keywords": (
+            "start game",
+            "beginner",
+            "how to start",
+            "new player",
+            "quickstart",
+            "first steps",
+        ),
+        "content": (
+            "1. Run `{PREFIX}balance` to initialize and check your wallet.\n"
+            "2. Run `{PREFIX}dailyclaim` for daily income.\n"
+            "3. Run `{PREFIX}stocks` and `{PREFIX}market` to see live prices and trend.\n"
+            "4. Start small: `{PREFIX}buy <symbol> <qty>` with low qty so you learn volatility.\n"
+            "5. Keep cash buffer (10-20%) instead of spending everything.\n"
+            "6. Check `{PREFIX}portfolio`, `{PREFIX}networth`, and `{PREFIX}credit` after each move.\n"
+            "7. When stable, add property with `{PREFIX}plots` + `{PREFIX}buyplot <id>`.\n"
+            "8. Optional growth: use `{PREFIX}takeloan <amount>` only if repayment is clear."
+        ),
+    },
+    {
+        "id": "market-basics",
+        "title": "Stocks, Commodities, and Crypto",
+        "keywords": (
+            "stocks",
+            "market",
+            "buy",
+            "sell",
+            "commodities",
+            "crypto",
+            "price",
+            "volatility",
+        ),
+        "content": (
+            "Use `{PREFIX}stocks` for stock list, `{PREFIX}commodities` for raw assets, and `{PREFIX}crypto` for high-risk assets.\n"
+            "Buy commands: `{PREFIX}buy`, `{PREFIX}buycommodity`, `{PREFIX}buycrypto`.\n"
+            "Sell commands: `{PREFIX}sell`, `{PREFIX}sellcommodity`, `{PREFIX}sellcrypto`.\n"
+            "Rules to remember: spread + fee on each order, exposure limits, and temporary halts during large crashes."
+        ),
+    },
+    {
+        "id": "real-estate",
+        "title": "Plots and Properties",
+        "keywords": (
+            "plot",
+            "property",
+            "real estate",
+            "buyplot",
+            "upgrade",
+            "sellproperty",
+            "rent",
+        ),
+        "content": (
+            "Discover land with `{PREFIX}plots`, then buy with `{PREFIX}buyplot <plot_id>`.\n"
+            "View owned assets using `{PREFIX}properties`.\n"
+            "Grow value using `{PREFIX}upgrade <plot_id>`.\n"
+            "Trade property using `{PREFIX}sellproperty <id> <price>` and `{PREFIX}buyproperty <id>`.\n"
+            "Properties add passive upside but also maintenance/tax pressure each cycle."
+        ),
+    },
+    {
+        "id": "loans-credit",
+        "title": "Loans, Debt, and Credit Score",
+        "keywords": (
+            "loan",
+            "takeloan",
+            "repay",
+            "debt",
+            "credit",
+            "interest",
+        ),
+        "content": (
+            "Check debt snapshot with `{PREFIX}loan` or `{PREFIX}debts`.\n"
+            "Borrow with `{PREFIX}takeloan <amount>`.\n"
+            "Repay with `{PREFIX}repay <amount>`.\n"
+            "Use `{PREFIX}credit` to track score and borrowing quality.\n"
+            "Late debt can trigger restrictions and liquidation; consistent repayment improves credit over time."
+        ),
+    },
+    {
+        "id": "taxes-income",
+        "title": "Taxes, Salary, and Filing",
+        "keywords": (
+            "tax",
+            "taxes",
+            "filetax",
+            "salary",
+            "income tax",
+            "capital gains",
+        ),
+        "content": (
+            "Check salary with `{PREFIX}salary` and tax status with `{PREFIX}taxes`.\n"
+            "Pay manually with `{PREFIX}filetax [amount]`.\n"
+            "Tax liability grows from gains/weekly cycles; leaving it too long hurts cashflow and risk profile.\n"
+            "Track broad economy pressure using `{PREFIX}economystatus`."
+        ),
+    },
+    {
+        "id": "private-businesses",
+        "title": "Private Businesses",
+        "keywords": (
+            "startbiz",
+            "business",
+            "mybiz",
+            "bizhire",
+            "bizfire",
+            "bizexpand",
+            "profit",
+        ),
+        "content": (
+            "Create with `{PREFIX}startbiz <type> <name>`.\n"
+            "View operations with `{PREFIX}mybiz`.\n"
+            "Manage team using `{PREFIX}bizhire` / `{PREFIX}bizfire`.\n"
+            "Scale with `{PREFIX}bizexpand`.\n"
+            "Weekly settlement applies revenue, payroll, maintenance, debt pressure, and tax effects."
+        ),
+    },
+    {
+        "id": "p2p-trading",
+        "title": "Player Trade and Auctions",
+        "keywords": (
+            "trade",
+            "auction",
+            "bid",
+            "trade_accept",
+            "trade_decline",
+            "auction_start",
+            "auctions",
+        ),
+        "content": (
+            "Direct trade: `{PREFIX}trade <@user> <cash|stock|property> <asset> <amount> [request_cash]`.\n"
+            "Finalize/deny with `{PREFIX}trade_accept <id>` or `{PREFIX}trade_decline <id>`.\n"
+            "Auction flow: `{PREFIX}auction_start ...`, `{PREFIX}bid <id> <amount>`, `{PREFIX}auctions`.\n"
+            "Auctions include anti-sniping extensions near close."
+        ),
+    },
+    {
+        "id": "status-analysis",
+        "title": "How to Track Progress",
+        "keywords": (
+            "status",
+            "progress",
+            "portfolio",
+            "networth",
+            "leaderboard",
+            "bizprofile",
+            "marketnews",
+            "ledger",
+        ),
+        "content": (
+            "Core health checks: `{PREFIX}portfolio`, `{PREFIX}networth`, `{PREFIX}credit`, `{PREFIX}taxes`.\n"
+            "Economy-level view: `{PREFIX}marketnews`, `{PREFIX}markethalt`, `{PREFIX}economystatus`.\n"
+            "Competitive stats: `{PREFIX}bizleaderboard [cash|networth|income]` and `{PREFIX}bizprofile [@user]`.\n"
+            "Audit recent transactions with `{PREFIX}ledger [@user]`."
+        ),
+    },
+    {
+        "id": "risk-controls",
+        "title": "Risk and Safety Controls",
+        "keywords": (
+            "halt",
+            "circuit breaker",
+            "frozen",
+            "admin",
+            "bizadmin",
+            "risk",
+            "liquidation",
+        ),
+        "content": (
+            "Circuit breakers pause severe drops (asset-level and market-level).\n"
+            "If debt escalates, the game can restrict trading and liquidate assets in a controlled order.\n"
+            "Moderators can use `{PREFIX}bizadmin ...` for freeze/grant/audit/reverse and market control actions."
+        ),
+    },
+]
+
+BUSINESS_HELP_QUERY_TERMS: tuple[str, ...] = (
+    "game",
+    "business",
+    "economy",
+    "market",
+    "buy",
+    "sell",
+    "trade",
+    "stock",
+    "stocks",
+    "commodity",
+    "commodities",
+    "crypto",
+    "plot",
+    "property",
+    "loan",
+    "debt",
+    "credit",
+    "tax",
+    "taxes",
+    "balance",
+    "dailyclaim",
+    "portfolio",
+    "networth",
+    "debts",
+    "salary",
+    "biz",
+    "auction",
+    "takeloan",
+    "repay",
+)
+
+BUSINESS_HELP_INTENT_TERMS: tuple[str, ...] = (
+    "help",
+    "guide",
+    "how",
+    "explain",
+    "tell",
+    "tutorial",
+    "walkthrough",
+    "setup",
+    "configure",
+    "start",
+    "begin",
+    "commands",
+    "cmd",
+    "tips",
+)
+
+
+def _help_tokenize(text: str) -> list[str]:
+    return [tok.lower() for tok in WORD_PATTERN.findall(text.lower()) if len(tok) >= 2]
+
+
+def parse_business_help_query(text: str) -> str | None:
+    normalized = " ".join(text.lower().split()).strip()
+    if not normalized:
+        return None
+
+    if re.match(r"^(buy|sell)\s+[a-z0-9._-]+\s+\d+\b", normalized):
+        return None
+    if re.match(r"^(bid|repay|takeloan)\s+\d+\b", normalized):
+        return None
+    if re.match(r"^(buyplot|buyproperty)\s+[a-z0-9._-]+\b", normalized):
+        return None
+    if re.match(r"^sellproperty\s+[a-z0-9._-]+\s+\d+\b", normalized):
+        return None
+
+    has_domain = any(term in normalized for term in BUSINESS_HELP_QUERY_TERMS)
+    has_intent = any(term in normalized for term in BUSINESS_HELP_INTENT_TERMS)
+    asks_explanatory_what = bool(
+        re.search(r"^(what(?:'s| is| are)|tell me about)\b", normalized)
+    )
+    asks_personal_status = bool(re.search(r"\bwhat(?:'s| is)?\s+my\b", normalized))
+    asks_question = normalized.endswith("?")
+    question_has_help_cue = bool(
+        re.search(r"\b(how|what|why|when|where|can|should)\b", normalized)
+    )
+    if not has_domain:
+        return None
+    if asks_personal_status:
+        return None
+    if has_intent or asks_explanatory_what or (asks_question and question_has_help_cue):
+        return normalized
+    return None
+
+
+def retrieve_business_help_chunks(query: str, *, limit: int = 3) -> list[dict[str, object]]:
+    normalized = " ".join(query.lower().split()).strip()
+    query_tokens = set(_help_tokenize(normalized))
+    ranked: list[tuple[float, dict[str, object]]] = []
+
+    for chunk in BUSINESS_HELP_KB:
+        score = 0.0
+        keywords = chunk.get("keywords", ())
+        if isinstance(keywords, tuple):
+            for keyword in keywords:
+                kw = str(keyword).lower().strip()
+                if not kw:
+                    continue
+                if " " in kw:
+                    if kw in normalized:
+                        score += 6.0
+                    kw_tokens = set(_help_tokenize(kw))
+                    if kw_tokens and kw_tokens.issubset(query_tokens):
+                        score += 3.0
+                elif kw in query_tokens:
+                    score += 2.5
+
+        doc_text = f"{chunk.get('title', '')} {chunk.get('content', '')}"
+        overlap = len(query_tokens.intersection(_help_tokenize(doc_text)))
+        score += min(6.0, overlap * 0.8)
+
+        if str(chunk.get("id")) == "quickstart":
+            if {"start", "begin", "new", "first"}.intersection(query_tokens):
+                score += 8.0
+            if {"game", "economy", "business"}.intersection(query_tokens):
+                score += 2.0
+
+        if score > 0:
+            ranked.append((score, chunk))
+
+    if not ranked:
+        fallback = next((entry for entry in BUSINESS_HELP_KB if entry.get("id") == "quickstart"), None)
+        return [fallback] if fallback else []
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    selected = [item[1] for item in ranked[: max(1, limit)]]
+    if str(selected[0].get("id")) != "quickstart" and (
+        "start" in normalized or "begin" in normalized or "new player" in normalized
+    ):
+        quickstart = next((entry for entry in BUSINESS_HELP_KB if entry.get("id") == "quickstart"), None)
+        if quickstart is not None:
+            selected = [quickstart, *selected]
+    deduped: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
+    for entry in selected:
+        entry_id = str(entry.get("id", ""))
+        if entry_id in seen_ids:
+            continue
+        seen_ids.add(entry_id)
+        deduped.append(entry)
+    return deduped[: max(1, limit)]
+
+
+def build_business_help_response(query: str, chunks: list[dict[str, object]]) -> str:
+    if not chunks:
+        return (
+            "Business help is available, but I could not map this query.\n"
+            f"Try `{PREFIX}help` and see the Business Commands section."
+        )
+
+    lines = [
+        f"Business guide for: `{query}`",
+        "",
+    ]
+    for chunk in chunks:
+        title = str(chunk.get("title", "Guide")).strip()
+        content = str(chunk.get("content", "")).strip().replace("{PREFIX}", PREFIX)
+        lines.append(f"**{title}**")
+        lines.append(content)
+        lines.append("")
+    lines.append(
+        f"Ask follow-ups naturally, for example: `bell explain loans`, "
+        f"`bell how do taxes work`, `bell how to grow faster safely`."
+    )
+    return "\n".join(lines).strip()
+
+
+async def send_business_help_query_response(
+    target: discord.abc.Messageable, query: str
+) -> None:
+    chunks = retrieve_business_help_chunks(query, limit=4)
+    response = build_business_help_response(query, chunks)
+    await send_chunked(target, response)
+
+
+def _sanitize_capabilities_catalog_payload(payload: Any) -> dict[str, Any]:
+    base = _default_capabilities_catalog_payload()
+    if not isinstance(payload, dict):
+        return base
+    commands_raw = payload.get("commands", {})
+    if not isinstance(commands_raw, dict):
+        commands_raw = {}
+    system_raw = payload.get("system_capabilities", [])
+    if not isinstance(system_raw, list):
+        system_raw = []
+    sanitized: dict[str, Any] = {
+        "schema_version": int(payload.get("schema_version", 1) or 1),
+        "generated_at": float(payload.get("generated_at", 0.0) or 0.0),
+        "commands": {},
+        "system_capabilities": [],
+    }
+    for name, row in commands_raw.items():
+        if not isinstance(row, dict):
+            continue
+        cmd_name = str(name).strip().lower()
+        if not cmd_name:
+            continue
+        aliases = row.get("aliases", [])
+        if not isinstance(aliases, list):
+            aliases = []
+        examples = row.get("examples", [])
+        if not isinstance(examples, list):
+            examples = []
+        triggers = row.get("nl_triggers", [])
+        if not isinstance(triggers, list):
+            triggers = []
+        permission_hints = row.get("permission_hints", [])
+        if not isinstance(permission_hints, list):
+            permission_hints = []
+        domain = str(row.get("domain", "utility")).strip().lower()
+        if domain not in CAPABILITY_DOMAINS:
+            domain = "utility"
+        sanitized["commands"][cmd_name] = {
+            "name": cmd_name,
+            "aliases": sorted({str(item).strip().lower() for item in aliases if str(item).strip()})[:10],
+            "domain": domain,
+            "summary": str(row.get("summary", "")).strip()[:280],
+            "mod_only": bool(row.get("mod_only", False)),
+            "examples": [str(item).strip()[:140] for item in examples if str(item).strip()][:6],
+            "nl_triggers": [str(item).strip().lower()[:50] for item in triggers if str(item).strip()][:12],
+            "usage": str(row.get("usage", f"{PREFIX}{cmd_name}")).strip()[:180],
+            "signature": str(row.get("signature", "")).strip()[:160],
+            "hidden": bool(row.get("hidden", False)),
+            "command_type": str(row.get("command_type", "prefix")).strip().lower()[:20],
+            "permission_hints": [str(item).strip().lower()[:30] for item in permission_hints if str(item).strip()][:8],
+        }
+    for row in system_raw:
+        if not isinstance(row, dict):
+            continue
+        capability_id = str(row.get("id", "")).strip().lower()
+        if not capability_id:
+            continue
+        domain = str(row.get("domain", "utility")).strip().lower()
+        if domain not in CAPABILITY_DOMAINS:
+            domain = "utility"
+        examples = row.get("examples", [])
+        if not isinstance(examples, list):
+            examples = []
+        triggers = row.get("nl_triggers", [])
+        if not isinstance(triggers, list):
+            triggers = []
+        sanitized["system_capabilities"].append(
+            {
+                "id": capability_id,
+                "domain": domain,
+                "summary": str(row.get("summary", "")).strip()[:280],
+                "mod_only": bool(row.get("mod_only", False)),
+                "examples": [str(item).strip()[:140] for item in examples if str(item).strip()][:6],
+                "nl_triggers": [str(item).strip().lower()[:50] for item in triggers if str(item).strip()][:12],
+            }
+        )
+    return sanitized
+
+
+def load_capabilities_overrides(*, force: bool = False) -> dict[str, Any]:
+    global CAPABILITIES_OVERRIDES_CACHE
+    global CAPABILITIES_OVERRIDES_CACHE_TS
+    global CAPABILITIES_OVERRIDES_CACHE_MTIME
+    ensure_data_files()
+    now = time.monotonic()
+    mtime = _safe_file_mtime(CAPABILITIES_OVERRIDES_FILE)
+    mtime_unchanged = abs(mtime - CAPABILITIES_OVERRIDES_CACHE_MTIME) < 1e-6
+    if (
+        not force
+        and CAPABILITIES_OVERRIDES_CACHE is not None
+        and mtime_unchanged
+        and (now - CAPABILITIES_OVERRIDES_CACHE_TS) < CAPABILITIES_CACHE_TTL_SECONDS
+    ):
+        return CAPABILITIES_OVERRIDES_CACHE
+    try:
+        raw = json.loads(CAPABILITIES_OVERRIDES_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        print(f"[CAPABILITY OVERRIDES LOAD ERROR] {error}")
+        raw = _default_capabilities_overrides_payload()
+        try:
+            CAPABILITIES_OVERRIDES_FILE.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+    payload = _sanitize_capabilities_overrides_payload(raw)
+    CAPABILITIES_OVERRIDES_CACHE = payload
+    CAPABILITIES_OVERRIDES_CACHE_TS = now
+    CAPABILITIES_OVERRIDES_CACHE_MTIME = _safe_file_mtime(CAPABILITIES_OVERRIDES_FILE)
+    return payload
+
+
+def _capability_domain_from_command(command_name: str, aliases: list[str]) -> str:
+    name = command_name.lower().strip()
+    alias_set = {item.lower().strip() for item in aliases}
+    token_set = {name, *alias_set}
+
+    moderation = {
+        "pb", "pba", "clear", "bulkdelete", "kick", "ban", "unban", "mute", "unmute",
+        "lock", "unlock", "slowmode", "warn", "warnings", "clearwarns", "setmodlog",
+        "clearmodlog", "reloadbadwords", "automod", "aiguard", "aimodmode", "modqueue",
+        "case", "override", "appeal", "modguard", "escalation",
+    }
+    music = {"join", "leave", "play", "skip", "pause", "resume", "stop", "queue", "nowplaying"}
+    business = {
+        "balance", "dailyclaim", "portfolio", "networth", "stocks", "market", "commodities",
+        "crypto", "buycommodity", "sellcommodity", "buycrypto", "sellcrypto", "startbiz",
+        "mybiz", "bizhire", "bizfire", "bizexpand", "salary", "taxes", "filetax", "credit",
+        "markethalt", "economystatus", "bizhelp", "guide", "buy", "sell", "plots", "buyplot",
+        "upgrade", "properties", "sellproperty", "buyproperty", "loan", "takeloan", "repay",
+        "debts", "trade", "trade_accept", "trade_decline", "auction_start", "bid", "auctions",
+        "bizleaderboard", "bizprofile", "marketnews", "ledger",
+    }
+    ai = {
+        "aimodel", "aimodels", "aireset", "psych", "myvibe", "vibe", "vibecheck", "roast",
+        "serverlore", "aicrush", "analyze", "lie_detector", "futureme", "rizzcoach", "argument",
+        "debate", "ai", "ask", "aisummary", "catchup", "catchupchannel", "serverinsights",
+    }
+    engagement = {"rank", "leaderboard", "streak", "daily", "quests", "event", "engagementhub", "autoloops", "questmode", "engagementtz", "engagementlimits"}
+    utility = {"help", "say", "cat", "cats", "food", "ping", "avatar", "userinfo", "serverinfo", "poll", "snipe", "remind", "setgenderroles", "genderroles", "cleargenderroles", "welcomeconcierge", "setintrochannel", "clearintrochannel"}
+
+    if token_set.intersection(moderation):
+        return "moderation"
+    if token_set.intersection(music):
+        return "music"
+    if token_set.intersection(business):
+        return "business"
+    if token_set.intersection(engagement):
+        return "engagement"
+    if token_set.intersection(ai):
+        return "ai"
+    if token_set.intersection(utility):
+        return "utility"
+    if any(term in name for term in ("roast", "vibe", "rizz", "crush")):
+        return "fun"
+    return "utility"
+
+
+def _capability_mod_only_from_command(command: commands.Command, command_name: str) -> bool:
+    known_mod_only = {
+        "pb", "pba", "clear", "bulkdelete", "kick", "ban", "unban", "mute", "unmute",
+        "lock", "unlock", "slowmode", "warn", "warnings", "clearwarns", "setmodlog",
+        "clearmodlog", "reloadbadwords", "automod", "aiguard", "aimodmode", "modqueue",
+        "case", "override", "modguard", "escalation", "setgenderroles", "genderroles",
+        "cleargenderroles", "welcomeconcierge", "setintrochannel", "clearintrochannel",
+        "engagementlimits", "engagementhub", "autoloops", "questmode", "engagementtz",
+        "markethalt", "serverinsights", "say",
+    }
+    if command_name in known_mod_only:
+        return True
+    checks_blob = " ".join(str(check).lower() for check in getattr(command, "checks", []))
+    permission_markers = (
+        "manage_guild", "manage_messages", "moderate_members", "kick_members",
+        "ban_members", "administrator", "has_permissions",
+    )
+    return any(marker in checks_blob for marker in permission_markers)
+
+
+def _capability_permission_hints(command: commands.Command, mod_only: bool) -> list[str]:
+    checks_blob = " ".join(str(check).lower() for check in getattr(command, "checks", []))
+    hints: list[str] = []
+    marker_to_hint = {
+        "manage_guild": "manage_guild",
+        "manage_messages": "manage_messages",
+        "moderate_members": "moderate_members",
+        "kick_members": "kick_members",
+        "ban_members": "ban_members",
+        "administrator": "administrator",
+    }
+    for marker, hint in marker_to_hint.items():
+        if marker in checks_blob and hint not in hints:
+            hints.append(hint)
+    if mod_only and not hints:
+        hints.append("moderator")
+    return hints
+
+
+def _command_usage(command: commands.Command, name: str) -> tuple[str, str]:
+    signature = " ".join((command.signature or "").split()).strip()
+    usage = f"{PREFIX}{name}"
+    if signature:
+        usage = f"{usage} {signature}"
+    return usage.strip(), signature
+
+
+def _default_capability_summary(command_name: str, domain: str) -> str:
+    readable = command_name.replace("_", " ")
+    if domain == "moderation":
+        return f"Moderation command for {readable} actions."
+    if domain == "music":
+        return f"Music control command for {readable}."
+    if domain == "business":
+        return f"Business economy command for {readable}."
+    if domain == "ai":
+        return f"AI feature command for {readable}."
+    if domain == "engagement":
+        return f"Engagement and activity command for {readable}."
+    if domain == "fun":
+        return f"Fun/social feature command for {readable}."
+    return f"Utility command for {readable}."
+
+
+def _discover_capability_commands() -> dict[str, dict[str, Any]]:
+    discovered: dict[str, dict[str, Any]] = {}
+    for command in bot.commands:
+        if not isinstance(command, commands.Command):
+            continue
+        name = str(command.name).strip().lower()
+        if not name:
+            continue
+        aliases = sorted(
+            {
+                str(alias).strip().lower()
+                for alias in getattr(command, "aliases", [])
+                if str(alias).strip()
+            }
+        )
+        usage, signature = _command_usage(command, name)
+        domain = _capability_domain_from_command(name, aliases)
+        mod_only = _capability_mod_only_from_command(command, name)
+        permission_hints = _capability_permission_hints(command, mod_only)
+        help_text = (getattr(command, "help", "") or "").strip()
+        summary = help_text.splitlines()[0].strip()[:280] if help_text else _default_capability_summary(name, domain)
+        nl_triggers = sorted(
+            {
+                name,
+                name.replace("_", " "),
+                domain,
+                *aliases,
+            }
+        )[:12]
+        discovered[name] = {
+            "name": name,
+            "aliases": aliases,
+            "domain": domain,
+            "summary": summary,
+            "mod_only": mod_only,
+            "examples": [usage],
+            "nl_triggers": nl_triggers,
+            "usage": usage,
+            "signature": signature,
+            "hidden": bool(getattr(command, "hidden", False)),
+            "command_type": "hybrid" if isinstance(command, commands.HybridCommand) else "prefix",
+            "permission_hints": permission_hints,
+        }
+    return discovered
+
+
+def _merge_capability_commands(
+    discovered: dict[str, dict[str, Any]],
+    overrides: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    override_commands = overrides.get("commands", {})
+    if not isinstance(override_commands, dict):
+        override_commands = {}
+
+    for name, base in discovered.items():
+        row = dict(base)
+        override = override_commands.get(name)
+        if isinstance(override, dict):
+            if "domain" in override:
+                domain = str(override.get("domain", row["domain"])).strip().lower()
+                row["domain"] = domain if domain in CAPABILITY_DOMAINS else row["domain"]
+            if "summary" in override and str(override.get("summary", "")).strip():
+                row["summary"] = str(override.get("summary", "")).strip()[:280]
+            if "mod_only" in override:
+                row["mod_only"] = bool(override.get("mod_only"))
+            override_examples = override.get("examples", [])
+            if isinstance(override_examples, list) and override_examples:
+                row["examples"] = [str(item).strip()[:140] for item in override_examples if str(item).strip()][:6]
+            override_triggers = override.get("nl_triggers", [])
+            if isinstance(override_triggers, list) and override_triggers:
+                row["nl_triggers"] = sorted(
+                    {
+                        *row.get("nl_triggers", []),
+                        *[str(item).strip().lower()[:50] for item in override_triggers if str(item).strip()],
+                    }
+                )[:16]
+        merged[name] = row
+
+    for name, override in override_commands.items():
+        if name in merged or not isinstance(override, dict):
+            continue
+        domain = str(override.get("domain", "utility")).strip().lower()
+        if domain not in CAPABILITY_DOMAINS:
+            domain = "utility"
+        usage = f"{PREFIX}{name}"
+        examples = override.get("examples", [])
+        if not isinstance(examples, list):
+            examples = []
+        triggers = override.get("nl_triggers", [])
+        if not isinstance(triggers, list):
+            triggers = []
+        merged[name] = {
+            "name": name,
+            "aliases": [],
+            "domain": domain,
+            "summary": str(override.get("summary", _default_capability_summary(name, domain))).strip()[:280],
+            "mod_only": bool(override.get("mod_only", False)),
+            "examples": [str(item).strip()[:140] for item in examples if str(item).strip()] or [usage],
+            "nl_triggers": [str(item).strip().lower()[:50] for item in triggers if str(item).strip()][:12],
+            "usage": usage,
+            "signature": "",
+            "hidden": False,
+            "command_type": "manual",
+            "permission_hints": ["moderator"] if bool(override.get("mod_only", False)) else [],
+        }
+    return merged
+
+
+def rebuild_capabilities_catalog(*, force_overrides_reload: bool = False) -> dict[str, Any]:
+    global CAPABILITIES_CATALOG_CACHE
+    global CAPABILITIES_CATALOG_CACHE_TS
+    global CAPABILITIES_CATALOG_CACHE_MTIME
+    try:
+        overrides = load_capabilities_overrides(force=force_overrides_reload)
+        discovered = _discover_capability_commands()
+        merged_commands = _merge_capability_commands(discovered, overrides)
+        system_caps = overrides.get("system_capabilities", [])
+        if not isinstance(system_caps, list):
+            system_caps = []
+        payload = _sanitize_capabilities_catalog_payload(
+            {
+                "schema_version": 1,
+                "generated_at": time.time(),
+                "commands": merged_commands,
+                "system_capabilities": system_caps,
+            }
+        )
+        try:
+            CAPABILITIES_CATALOG_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError as error:
+            print(f"[CAPABILITY CATALOG WRITE ERROR] {error}")
+        CAPABILITIES_CATALOG_CACHE = payload
+        CAPABILITIES_CATALOG_CACHE_TS = time.monotonic()
+        CAPABILITIES_CATALOG_CACHE_MTIME = _safe_file_mtime(CAPABILITIES_CATALOG_FILE)
+        return payload
+    except Exception as error:
+        print(f"[CAPABILITY CATALOG REBUILD ERROR] {error}")
+        fallback = _default_capabilities_catalog_payload()
+        CAPABILITIES_CATALOG_CACHE = fallback
+        CAPABILITIES_CATALOG_CACHE_TS = time.monotonic()
+        return fallback
+
+
+def get_capabilities_catalog(*, force_refresh: bool = False) -> dict[str, Any]:
+    global CAPABILITIES_CATALOG_CACHE
+    global CAPABILITIES_CATALOG_CACHE_TS
+    global CAPABILITIES_CATALOG_CACHE_MTIME
+    ensure_data_files()
+    now = time.monotonic()
+    mtime = _safe_file_mtime(CAPABILITIES_CATALOG_FILE)
+    mtime_unchanged = abs(mtime - CAPABILITIES_CATALOG_CACHE_MTIME) < 1e-6
+    cache_fresh = (
+        CAPABILITIES_CATALOG_CACHE is not None
+        and mtime_unchanged
+        and (now - CAPABILITIES_CATALOG_CACHE_TS) < CAPABILITIES_CACHE_TTL_SECONDS
+    )
+    if not force_refresh and cache_fresh:
+        return CAPABILITIES_CATALOG_CACHE
+
+    overrides_mtime = _safe_file_mtime(CAPABILITIES_OVERRIDES_FILE)
+    should_rebuild = (
+        force_refresh
+        or CAPABILITIES_CATALOG_CACHE is None
+        or not mtime_unchanged
+        or abs(overrides_mtime - CAPABILITIES_OVERRIDES_CACHE_MTIME) > 1e-6
+    )
+    if should_rebuild:
+        return rebuild_capabilities_catalog(
+            force_overrides_reload=(abs(overrides_mtime - CAPABILITIES_OVERRIDES_CACHE_MTIME) > 1e-6)
+        )
+
+    try:
+        payload = json.loads(CAPABILITIES_CATALOG_FILE.read_text(encoding="utf-8"))
+        sanitized = _sanitize_capabilities_catalog_payload(payload)
+        CAPABILITIES_CATALOG_CACHE = sanitized
+        CAPABILITIES_CATALOG_CACHE_TS = now
+        CAPABILITIES_CATALOG_CACHE_MTIME = mtime
+        return sanitized
+    except (json.JSONDecodeError, OSError) as error:
+        print(f"[CAPABILITY CATALOG LOAD ERROR] {error}")
+        return rebuild_capabilities_catalog(force_overrides_reload=True)
+
+
+def parse_capability_query(text: str, catalog: dict[str, Any]) -> dict[str, Any] | None:
+    normalized = " ".join(text.lower().split()).strip()
+    if not normalized:
+        return None
+    tokens = set(_help_tokenize(normalized))
+    has_intent = any(pattern.search(normalized) is not None for pattern in CAPABILITY_INTENT_PATTERNS)
+    commands_raw = catalog.get("commands", {})
+    if not isinstance(commands_raw, dict):
+        commands_raw = {}
+    command_hits: set[str] = set()
+    for name, row in commands_raw.items():
+        if not isinstance(row, dict):
+            continue
+        if name in tokens:
+            command_hits.add(name)
+        for alias in row.get("aliases", []):
+            if str(alias).strip().lower() in tokens:
+                command_hits.add(name)
+    domain_focus: str | None = None
+    domain_score = -1
+    for domain, terms in CAPABILITY_QUERY_DOMAIN_TERMS.items():
+        score = len(tokens.intersection(terms))
+        if score > domain_score:
+            domain_score = score
+            domain_focus = domain
+    if domain_score <= 0:
+        domain_focus = None
+
+    if not has_intent:
+        if command_hits:
+            has_intent = bool(re.search(r"\bhow\b|\buse\b|\bcommand\b|\bcmd\b|\bdo i\b", normalized))
+        elif domain_focus is not None:
+            has_intent = bool(re.search(r"\bhelp\b|\bcommands?\b|\bcapabilit(?:y|ies)\b|\bhow\b", normalized))
+    if not has_intent:
+        return None
+
+    return {
+        "query": normalized,
+        "tokens": tokens,
+        "domain_focus": domain_focus,
+        "command_hits": sorted(command_hits),
+    }
+
+
+def _capability_score_command(
+    entry: dict[str, Any],
+    query: dict[str, Any],
+) -> float:
+    score = 0.0
+    tokens: set[str] = query["tokens"]
+    query_text = str(query.get("query", ""))
+    domain_focus: str | None = query["domain_focus"]
+    command_hits: set[str] = set(query["command_hits"])
+    name = str(entry.get("name", "")).lower()
+    aliases = {str(item).lower() for item in entry.get("aliases", [])}
+    domain = str(entry.get("domain", "utility")).lower()
+    triggers = {str(item).lower() for item in entry.get("nl_triggers", [])}
+    summary_tokens = set(_help_tokenize(str(entry.get("summary", ""))))
+    entry_tokens = {name, *aliases, *triggers, domain, *summary_tokens}
+
+    if name in command_hits:
+        score += 8.0
+    elif aliases.intersection(command_hits):
+        score += 6.0
+    overlap = len(tokens.intersection(entry_tokens))
+    score += min(9.0, overlap * 0.9)
+    for trigger in triggers:
+        if " " in trigger and trigger and trigger in query_text:
+            score += 2.2
+    if domain_focus is not None:
+        if domain == domain_focus:
+            score += 3.5
+        else:
+            score -= 0.8
+    if bool(entry.get("hidden", False)):
+        score -= 1.5
+    return score
+
+
+def _capability_score_system(
+    entry: dict[str, Any],
+    query: dict[str, Any],
+) -> float:
+    score = 0.0
+    tokens: set[str] = query["tokens"]
+    query_text = str(query.get("query", ""))
+    domain_focus: str | None = query["domain_focus"]
+    domain = str(entry.get("domain", "utility")).lower()
+    summary_tokens = set(_help_tokenize(str(entry.get("summary", ""))))
+    triggers = {str(item).lower() for item in entry.get("nl_triggers", [])}
+    overlap = len(tokens.intersection({domain, *summary_tokens, *triggers}))
+    score += min(8.0, overlap * 1.0)
+    for trigger in triggers:
+        if " " in trigger and trigger and trigger in query_text:
+            score += 2.0
+    if domain_focus is not None:
+        if domain == domain_focus:
+            score += 3.0
+        else:
+            score -= 0.6
+    return score
+
+
+def build_capability_query_response(
+    query: dict[str, Any],
+    catalog: dict[str, Any],
+    *,
+    requester_is_mod: bool,
+) -> str:
+    commands_raw = catalog.get("commands", {})
+    if not isinstance(commands_raw, dict) or not commands_raw:
+        return (
+            "I couldn't load my capability catalog right now. "
+            f"Use `{PREFIX}help` for the full command list."
+        )
+    system_raw = catalog.get("system_capabilities", [])
+    if not isinstance(system_raw, list):
+        system_raw = []
+
+    scored_commands: list[tuple[float, dict[str, Any]]] = []
+    for row in commands_raw.values():
+        if not isinstance(row, dict):
+            continue
+        score = _capability_score_command(row, query)
+        if score > 0:
+            scored_commands.append((score, row))
+    scored_commands.sort(key=lambda item: item[0], reverse=True)
+
+    scored_system: list[tuple[float, dict[str, Any]]] = []
+    for row in system_raw:
+        if not isinstance(row, dict):
+            continue
+        score = _capability_score_system(row, query)
+        if score > 0:
+            scored_system.append((score, row))
+    scored_system.sort(key=lambda item: item[0], reverse=True)
+
+    domain_focus = query.get("domain_focus")
+    title = "Bell Capabilities"
+    if isinstance(domain_focus, str) and domain_focus:
+        title = f"Bell {domain_focus.title()} Capabilities"
+
+    lines = [f"**{title}**"]
+    if scored_system:
+        lines.append("")
+        for _, row in scored_system[:2]:
+            if bool(row.get("mod_only", False)) and not requester_is_mod:
+                lines.append("- Moderator-only capability available. Ask a moderator for command-level details.")
+                continue
+            summary = str(row.get("summary", "")).strip()
+            if summary:
+                lines.append(f"- {summary}")
+    lines.append("")
+    lines.append("**Recommended Commands**")
+
+    recommended = scored_commands[:8]
+    if not recommended:
+        lines.append(f"- Use `{PREFIX}help` to browse all commands.")
+        return "\n".join(lines)
+
+    visible_recommendations = 0
+    redacted_count = 0
+    for _, row in recommended:
+        name = str(row.get("name", "")).strip()
+        usage = str(row.get("usage", f"{PREFIX}{name}")).strip()
+        summary = str(row.get("summary", "")).strip()
+        mod_only = bool(row.get("mod_only", False))
+        if mod_only and not requester_is_mod:
+            if redacted_count >= 3:
+                continue
+            high_level = summary or "This action is available to moderators."
+            lines.append(f"- Moderator-only capability: {high_level}")
+            redacted_count += 1
+            visible_recommendations += 1
+            if visible_recommendations >= 6:
+                break
+            continue
+        line = f"- `{usage}`"
+        if summary:
+            line += f" - {summary}"
+        lines.append(line)
+        examples = row.get("examples", [])
+        if isinstance(examples, list) and examples:
+            example = str(examples[0]).strip()
+            if example and example != usage:
+                lines.append(f"  Example: `{example}`")
+        visible_recommendations += 1
+        if visible_recommendations >= 6:
+            break
+
+    command_hits = query.get("command_hits", [])
+    best_next: dict[str, Any] | None = None
+    if isinstance(command_hits, list) and command_hits:
+        hit_set = {str(item).strip().lower() for item in command_hits}
+        for _, row in scored_commands:
+            if str(row.get("name", "")).lower() in hit_set:
+                best_next = row
+                break
+    if best_next is None and scored_commands:
+        best_next = scored_commands[0][1]
+
+    if isinstance(best_next, dict):
+        mod_only = bool(best_next.get("mod_only", False))
+        lines.append("")
+        if mod_only and not requester_is_mod:
+            lines.append("Best next step: ask a moderator to run the relevant moderation command.")
+        else:
+            usage = str(best_next.get("usage", "")).strip()
+            if usage:
+                lines.append(f"Best next command: `{usage}`")
+            permission_hints = best_next.get("permission_hints", [])
+            if isinstance(permission_hints, list) and permission_hints:
+                lines.append(f"Permission note: `{', '.join(str(item) for item in permission_hints[:4])}`")
+
+    lines.append("")
+    lines.append(
+        "Ask a follow-up like: `bell how do I use this command step by step` or "
+        f"`bell show {domain_focus or 'moderation'} commands`."
+    )
+    return "\n".join(lines)
+
+
+async def send_capability_query_response(
+    target: discord.abc.Messageable,
+    text: str,
+    *,
+    requester_is_mod: bool,
+) -> bool:
+    try:
+        catalog = get_capabilities_catalog()
+    except Exception as error:
+        print(f"[CAPABILITY CATALOG ACCESS ERROR] {error}")
+        return False
+    commands_raw = catalog.get("commands", {})
+    if not isinstance(commands_raw, dict) or not commands_raw:
+        print("[CAPABILITY CATALOG RECOVERY] Missing or empty catalog, falling back to guide handler.")
+        return False
+    query = parse_capability_query(text, catalog)
+    if query is None:
+        return False
+    response = build_capability_query_response(
+        query,
+        catalog,
+        requester_is_mod=requester_is_mod,
+    )
+    await send_chunked(target, response)
+    return True
+
+
+BOT_GUIDE_KB: list[dict[str, object]] = [
+    {
+        "id": "bot-start",
+        "title": "Start Using Bell",
+        "keywords": (
+            "start",
+            "begin",
+            "how to use",
+            "commands",
+            "prefix",
+            "help",
+            "what can you do",
+        ),
+        "content": (
+            f"Bell uses prefix `{PREFIX}`.\n"
+            f"Run `{PREFIX}help` for the full command list.\n"
+            "You can also talk naturally by addressing Bell (mention Bell or start with `bell ...`).\n"
+            f"Examples: `{PREFIX}ping`, `bell show my avatar`, `bell how do I start the game`."
+        ),
+    },
+    {
+        "id": "moderation",
+        "title": "Moderation Features (Mod-Only)",
+        "keywords": (
+            "moderation",
+            "mod",
+            "timeout",
+            "mute",
+            "ban",
+            "kick",
+            "clear",
+            "purge",
+            "pb",
+            "pba",
+            "automod",
+        ),
+        "content": (
+            f"Cleanup: `{PREFIX}pb`, `{PREFIX}pba`, `{PREFIX}clear <amount>`, `{PREFIX}bulkdelete <#channel> <amount>`.\n"
+            f"Member actions: `{PREFIX}mute`, `{PREFIX}unmute`, `{PREFIX}kick`, `{PREFIX}ban`, `{PREFIX}unban`.\n"
+            f"Channel controls: `{PREFIX}lock`, `{PREFIX}unlock`, `{PREFIX}slowmode`.\n"
+            f"AutoMod controls: `{PREFIX}automod <on|off|status>` and conversational `bell turn on automod`."
+        ),
+    },
+    {
+        "id": "ai-chat",
+        "title": "AI Chat and Summaries",
+        "keywords": (
+            "ai",
+            "chatgpt",
+            "ask",
+            "summary",
+            "summarize",
+            "aisummary",
+            "aimodel",
+        ),
+        "content": (
+            f"Direct AI: `{PREFIX}ai <prompt>`.\n"
+            f"Channel summary: `{PREFIX}aisummary [count]` or natural `bell summarise 50 msgs`.\n"
+            f"Model checks: `{PREFIX}aimodel` and `{PREFIX}aimodels`.\n"
+            f"Reset memory: `{PREFIX}aireset`."
+        ),
+    },
+    {
+        "id": "psych-mode",
+        "title": "Psych Support Mode",
+        "keywords": (
+            "psych",
+            "psychologist",
+            "mental support",
+            "listen mode",
+            "counseling",
+        ),
+        "content": (
+            f"Use `{PREFIX}psych start` to begin a listen-first support session.\n"
+            f"Control with `{PREFIX}psych status`, `{PREFIX}psych reset`, `{PREFIX}psych stop`.\n"
+            "In active mode Bell waits for a pause, then replies with context-aware support."
+        ),
+    },
+    {
+        "id": "music",
+        "title": "Music Playback",
+        "keywords": (
+            "music",
+            "play",
+            "song",
+            "spotify",
+            "youtube",
+            "voice",
+            "queue",
+        ),
+        "content": (
+            f"Join with `{PREFIX}join`, play with `{PREFIX}play <query/link>`, leave with `{PREFIX}leave`.\n"
+            f"Playback controls: `{PREFIX}pause`, `{PREFIX}resume`, `{PREFIX}skip`, `{PREFIX}stop`, `{PREFIX}queue`.\n"
+            "Spotify links are resolved to playable sources. Host must have ffmpeg and PyNaCl installed."
+        ),
+    },
+    {
+        "id": "fun-social",
+        "title": "Fun Social Features",
+        "keywords": (
+            "roast",
+            "aicrush",
+            "analyze",
+            "vibe",
+            "vibecheck",
+            "serverlore",
+            "futureme",
+            "rizz",
+            "debate",
+            "argument",
+        ),
+        "content": (
+            f"Popular commands: `{PREFIX}roast`, `{PREFIX}aicrush`, `{PREFIX}analyze`, `{PREFIX}vibe`, `{PREFIX}vibecheck`.\n"
+            f"Other AI fun: `{PREFIX}serverlore`, `{PREFIX}futureme`, `{PREFIX}rizzcoach`, `{PREFIX}debate`, `{PREFIX}argument`.\n"
+            "Most fun commands also work conversationally when you address Bell."
+        ),
+    },
+    {
+        "id": "engagement",
+        "title": "Engagement and XP",
+        "keywords": (
+            "xp",
+            "rank",
+            "leaderboard",
+            "daily",
+            "quests",
+            "streak",
+            "event",
+            "catchup",
+            "serverinsights",
+        ),
+        "content": (
+            f"Progress commands: `{PREFIX}rank`, `{PREFIX}leaderboard`, `{PREFIX}streak`, `{PREFIX}daily`, `{PREFIX}quests`.\n"
+            f"Events: `{PREFIX}event start <trivia|hottake|caption>`, `{PREFIX}event status`, `{PREFIX}event stop`.\n"
+            f"Recap/insights: `{PREFIX}catchup [hours]`, `{PREFIX}serverinsights [hours]` (mods only)."
+        ),
+    },
+    {
+        "id": "business",
+        "title": "Business Economy Guidance",
+        "keywords": (
+            "business",
+            "economy",
+            "stocks",
+            "loan",
+            "tax",
+            "plot",
+            "portfolio",
+            "networth",
+            "bizhelp",
+        ),
+        "content": (
+            f"Use `{PREFIX}bizhelp <question>` for detailed economy walkthroughs.\n"
+            "Natural examples: `bell how do I start the game`, `bell explain loans`, `bell how taxes work`.\n"
+            f"Core economy commands include `{PREFIX}balance`, `{PREFIX}dailyclaim`, `{PREFIX}portfolio`, `{PREFIX}buy`, `{PREFIX}sell`."
+        ),
+    },
+]
+
+BOT_GUIDE_INTENT_TERMS: tuple[str, ...] = (
+    "help",
+    "guide",
+    "how",
+    "explain",
+    "tell",
+    "tutorial",
+    "walkthrough",
+    "setup",
+    "configure",
+    "start",
+    "begin",
+    "commands",
+    "command",
+    "use",
+    "tips",
+)
+
+BOT_GUIDE_DOMAIN_TERMS: tuple[str, ...] = (
+    "bell",
+    "bot",
+    "command",
+    "commands",
+    "moderation",
+    "automod",
+    "timeout",
+    "mute",
+    "clear",
+    "music",
+    "play",
+    "avatar",
+    "pfp",
+    "ai",
+    "summary",
+    "catchup",
+    "insights",
+    "psych",
+    "vibe",
+    "crush",
+    "roast",
+    "analyze",
+    "xp",
+    "rank",
+    "leaderboard",
+    "quest",
+    "business",
+    "economy",
+    "stock",
+    "loan",
+    "tax",
+    "property",
+    "plot",
+    "auction",
+    "trade",
+)
+
+
+def parse_general_guide_query(text: str) -> str | None:
+    normalized = " ".join(text.lower().split()).strip()
+    if not normalized:
+        return None
+
+    if re.match(
+        r"^(clear|mute|ban|kick|buy|sell|repay|takeloan|bid)\b\s+\d",
+        normalized,
+    ):
+        return None
+
+    if normalized in {"help", "commands", "what can you do", "show commands"}:
+        return normalized
+
+    asks_explanatory_what = bool(
+        re.search(r"^(what(?:'s| is| are)|tell me about)\b", normalized)
+    )
+    asks_personal_status = bool(
+        re.search(
+            r"\b(what(?:'s| is)?|show|check|get)\s+my\b.*\b(rank|leaderboard|streak|daily|quest|balance|portfolio|networth|debt|tax)\b",
+            normalized,
+        )
+    )
+    asks_question = normalized.endswith("?")
+    question_has_help_cue = bool(
+        re.search(r"\b(how|what|why|when|where|can|should)\b", normalized)
+    )
+    has_intent = any(term in normalized for term in BOT_GUIDE_INTENT_TERMS)
+    has_domain = any(term in normalized for term in BOT_GUIDE_DOMAIN_TERMS)
+    if asks_personal_status:
+        return None
+    if has_domain and (
+        has_intent or asks_explanatory_what or (asks_question and question_has_help_cue)
+    ):
+        return normalized
+    return None
+
+
+def retrieve_general_guide_chunks(query: str, *, limit: int = 3) -> list[dict[str, object]]:
+    normalized = " ".join(query.lower().split()).strip()
+    query_tokens = set(_help_tokenize(normalized))
+    ranked: list[tuple[float, dict[str, object]]] = []
+
+    for chunk in BOT_GUIDE_KB:
+        score = 0.0
+        keywords = chunk.get("keywords", ())
+        if isinstance(keywords, tuple):
+            for keyword in keywords:
+                kw = str(keyword).lower().strip()
+                if not kw:
+                    continue
+                if " " in kw:
+                    if kw in normalized:
+                        score += 4.2
+                elif kw in query_tokens or kw in normalized:
+                    score += 2.2
+        doc_text = f"{chunk.get('title', '')} {chunk.get('content', '')}"
+        overlap = len(query_tokens.intersection(_help_tokenize(doc_text)))
+        score += min(5.0, overlap * 0.7)
+
+        if str(chunk.get("id")) == "bot-start":
+            if {"start", "begin", "help", "commands"}.intersection(query_tokens):
+                score += 5.0
+        if str(chunk.get("id")) == "business":
+            if {"business", "economy", "stock", "loan", "tax", "plot"}.intersection(query_tokens):
+                score += 3.0
+
+        if score > 0:
+            ranked.append((score, chunk))
+
+    if not ranked:
+        default_chunks: list[dict[str, object]] = []
+        for wanted in ("bot-start", "business"):
+            found = next((entry for entry in BOT_GUIDE_KB if entry.get("id") == wanted), None)
+            if found is not None:
+                default_chunks.append(found)
+        return default_chunks[: max(1, limit)]
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    selected = [item[1] for item in ranked[: max(1, limit)]]
+    deduped: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
+    for entry in selected:
+        entry_id = str(entry.get("id", ""))
+        if entry_id in seen_ids:
+            continue
+        seen_ids.add(entry_id)
+        deduped.append(entry)
+    return deduped
+
+
+def build_general_guide_response(query: str, chunks: list[dict[str, object]]) -> str:
+    if not chunks:
+        return (
+            f"I could not map that request yet. Use `{PREFIX}help` for the full command list, "
+            f"or ask `bell how do I start the game`."
+        )
+
+    lines = [f"Guide for: `{query}`", ""]
+    for chunk in chunks:
+        title = str(chunk.get("title", "Guide")).strip()
+        content = str(chunk.get("content", "")).strip().replace("{PREFIX}", PREFIX)
+        lines.append(f"**{title}**")
+        lines.append(content)
+        lines.append("")
+    lines.append(
+        f"Ask follow-ups naturally, for example: `bell how does automod work`, "
+        f"`bell explain music setup`, `bell explain business loans`."
+    )
+    return "\n".join(lines).strip()
+
+
+async def send_general_guide_query_response(
+    target: discord.abc.Messageable, query: str
+) -> None:
+    chunks = retrieve_general_guide_chunks(query, limit=4)
+    response = build_general_guide_response(query, chunks)
+    await send_chunked(target, response)
 
 
 async def handle_active_argument_mode_turn(message: discord.Message) -> bool:
@@ -2128,6 +14409,7 @@ async def handle_active_argument_mode_turn(message: discord.Message) -> bool:
                 prompt,
                 max_tokens=ARGUMENT_MODE_REPLY_TOKENS,
                 temperature=0.82,
+                policy_key="argument",
             )
         except Exception as error:
             print(f"[ARGUMENT MODE TURN ERROR] {error}")
@@ -2152,11 +14434,341 @@ async def handle_active_argument_mode_turn(message: discord.Message) -> bool:
     return True
 
 
+async def handle_business_conversational_request(message: discord.Message, text: str) -> bool:
+    if message.guild is None or not isinstance(message.author, discord.Member):
+        return False
+    if not get_guild_business_enabled(message.guild.id):
+        return False
+
+    lowered = " ".join(text.lower().split())
+
+    async def _cooldown_ok() -> bool:
+        now = time.monotonic()
+        last = BUSINESS_LAST_COMMAND_TS.get(message.author.id, 0.0)
+        if now - last < BUSINESS_COMMAND_COOLDOWN_SECONDS:
+            await message.channel.send(
+                f"Slow down. Business cooldown: `{BUSINESS_COMMAND_COOLDOWN_SECONDS}`s.",
+                delete_after=4,
+            )
+            return False
+        BUSINESS_LAST_COMMAND_TS[message.author.id] = now
+        return True
+
+    if re.search(r"\b(show|my)\b.*\bportfolio\b", lowered) or lowered in {"portfolio", "show portfolio"}:
+        if not await _cooldown_ok():
+            return True
+        async with BUSINESS_STATE_LOCK:
+            user = _business_get_user(message.author.id)
+            lines = _business_portfolio_lines(user)
+            cash = float(user.get("cash", 0.0))
+            stock_value = _business_portfolio_value(user)
+            commodity_value = _business_asset_portfolio_value(user, "commodity")
+            crypto_value = _business_asset_portfolio_value(user, "crypto")
+            total_assets = stock_value + commodity_value + crypto_value
+        owner_label = f"{message.author.mention} ({message.author.display_name})"
+        if not lines:
+            await message.channel.send(
+                f"**Portfolio - {owner_label}**\n"
+                f"Cash: `{_business_money(cash)}`\nNo stock holdings yet."
+            )
+        else:
+            await message.channel.send(
+                f"**Portfolio - {owner_label}**\n"
+                f"Cash: `{_business_money(cash)}` | Asset value: `{_business_money(total_assets)}`\n"
+                + "\n".join(lines)
+            )
+        return True
+
+    if "market summary" in lowered or lowered in {"market", "show market"}:
+        if not await _cooldown_ok():
+            return True
+        async with BUSINESS_STATE_LOCK:
+            news = str(get_business_state()["market"].get("last_news", "No market update yet."))
+        await message.channel.send(f"ðŸ“° **Market Summary**\n{news}")
+        return True
+
+    if re.search(r"\b(balance|net worth|networth)\b", lowered):
+        if not await _cooldown_ok():
+            return True
+        async with BUSINESS_STATE_LOCK:
+            user = _business_get_user(message.author.id)
+            cash = float(user.get("cash", 0.0))
+            debt = _business_debt_total(user)
+            net = _business_networth(message.author.id)
+        await message.channel.send(
+            f"ðŸ’¼ Cash `{_business_money(cash)}` | Debt `{_business_money(debt)}` | Net worth `{_business_money(net)}`"
+        )
+        return True
+
+    trade_match = re.search(r"\b(buy|sell)\s+(\d{1,6})\s+([a-z0-9]{2,14})\b", lowered)
+    if trade_match:
+        if _business_is_user_frozen(message.author.id):
+            await message.channel.send("Your business account is frozen by moderators.")
+            return True
+        if not await _cooldown_ok():
+            return True
+        action = trade_match.group(1).lower()
+        qty = int(trade_match.group(2))
+        token = trade_match.group(3)
+        asset_type, symbol = _business_resolve_trade_asset(token)
+        if asset_type is None or symbol is None:
+            await message.channel.send(f"Unknown asset `{token}`.")
+            return True
+        if _business_market_paused(message.guild.id):
+            await message.channel.send("Market is currently paused by admins.")
+            return True
+        async with BUSINESS_STATE_LOCK:
+            if action == "buy":
+                ok, msg, total = _business_execute_asset_buy(
+                    user_id=message.author.id,
+                    guild_id=message.guild.id,
+                    asset_type=asset_type,
+                    symbol=symbol,
+                    qty=qty,
+                    source="conversational",
+                )
+                if not ok:
+                    await message.channel.send(msg)
+                    return True
+                await message.channel.send(f"✅ {msg} Total `{_business_money(total)}`.")
+            else:
+                ok, msg, net = _business_execute_asset_sell(
+                    user_id=message.author.id,
+                    guild_id=message.guild.id,
+                    asset_type=asset_type,
+                    symbol=symbol,
+                    qty=qty,
+                    source="conversational",
+                )
+                if not ok:
+                    await message.channel.send(msg)
+                    return True
+                await message.channel.send(f"✅ {msg} Net `{_business_money(net)}`.")
+        return True
+
+    if "show my taxes" in lowered or lowered in {"taxes", "show taxes"}:
+        if not await _cooldown_ok():
+            return True
+        async with BUSINESS_STATE_LOCK:
+            user = _business_get_user(message.author.id)
+            liability = float(user.get("tax_liability", 0.0) or 0.0)
+            paid_total = float(user.get("taxes_paid_total", 0.0) or 0.0)
+        await message.channel.send(
+            f"🧾 Tax liability: `{_business_money(liability)}` | Paid total: `{_business_money(paid_total)}`"
+        )
+        return True
+
+    file_tax_match = re.search(r"\bfile\s*tax(?:es)?(?:\s+(\d{1,9}))?\b", lowered)
+    if file_tax_match:
+        if _business_is_user_frozen(message.author.id):
+            await message.channel.send("Your business account is frozen by moderators.")
+            return True
+        if not await _cooldown_ok():
+            return True
+        requested = float(file_tax_match.group(1)) if file_tax_match.group(1) else None
+        async with BUSINESS_STATE_LOCK:
+            user = _business_get_user(message.author.id)
+            liability = float(user.get("tax_liability", 0.0) or 0.0)
+            cash = float(user.get("cash", 0.0) or 0.0)
+            if liability <= 0:
+                await message.channel.send("You have no outstanding tax liability.")
+                return True
+            amount = liability if requested is None else max(0.0, requested)
+            paid = min(amount, liability, cash)
+            if paid <= 0:
+                await message.channel.send("Not enough cash to file taxes.")
+                return True
+            user["cash"] = cash - paid
+            user["tax_liability"] = max(0.0, liability - paid)
+            user["taxes_paid_total"] = float(user.get("taxes_paid_total", 0.0)) + paid
+            _business_add_ledger_entry(
+                action="tax_filing",
+                user_id=message.author.id,
+                amount=-paid,
+                details={"source": "conversational", "remaining_liability": float(user.get("tax_liability", 0.0))},
+            )
+            _mark_business_dirty()
+            remaining_liability = float(user.get("tax_liability", 0.0))
+        await message.channel.send(
+            f"✅ Tax payment recorded: `{_business_money(paid)}` | Remaining: `{_business_money(remaining_liability)}`"
+        )
+        return True
+
+    if "show my credit" in lowered or lowered in {"credit", "show credit"}:
+        if not await _cooldown_ok():
+            return True
+        async with BUSINESS_STATE_LOCK:
+            user = _business_get_user(message.author.id)
+            score = int(user.get("credit_score", 650) or 650)
+            debt = _business_debt_total(user)
+            net = _business_networth(message.author.id)
+        await message.channel.send(
+            f"📊 Credit score: `{score}` | Debt: `{_business_money(debt)}` | Net worth: `{_business_money(net)}`"
+        )
+        return True
+
+    start_biz_match = re.search(r"\bstart\s+(?:a\s+)?business\s+([a-z]+)(?:\s+(.+))?$", lowered)
+    if start_biz_match:
+        if not BUSINESS_ENABLE_PRIVATE_BUSINESSES:
+            await message.channel.send("Private businesses are disabled.")
+            return True
+        if _business_is_user_frozen(message.author.id):
+            await message.channel.send("Your business account is frozen by moderators.")
+            return True
+        if not await _cooldown_ok():
+            return True
+        biz_type = start_biz_match.group(1).strip().lower()
+        explicit_name = start_biz_match.group(2).strip() if start_biz_match.group(2) else ""
+        biz_name = explicit_name[:60] if explicit_name else f"{message.author.display_name}'s {biz_type.title()}"
+        async with BUSINESS_STATE_LOCK:
+            state = get_business_state()
+            profiles = state.get("businesses", {}).get("profiles", {})
+            profile = profiles.get(biz_type) if isinstance(profiles, dict) else None
+            if not isinstance(profile, dict):
+                await message.channel.send("Unknown business type.")
+                return True
+            user = _business_get_user(message.author.id)
+            setup_cost = float(profile.get("expand_cost", 7000.0) or 7000.0) * 0.65
+            if float(user.get("cash", 0.0)) < setup_cost:
+                await message.channel.send(f"Insufficient cash. Need `{_business_money(setup_cost)}`.")
+                return True
+            biz_id = _business_next_id("biz")
+            state["businesses"]["registry"][biz_id] = {
+                "id": biz_id,
+                "owner_id": message.author.id,
+                "name": biz_name,
+                "type": biz_type,
+                "level": 1,
+                "employees": 0,
+                "status": "active",
+                "debt": 0.0,
+                "cash_reserve": 0.0,
+                "base_value": setup_cost * 1.15,
+                "stress_cycles": 0,
+                "created_ts": _business_now_ts(),
+            }
+            user["cash"] = float(user.get("cash", 0.0)) - setup_cost
+            ids = list(user.get("business_ids", []))
+            ids.append(biz_id)
+            user["business_ids"] = ids
+            _business_add_ledger_entry(
+                action="business_start",
+                user_id=message.author.id,
+                amount=-setup_cost,
+                details={"biz_id": biz_id, "source": "conversational"},
+            )
+            _mark_business_dirty()
+        await message.channel.send(
+            f"🏢 Business started: **{biz_name}** (`{biz_id}`) | Cost `{_business_money(setup_cost)}`"
+        )
+        return True
+
+    loan_match = re.search(r"\b(take loan|takeloan|loan)\s+(\d{2,9})\b", lowered)
+    if loan_match:
+        if _business_is_user_frozen(message.author.id):
+            await message.channel.send("Your business account is frozen by moderators.")
+            return True
+        if not await _cooldown_ok():
+            return True
+        amount = float(loan_match.group(2))
+        loan_rate = None
+        async with BUSINESS_STATE_LOCK:
+            ok, data = _business_issue_loan(message.author.id, amount)
+            if ok:
+                user = _business_get_user(message.author.id)
+                for loan in user.get("loans", []):
+                    if isinstance(loan, dict) and str(loan.get("id")) == str(data):
+                        loan_rate = float(loan.get("rate", BUSINESS_HOURLY_INTEREST_RATE) or BUSINESS_HOURLY_INTEREST_RATE)
+                        break
+        if not ok:
+            await message.channel.send(data)
+            return True
+        await message.channel.send(
+            f"🏦 Loan approved (`{data}`) for `{_business_money(amount)}` at "
+            f"`{(loan_rate if loan_rate is not None else BUSINESS_HOURLY_INTEREST_RATE) * 100:.3f}%` hourly."
+        )
+        return True
+
+    repay_match = re.search(r"\brepay\s+(\d{2,9})\b", lowered)
+    if repay_match:
+        if _business_is_user_frozen(message.author.id):
+            await message.channel.send("Your business account is frozen by moderators.")
+            return True
+        if not await _cooldown_ok():
+            return True
+        amount = float(repay_match.group(1))
+        async with BUSINESS_STATE_LOCK:
+            paid, closed = _business_repay_loans_from_cash(
+                message.author.id,
+                amount,
+                source="conversational",
+            )
+        if paid <= 0:
+            await message.channel.send("No repayment executed.")
+        else:
+            await message.channel.send(
+                f"âœ… Repaid `{_business_money(paid)}`. Closed loans: `{closed}`."
+            )
+        return True
+
+    return False
+
+
+def _normalize_addressed_command_text(text: str) -> tuple[str, str]:
+    normalized = " ".join(text.split()).strip()
+    if not normalized:
+        return "", ""
+    head, *rest = normalized.split(maxsplit=1)
+    cleaned_head = re.sub(r"^[^\w]+|[^\w]+$", "", head).strip().lower()
+    if not cleaned_head:
+        return "", ""
+    rebuilt = f"{cleaned_head} {rest[0]}".strip() if rest else cleaned_head
+    return cleaned_head, rebuilt
+
+
+async def try_invoke_addressed_command(message: discord.Message, addressed_text: str) -> bool:
+    command_name, normalized_text = _normalize_addressed_command_text(addressed_text)
+    if not command_name or not normalized_text:
+        return False
+
+    command = bot.all_commands.get(command_name)
+    if command is None:
+        return False
+
+    canonical = str(getattr(command, "name", command_name)).strip().lower()
+    root = str(getattr(command, "qualified_name", canonical)).split()[0].strip().lower()
+    if canonical in NATURAL_COMMAND_BLOCKLIST or root in NATURAL_COMMAND_BLOCKLIST:
+        await message.channel.send(
+            f"For safety, natural-language command mode does not allow `{canonical}`. "
+            f"Use `{PREFIX}{canonical}` explicitly."
+        )
+        return True
+
+    proxy = copy.copy(message)
+    proxy.content = f"{PREFIX}{normalized_text}"
+    ctx = await bot.get_context(proxy)
+    if ctx.command is None:
+        return False
+
+    invoked_name = str(getattr(ctx.command, "name", "")).strip().lower()
+    invoked_root = str(getattr(ctx.command, "qualified_name", invoked_name)).split()[0].strip().lower()
+    if invoked_name in NATURAL_COMMAND_BLOCKLIST or invoked_root in NATURAL_COMMAND_BLOCKLIST:
+        await message.channel.send(
+            f"For safety, natural-language command mode does not allow `{invoked_name}`. "
+            f"Use `{PREFIX}{invoked_name}` explicitly."
+        )
+        return True
+
+    await bot.invoke(ctx)
+    return True
+
+
 async def handle_conversational_request(message: discord.Message) -> bool:
     if message.guild is None or not isinstance(message.author, discord.Member):
         return False
 
-    text = strip_bot_address_prefix(message)
+    addressed_text = strip_bot_address_prefix(message)
+    text = addressed_text
     if not text and await is_reply_to_bot_message(message):
         text = message.content.strip()
     if not text:
@@ -2176,11 +14788,64 @@ async def handle_conversational_request(message: discord.Message) -> bool:
         )
         return True
 
+    if addressed_text:
+        try:
+            if await try_invoke_addressed_command(message, addressed_text):
+                return True
+        except Exception as error:
+            print(f"[NATURAL COMMAND ROUTER ERROR] {error}")
+
+    try:
+        if await maybe_handle_reply_translation_request(message, addressed_text):
+            return True
+    except Exception as error:
+        print(f"[REPLY TRANSLATION ROUTER ERROR] {error}")
+
+    business_help_query = parse_business_help_query(text)
+    if business_help_query is not None:
+        if not await enforce_fun_rate_limit_message(message):
+            return True
+        await send_business_help_query_response(message.channel, business_help_query)
+        return True
+
+    try:
+        if await handle_business_conversational_request(message, text):
+            return True
+    except Exception as error:
+        print(f"[BUSINESS CONVERSATIONAL ERROR] {error}")
+
+    capability_query_detected = False
+    try:
+        capability_catalog = get_capabilities_catalog()
+        capability_query_detected = parse_capability_query(text, capability_catalog) is not None
+    except Exception as error:
+        print(f"[CAPABILITY ROUTER ERROR] {error}")
+    if capability_query_detected:
+        if not await enforce_fun_rate_limit_message(message):
+            return True
+        if await send_capability_query_response(
+            message.channel,
+            text,
+            requester_is_mod=is_moderator(message.author),
+        ):
+            return True
+
+    general_guide_query = parse_general_guide_query(text)
+    if general_guide_query is not None:
+        if not await enforce_fun_rate_limit_message(message):
+            return True
+        await send_general_guide_query_response(message.channel, general_guide_query)
+        return True
+
     if re.search(r"\bcats?\b", lowered):
+        if not await enforce_fun_rate_limit_message(message):
+            return True
         await send_random_cat_image(message.channel)
         return True
 
     if re.search(r"\bfood\b", lowered):
+        if not await enforce_fun_rate_limit_message(message):
+            return True
         await send_random_indian_veg_food(message.channel)
         return True
 
@@ -2194,6 +14859,8 @@ async def handle_conversational_request(message: discord.Message) -> bool:
 
     argument_topic = parse_argument_topic(text)
     if argument_topic is not None:
+        if not await enforce_fun_rate_limit_message(message):
+            return True
         if not is_ai_configured():
             await message.channel.send(ai_setup_message())
             return True
@@ -2209,15 +14876,101 @@ async def handle_conversational_request(message: discord.Message) -> bool:
         start_argument_session(message.channel.id, message.author.id, argument_topic, side)
         await send_chunked(
             message.channel,
-            f"⚔️ **Argument Mode** ({side}) on **{argument_topic}**\n"
+            f"âš”ï¸ **Argument Mode** ({side}) on **{argument_topic}**\n"
             f"{opening}\n\n"
             "Reply with your points normally in this channel and I'll counter each one. "
             "Say `bell stop argument` to end.",
         )
         return True
 
+    catchup_hours = parse_catchup_hours_request(text)
+    if catchup_hours is not None:
+        if not await enforce_fun_rate_limit_message(message):
+            return True
+        await run_catchup_for_channel(message.channel, message.channel, catchup_hours)
+        return True
+
+    insights_hours = parse_serverinsights_hours_request(text)
+    if insights_hours is not None:
+        if not isinstance(message.author, discord.Member) or not is_moderator(message.author):
+            await message.channel.send("Only moderators can request server insights.")
+            return True
+        if not await enforce_fun_rate_limit_message(message):
+            return True
+        await run_server_insights(message.channel, message.guild, insights_hours)
+        return True
+
+    if NL_ENGAGEMENT_TRIGGERS:
+        missed_summary = (
+            re.search(r"\b(summarise|summarize|summary)\b", lowered) is not None
+            and re.search(r"\b(what i missed|missed)\b", lowered) is not None
+        )
+        if missed_summary:
+            if not await enforce_fun_rate_limit_message(message):
+                return True
+            await run_catchup_for_channel(message.channel, message.channel, 24)
+            return True
+
+        if "rank" in lowered:
+            snapshot = get_rank_snapshot(message.guild.id, message.author.id)
+            all_pos, all_total = get_user_rank_position(message.guild, message.author.id, "alltime")
+            await message.channel.send(
+                f"ðŸ… **Your Rank Snapshot**\n"
+                f"XP: `{snapshot['xp']}` (`{all_pos or '-'} / {all_total or '-'}`)\n"
+                f"Daily XP: `{snapshot['daily_xp']}` | Weekly: `{snapshot['weekly_points']}`\n"
+                f"Streak: `{snapshot['streak']}` (Best `{snapshot['best_streak']}`)"
+            )
+            return True
+
+        if "leaderboard" in lowered:
+            if not await enforce_fun_rate_limit_message(message):
+                return True
+            mode = "alltime"
+            if "daily" in lowered or "today" in lowered or "day" in lowered:
+                mode = "daily"
+            elif "weekly" in lowered or "week" in lowered:
+                mode = "weekly"
+            rows = build_leaderboard_rows(message.guild, normalize_leaderboard_mode(mode), limit=10)
+            if not rows:
+                await message.channel.send("Leaderboard is empty for now. Start chatting to earn XP.")
+                return True
+            title = {"daily": "Daily", "weekly": "Weekly", "alltime": "All-time"}[
+                normalize_leaderboard_mode(mode)
+            ]
+            lines = [
+                f"{idx}. **{name}** - `{score}`"
+                for idx, (_, name, score) in enumerate(rows, start=1)
+            ]
+            await message.channel.send(f"ðŸ“Š **{title} Leaderboard**\n" + "\n".join(lines))
+            return True
+
+        if re.search(r"\bstreak\b", lowered):
+            snapshot = get_rank_snapshot(message.guild.id, message.author.id)
+            await message.channel.send(
+                f"ðŸ”¥ **Your Streak**\n"
+                f"Current: `{snapshot['streak']}` day(s)\n"
+                f"Best: `{snapshot['best_streak']}` day(s)"
+            )
+            return True
+
+        if re.search(r"\b(daily|quests?)\b", lowered):
+            day_key, lines, completed_count, total_reward = get_user_quest_view(
+                message.guild.id, message.author.id
+            )
+            if not lines:
+                await message.channel.send("No quests configured right now.")
+                return True
+            await message.channel.send(
+                f"ðŸ—“ï¸ **Daily Quests ({day_key})**\n"
+                + "\n".join(lines)
+                + f"\n\nCompleted: `{completed_count}/{len(lines)}` | Potential reward: `{total_reward}` XP"
+            )
+            return True
+
     summary_count = parse_conversation_summary_count(text)
     if summary_count is not None:
+        if not await enforce_fun_rate_limit_message(message):
+            return True
         if not is_ai_configured():
             await message.channel.send(ai_setup_message())
             return True
@@ -2250,6 +15003,7 @@ async def handle_conversational_request(message: discord.Message) -> bool:
                     ai_messages,
                     max_tokens=AI_SUMMARY_MAX_TOKENS,
                     temperature=0.2,
+                    policy_key="summary",
                 )
             except Exception as error:
                 print(f"[CONVERSATIONAL SUMMARY ERROR] {error}")
@@ -2284,6 +15038,20 @@ async def handle_conversational_request(message: discord.Message) -> bool:
             channel=message.channel,
             details=f"New state: `{state_text}`",
         )
+        return True
+
+    if "modguard" in lowered:
+        if not is_moderator(message.author):
+            await message.channel.send("Only moderators can use moderation actions in conversational mode.")
+            return True
+        if re.search(r"\b(on|enable|enabled|start)\b", lowered) or "turn on" in lowered:
+            enabled = True
+        elif re.search(r"\b(off|disable|disabled|stop)\b", lowered) or "turn off" in lowered:
+            enabled = False
+        else:
+            enabled = not get_guild_modguard_enabled(message.guild.id)
+        set_guild_modguard_enabled(message.guild.id, enabled)
+        await message.channel.send(f"ModGuard is now **{'enabled' if enabled else 'disabled'}**.")
         return True
 
     if "ping" in lowered:
@@ -2441,6 +15209,7 @@ async def handle_conversational_request(message: discord.Message) -> bool:
                 ai_messages,
                 max_tokens=AI_MAX_TOKENS,
                 temperature=0.5,
+                policy_key="chat",
             )
         except Exception as error:
             print(f"[CONVERSATIONAL AI ERROR] {error}")
@@ -2990,6 +15759,8 @@ def should_try_fallback(status: int, raw_text: str, provider: str) -> bool:
 
 def friendly_ai_error(error: Exception | str) -> str:
     text = str(error).lower()
+    if "circuit open" in text:
+        return "AI is cooling down briefly after provider errors. Try again in under a minute."
     if "429" in text or "rate-limit" in text or "provider returned error" in text:
         return "AI providers are busy right now (rate-limited). Try again in 10-20 seconds."
     if "timeout" in text:
@@ -3026,7 +15797,14 @@ def current_ai_fallback_models() -> list[str]:
 
 
 async def request_openrouter_completion(
-    messages: list[dict[str, str]], *, max_tokens: int = 260, temperature: float = 0.6
+    messages: list[dict[str, str]],
+    *,
+    max_tokens: int = 260,
+    temperature: float = 0.6,
+    model_override: str | None = None,
+    fallback_models: list[str] | None = None,
+    response_format: dict[str, Any] | None = None,
+    include_fallback_notice: bool = True,
 ) -> str:
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is missing in .env")
@@ -3041,6 +15819,17 @@ async def request_openrouter_completion(
 
     timeout = aiohttp.ClientTimeout(total=AI_TIMEOUT_SECONDS)
     models_to_try = get_model_try_order("openrouter")
+    if model_override:
+        forced = model_override.strip()
+        if forced:
+            models_to_try = [forced, *[m for m in models_to_try if m != forced]]
+    if fallback_models:
+        ordered_fallbacks = [model.strip() for model in fallback_models if model.strip()]
+        models_to_try = [
+            *models_to_try[:1],
+            *[model for model in ordered_fallbacks if model not in models_to_try[:1]],
+            *[model for model in models_to_try[1:] if model not in ordered_fallbacks],
+        ]
     last_error = "OpenRouter request failed."
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for index, model_to_use in enumerate(models_to_try):
@@ -3050,6 +15839,8 @@ async def request_openrouter_completion(
                 "max_tokens": max_tokens,
                 "temperature": temperature,
             }
+            if response_format is not None:
+                payload["response_format"] = response_format
             try:
                 async with session.post(
                     OPENROUTER_API_URL, headers=headers, json=payload
@@ -3108,7 +15899,7 @@ async def request_openrouter_completion(
                     continue
                 raise RuntimeError(last_error)
 
-            if model_to_use != OPENROUTER_MODEL:
+            if include_fallback_notice and model_to_use != models_to_try[0]:
                 return f"[Fallback model: `{model_to_use}`]\n\n{content.strip()}"
             return content.strip()
 
@@ -3116,7 +15907,14 @@ async def request_openrouter_completion(
 
 
 async def request_groq_completion(
-    messages: list[dict[str, str]], *, max_tokens: int = 260, temperature: float = 0.6
+    messages: list[dict[str, str]],
+    *,
+    max_tokens: int = 260,
+    temperature: float = 0.6,
+    model_override: str | None = None,
+    fallback_models: list[str] | None = None,
+    response_format: dict[str, Any] | None = None,
+    include_fallback_notice: bool = True,
 ) -> str:
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is missing in .env")
@@ -3128,6 +15926,17 @@ async def request_groq_completion(
 
     timeout = aiohttp.ClientTimeout(total=AI_TIMEOUT_SECONDS)
     models_to_try = get_model_try_order("groq")
+    if model_override:
+        forced = model_override.strip()
+        if forced:
+            models_to_try = [forced, *[m for m in models_to_try if m != forced]]
+    if fallback_models:
+        ordered_fallbacks = [model.strip() for model in fallback_models if model.strip()]
+        models_to_try = [
+            *models_to_try[:1],
+            *[model for model in ordered_fallbacks if model not in models_to_try[:1]],
+            *[model for model in models_to_try[1:] if model not in ordered_fallbacks],
+        ]
     last_error = "Groq request failed."
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for index, model_to_use in enumerate(models_to_try):
@@ -3137,6 +15946,8 @@ async def request_groq_completion(
                 "max_tokens": max_tokens,
                 "temperature": temperature,
             }
+            if response_format is not None:
+                payload["response_format"] = response_format
             try:
                 async with session.post(GROQ_API_URL, headers=headers, json=payload) as response:
                     raw_text = await response.text()
@@ -3193,27 +16004,91 @@ async def request_groq_completion(
                     continue
                 raise RuntimeError(last_error)
 
-            if model_to_use != GROQ_MODEL:
+            if include_fallback_notice and model_to_use != models_to_try[0]:
                 return f"[Fallback model: `{model_to_use}`]\n\n{content.strip()}"
             return content.strip()
 
     raise RuntimeError(last_error)
 
 
-async def request_ai_completion(
-    messages: list[dict[str, str]], *, max_tokens: int = 260, temperature: float = 0.6
-) -> str:
-    if AI_PROVIDER == "groq":
-        return await request_groq_completion(
-            messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-    return await request_openrouter_completion(
-        messages,
-        max_tokens=max_tokens,
-        temperature=temperature,
+def should_retry_ai_error(error: Exception | str) -> bool:
+    text = str(error).lower()
+    markers = (
+        "429",
+        "rate",
+        "timeout",
+        "temporarily unavailable",
+        "provider returned error",
+        "network error",
+        "connection",
+        "503",
+        "502",
+        "504",
+        "busy",
+        "unavailable",
     )
+    return any(marker in text for marker in markers)
+
+
+async def request_ai_completion(
+    messages: list[dict[str, str]],
+    *,
+    max_tokens: int = 260,
+    temperature: float = 0.6,
+    policy_key: str = "general",
+    model_override: str | None = None,
+    fallback_models: list[str] | None = None,
+    response_format: dict[str, Any] | None = None,
+    include_fallback_notice: bool = True,
+) -> str:
+    normalized_key = (policy_key or "general").strip().lower()
+    circuit_until = AI_CIRCUIT_OPEN_UNTIL.get(normalized_key, 0.0)
+    now = time.monotonic()
+    if now < circuit_until:
+        wait_seconds = int(max(1.0, circuit_until - now))
+        raise RuntimeError(f"AI circuit open for `{normalized_key}` for {wait_seconds}s.")
+
+    async with AI_REQUEST_SEMAPHORE:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                if AI_PROVIDER == "groq":
+                    output = await request_groq_completion(
+                        messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        model_override=model_override,
+                        fallback_models=fallback_models,
+                        response_format=response_format,
+                        include_fallback_notice=include_fallback_notice,
+                    )
+                else:
+                    output = await request_openrouter_completion(
+                        messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        model_override=model_override,
+                        fallback_models=fallback_models,
+                        response_format=response_format,
+                        include_fallback_notice=include_fallback_notice,
+                    )
+                AI_CIRCUIT_OPEN_UNTIL.pop(normalized_key, None)
+                return output
+            except Exception as error:
+                last_error = error
+                can_retry = attempt == 0 and should_retry_ai_error(error)
+                if can_retry:
+                    await asyncio.sleep(AI_RETRY_BACKOFF_SECONDS)
+                    continue
+                if should_retry_ai_error(error):
+                    AI_CIRCUIT_OPEN_UNTIL[normalized_key] = (
+                        time.monotonic() + AI_CIRCUIT_BREAK_SECONDS
+                    )
+                raise
+
+        if last_error is not None:
+            raise last_error
+    raise RuntimeError("AI completion failed.")
 
 
 def append_ai_history(channel_id: int, user_prompt: str, assistant_reply: str) -> None:
@@ -3400,23 +16275,23 @@ def generate_vibecheck_local(user_messages: list[str], replies_received: list[st
         social_energy = "low-key presence"
 
     return (
-        "🔥 Vibe Check Result\n"
+        "ðŸ”¥ Vibe Check Result\n"
         f"Mood: {chaos_percent}% {mood_label}\n"
         f"Dominant trait: {dominant_trait}\n"
         f"Roast level: {roast_level}\n"
         f"Social energy: {social_energy}\n\n"
-        "⚠️ For fun only."
+        "âš ï¸ For fun only."
     )
 
 
 def normalize_vibecheck_output(raw: str) -> str:
     text = (raw or "").strip()
     if not text:
-        text = "🔥 Vibe Check Result"
+        text = "ðŸ”¥ Vibe Check Result"
     if "vibe check result" not in text.lower():
-        text = "🔥 Vibe Check Result\n" + text
+        text = "ðŸ”¥ Vibe Check Result\n" + text
     if "for fun only" not in text.lower():
-        text = text.rstrip() + "\n\n⚠️ For fun only."
+        text = text.rstrip() + "\n\nâš ï¸ For fun only."
     return text
 
 
@@ -3433,12 +16308,12 @@ async def generate_vibecheck_report(
         "2) No slurs, no hate, no protected-trait inferences.\n"
         "3) Keep each value concise (2-6 words).\n"
         "4) Return EXACTLY this format:\n"
-        "🔥 Vibe Check Result\n"
+        "ðŸ”¥ Vibe Check Result\n"
         "Mood: <0-100>% <descriptor>\n"
         "Dominant trait: <descriptor>\n"
         "Roast level: <descriptor>\n"
         "Social energy: <descriptor>\n"
-        "⚠️ For fun only.\n\n"
+        "âš ï¸ For fun only.\n\n"
         f"Target user: {member.display_name}\n"
         f"User messages analyzed: {len(user_messages)}\n"
         f"Replies considered: {len(replies_received)}\n\n"
@@ -3455,6 +16330,7 @@ async def generate_vibecheck_report(
         ai_messages,
         max_tokens=180,
         temperature=0.45,
+        policy_key="vibecheck",
     )
     return normalize_vibecheck_output(output)
 
@@ -3465,35 +16341,356 @@ async def collect_recent_channel_transcript(
     *,
     exclude_message_ids: set[int] | None = None,
 ) -> list[str]:
-    lines: list[str] = []
-    async for msg in channel.history(limit=limit):
-        if exclude_message_ids and msg.id in exclude_message_ids:
+    scan_limit = min(max(limit * 3, limit + 30), 2500)
+    entries = await get_channel_window_cached(
+        channel,
+        scan_limit=scan_limit,
+        cache_ttl_seconds=90,
+        include_attachment_marker=True,
+    )
+    lines = []
+    for entry in reversed(entries):
+        if exclude_message_ids and entry.message_id in exclude_message_ids:
             continue
-        if msg.author.bot:
-            continue
-        content = msg.clean_content.strip()
-        if not content:
-            continue
-        lines.append(f"{msg.author.display_name}: {content[:260]}")
+        lines.append(f"{entry.author_display_name}: {entry.content[:260]}")
+        if len(lines) >= limit:
+            break
     lines.reverse()
     return lines
+
+
+async def collect_channel_messages_since(
+    channel: discord.TextChannel,
+    cutoff,
+    *,
+    max_messages: int,
+) -> list[str]:
+    scan_limit = min(CATCHUP_SCAN_LIMIT, max(max_messages * 3, 200))
+    entries = await get_channel_window_cached(
+        channel,
+        after=cutoff,
+        scan_limit=scan_limit,
+        cache_ttl_seconds=CATCHUP_CACHE_SECONDS,
+        include_attachment_marker=True,
+    )
+    lines = [f"{entry.author_display_name}: {entry.content[:280]}" for entry in entries]
+    return lines[:max_messages]
+
+
+def generate_catchup_local_summary(transcript: list[str], hours: int) -> str:
+    if not transcript:
+        return "No meaningful messages found in that range."
+
+    authors = Counter()
+    words: list[str] = []
+    for line in transcript:
+        author, _, content = line.partition(": ")
+        if author:
+            authors[author] += 1
+        for token in WORD_PATTERN.findall(content.lower()):
+            cleaned = token.strip("'")
+            if len(cleaned) < 3 or cleaned in ROAST_STOP_WORDS:
+                continue
+            words.append(cleaned)
+
+    decision_markers = ("decide", "decided", "final", "approved", "ship", "confirmed", "agreed")
+    action_markers = ("todo", "to do", "next", "follow up", "need to", "please", "let's")
+    decision_lines = [
+        line.split(": ", 1)[1][:140]
+        for line in transcript
+        if any(marker in line.lower() for marker in decision_markers)
+    ][:3]
+    action_lines = [
+        line.split(": ", 1)[1][:140]
+        for line in transcript
+        if any(marker in line.lower() for marker in action_markers)
+    ][:4]
+    top_authors = ", ".join(f"{name} ({count})" for name, count in authors.most_common(3)) or "N/A"
+    top_topics = ", ".join(word for word, _ in Counter(words).most_common(6)) or "general chat"
+    reentry_prompt = (
+        f"Jump back in by asking about `{top_topics.split(',')[0]}` in one line."
+        if top_topics != "general chat"
+        else "Jump back in by asking for a quick status update."
+    )
+    return (
+        f"Key topics:\n- Message volume: `{len(transcript)}`\n"
+        f"- Most active people: {top_authors}\n"
+        f"- Main topics: {top_topics}\n"
+        "Decisions:\n"
+        + ("\n".join(f"- {line}" for line in decision_lines) if decision_lines else "- No clear decisions detected.")
+        + "\nAction items:\n"
+        + ("\n".join(f"- {line}" for line in action_lines) if action_lines else "- No clear action items detected.")
+        + "\nRe-entry prompt:\n"
+        + f"- {reentry_prompt}"
+    )
+
+
+async def build_catchup_summary(channel: discord.TextChannel, hours: int, transcript: list[str]) -> str:
+    clipped_lines = trim_context_lines(transcript, max_lines=190, max_chars=CATCHUP_MAX_PROMPT_CHARS)
+    prompt = (
+        "Summarize missed Discord chat in concise bullet points.\n"
+        "Output format exactly:\n"
+        "Key topics:\n"
+        "- 3-6 bullets\n"
+        "Decisions:\n"
+        "- bullets or `No clear decisions`\n"
+        "Action items:\n"
+        "- bullets or `No clear action items`\n"
+        "Re-entry prompt:\n"
+        "- one practical line to rejoin conversation\n"
+        "Keep it compact and practical.\n\n"
+        f"Window: last {hours} hours\n"
+        f"Channel: #{channel.name}\n"
+        "Transcript:\n"
+        + "\n".join(clipped_lines)
+    )
+    messages = [
+        {"role": "system", "content": AI_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    return await request_ai_completion(
+        messages,
+        max_tokens=AI_SUMMARY_MAX_TOKENS,
+        temperature=0.2,
+        policy_key="catchup",
+    )
+
+
+@dataclass
+class ServerInsightsSnapshot:
+    total_messages: int
+    scanned_messages: int
+    unique_users: int
+    channel_counts: dict[int, int]
+    day_counts: Counter[str]
+    hour_counts: Counter[int]
+
+
+async def collect_server_insights_snapshot(guild: discord.Guild, hours: int) -> ServerInsightsSnapshot:
+    cutoff = discord.utils.utcnow() - timedelta(hours=hours)
+    entries = await get_guild_window_cached(
+        guild,
+        full_history_scan=False,
+        scan_per_channel=INSIGHTS_SCAN_PER_CHANNEL,
+        max_history_messages=INSIGHTS_MAX_MESSAGES,
+        pause_every=220,
+        pause_seconds=0.05,
+        after=cutoff,
+        max_channels=INSIGHTS_MAX_CHANNELS,
+        cache_ttl_seconds=min(INSIGHTS_CACHE_SECONDS, 180),
+    )
+    if not entries:
+        return ServerInsightsSnapshot(0, 0, 0, {}, Counter(), Counter())
+
+    total_messages = len(entries)
+    users: set[int] = set()
+    channel_counts: dict[int, int] = defaultdict(int)
+    day_counts: Counter[str] = Counter()
+    hour_counts: Counter[int] = Counter()
+    for entry in entries:
+        users.add(entry.author_id)
+        channel_counts[entry.channel_id] += 1
+        created_dt = discord.utils.snowflake_time(entry.message_id)
+        day_counts[created_dt.strftime("%a")] += 1
+        hour_counts[created_dt.hour] += 1
+
+    return ServerInsightsSnapshot(
+        total_messages=total_messages,
+        scanned_messages=len(entries),
+        unique_users=len(users),
+        channel_counts=dict(channel_counts),
+        day_counts=day_counts,
+        hour_counts=hour_counts,
+    )
+
+
+def generate_server_insights_local(guild: discord.Guild, hours: int, snapshot: ServerInsightsSnapshot) -> str:
+    if snapshot.total_messages <= 0:
+        return "No user message activity was found in the selected window."
+
+    top_channels = sorted(snapshot.channel_counts.items(), key=lambda item: item[1], reverse=True)[:5]
+    channel_lines: list[str] = []
+    for channel_id, count in top_channels:
+        channel = guild.get_channel(channel_id)
+        if isinstance(channel, discord.TextChannel):
+            channel_lines.append(f"- {channel.mention}: `{count}` messages")
+
+    peak_hour = max(snapshot.hour_counts.items(), key=lambda item: item[1])[0] if snapshot.hour_counts else None
+    weekday_total = sum(snapshot.day_counts.get(day, 0) for day in ("Mon", "Tue", "Wed", "Thu", "Fri"))
+    weekend_total = snapshot.day_counts.get("Sat", 0) + snapshot.day_counts.get("Sun", 0)
+    weekend_ratio = (weekend_total / max(1, weekday_total + weekend_total)) * 100
+
+    suggestions = [
+        "- Run one lightweight poll in the top-active channel during peak hours (expected: +10-20% conversation starts).",
+        "- Start one recurring weekly prompt in a medium-activity channel (expected: stronger cross-channel retention).",
+        "- Highlight quality threads once daily instead of extra announcements (expected: better depth, less noise).",
+    ]
+    if weekend_ratio < 20:
+        suggestions[0] = "- Weekend engagement is low; schedule a Friday poll to seed weekend discussion (expected: higher weekend DAU)."
+
+    hour_text = f"`{peak_hour:02d}:00 UTC`" if peak_hour is not None else "N/A"
+    return (
+        f"Server insights for last `{hours}` hour(s):\n"
+        f"- Total user messages: `{snapshot.total_messages}`\n"
+        f"- Active users: `{snapshot.unique_users}`\n"
+        f"- Peak hour: {hour_text}\n"
+        f"- Weekend share: `{weekend_ratio:.0f}%`\n"
+        "Top channels:\n"
+        + ("\n".join(channel_lines) if channel_lines else "- N/A")
+        + "\nRecommendations:\n"
+        + "\n".join(suggestions)
+    )
+
+
+async def build_server_insights_report(guild: discord.Guild, hours: int, snapshot: ServerInsightsSnapshot) -> str:
+    top_channels = sorted(snapshot.channel_counts.items(), key=lambda item: item[1], reverse=True)[:8]
+    top_channel_lines: list[str] = []
+    for channel_id, count in top_channels:
+        channel = guild.get_channel(channel_id)
+        label = channel.name if isinstance(channel, discord.TextChannel) else str(channel_id)
+        top_channel_lines.append(f"- #{label}: {count}")
+
+    top_days = ", ".join(f"{day}:{count}" for day, count in snapshot.day_counts.most_common(7)) or "none"
+    top_hours = ", ".join(f"{hour:02d}:00={count}" for hour, count in snapshot.hour_counts.most_common(8)) or "none"
+    prompt = (
+        "You are a Discord community engagement analyst.\n"
+        "Generate concise, practical insights for moderators.\n"
+        "Do not suggest spammy tactics.\n"
+        "Output sections exactly:\n"
+        "Snapshot:\n"
+        "Trend diagnosis:\n"
+        "What is working:\n"
+        "Risks:\n"
+        "Recommendations:\n"
+        "Recommendations must be concrete, low-noise, and include expected effect.\n\n"
+        f"Server: {guild.name}\n"
+        f"Window hours: {hours}\n"
+        f"Total user messages: {snapshot.total_messages}\n"
+        f"Unique users: {snapshot.unique_users}\n"
+        f"Scanned messages: {snapshot.scanned_messages}\n"
+        f"Top channels:\n{chr(10).join(top_channel_lines) if top_channel_lines else '- none'}\n"
+        f"Day distribution: {top_days}\n"
+        f"Hour distribution: {top_hours}\n"
+    )
+    messages = [
+        {"role": "system", "content": AI_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+    return await request_ai_completion(
+        messages,
+        max_tokens=AI_SUMMARY_MAX_TOKENS,
+        temperature=0.25,
+        policy_key="serverinsights",
+    )
+
+
+async def run_catchup_for_channel(
+    target: discord.abc.Messageable | commands.Context,
+    channel: discord.TextChannel,
+    hours: int,
+) -> None:
+    cache_key = (channel.guild.id, channel.id, hours)
+    now = time.monotonic()
+    cached = CATCHUP_CACHE.get(cache_key)
+    if cached and now - cached[0] < CATCHUP_CACHE_SECONDS:
+        await send_chunked(target, cached[1] + "\n\n_(Cached for faster response)_")
+        return
+
+    lock = CATCHUP_LOCKS[cache_key]
+    async with lock:
+        latest_cached = CATCHUP_CACHE.get(cache_key)
+        if latest_cached and time.monotonic() - latest_cached[0] < CATCHUP_CACHE_SECONDS:
+            await send_chunked(target, latest_cached[1] + "\n\n_(Cached for faster response)_")
+            return
+
+        cutoff = discord.utils.utcnow() - timedelta(hours=hours)
+        transcript = await collect_channel_messages_since(
+            channel,
+            cutoff,
+            max_messages=CATCHUP_MAX_MESSAGES,
+        )
+        if not transcript:
+            await send_chunked(target, f"No recent user messages found in {channel.mention} for the last `{hours}` hour(s).")
+            return
+
+        try:
+            summary = await build_catchup_summary(channel, hours, transcript)
+        except Exception as error:
+            print(f"[CATCHUP ERROR] {error}")
+            summary = generate_catchup_local_summary(transcript, hours)
+
+        payload = (
+            f"â±ï¸ Catch-up for {channel.mention} (last `{hours}` hour(s), `{len(transcript)}` messages)\n"
+            f"{summary}"
+        )
+        CATCHUP_CACHE[cache_key] = (time.monotonic(), payload)
+    await send_chunked(target, payload)
+
+
+async def run_server_insights(
+    target: discord.abc.Messageable | commands.Context,
+    guild: discord.Guild,
+    hours: int,
+) -> None:
+    cache_key = (guild.id, hours)
+    now = time.monotonic()
+    cached = INSIGHTS_CACHE.get(cache_key)
+    if cached and now - cached[0] < INSIGHTS_CACHE_SECONDS:
+        await send_chunked(target, cached[1] + "\n\n_(Cached for faster response)_")
+        return
+
+    lock = INSIGHTS_LOCKS[cache_key]
+    async with lock:
+        latest_cached = INSIGHTS_CACHE.get(cache_key)
+        if latest_cached and time.monotonic() - latest_cached[0] < INSIGHTS_CACHE_SECONDS:
+            await send_chunked(target, latest_cached[1] + "\n\n_(Cached for faster response)_")
+            return
+
+        snapshot = await collect_server_insights_snapshot(guild, hours)
+        if snapshot.total_messages <= 0:
+            await send_chunked(
+                target,
+                f"No meaningful user activity found in **{guild.name}** for the last `{hours}` hour(s).",
+            )
+            return
+
+        try:
+            report = await build_server_insights_report(guild, hours, snapshot)
+        except Exception as error:
+            print(f"[SERVER INSIGHTS ERROR] {error}")
+            report = generate_server_insights_local(guild, hours, snapshot)
+
+        payload = (
+            f"ðŸ“Š Server insights for **{guild.name}** (last `{hours}` hour(s))\n"
+            f"{report}"
+        )
+        INSIGHTS_CACHE[cache_key] = (time.monotonic(), payload)
+    await send_chunked(target, payload)
 
 
 async def collect_recent_user_messages(
     channel: discord.TextChannel, user_id: int, limit: int
 ) -> list[str]:
-    messages: list[str] = []
-    async for msg in channel.history(limit=min(5000, max(limit * 8, limit + 120))):
-        if msg.author.bot or msg.author.id != user_id:
-            continue
-        content = msg.clean_content.strip()
-        if not content:
-            continue
-        messages.append(content[:260])
-        if len(messages) >= limit:
-            break
-    messages.reverse()
-    return messages
+    scan_limit = min(5000, max(limit * 8, limit + 120))
+    entries = await get_channel_window_cached(
+        channel,
+        scan_limit=scan_limit,
+        cache_ttl_seconds=90,
+        include_attachment_marker=True,
+    )
+    messages = [entry.content[:260] for entry in entries if entry.author_id == user_id]
+    return messages[-limit:]
+
+
+async def collect_recent_user_messages_guild(
+    guild: discord.Guild, user_id: int, limit: int
+) -> tuple[list[str], list[WindowMessage]]:
+    entries = await get_social_message_window(guild)
+    user_entries = [entry for entry in entries if entry.author_id == user_id]
+    if not user_entries:
+        return [], []
+    selected = user_entries[-limit:]
+    return [entry.content[:260] for entry in selected], selected
 
 
 def user_style_stats(user_messages: list[str]) -> dict[str, str]:
@@ -3529,19 +16726,74 @@ def user_style_stats(user_messages: list[str]) -> dict[str, str]:
     }
 
 
+def analyze_confidence_band(message_count: int, vocab_diversity: float) -> str:
+    if message_count >= 180 and vocab_diversity >= 0.42:
+        return "High"
+    if message_count >= 90 and vocab_diversity >= 0.3:
+        return "Medium"
+    return "Low"
+
+
+def derive_analyze_actionables(
+    guild: discord.Guild,
+    user_entries: list[WindowMessage],
+    top_words: list[str],
+    question_ratio: float,
+    exclaim_ratio: float,
+) -> tuple[str, str, str]:
+    channel_counts: Counter[int] = Counter(entry.channel_id for entry in user_entries)
+    hour_counts: Counter[int] = Counter(
+        discord.utils.snowflake_time(entry.message_id).hour for entry in user_entries
+    )
+    best_channel_fit = "General discussion"
+    if channel_counts:
+        top_channel_id, _ = channel_counts.most_common(1)[0]
+        top_channel = guild.get_channel(top_channel_id)
+        if isinstance(top_channel, discord.TextChannel):
+            best_channel_fit = f"#{top_channel.name}"
+
+    if question_ratio >= 0.3:
+        trigger = "Respond when they ask direct questions or ask for opinions."
+    elif exclaim_ratio >= 0.22:
+        trigger = "High-energy threads and hype moments get their best engagement."
+    else:
+        trigger = "They engage best on clear prompts and structured topics."
+
+    if hour_counts:
+        peak_hour = hour_counts.most_common(1)[0][0]
+        best_time = f"{peak_hour:02d}:00 UTC"
+    else:
+        best_time = "No clear pattern"
+
+    if top_words:
+        trigger += f" Top recurring keywords: {', '.join(top_words[:3])}."
+
+    return best_channel_fit, trigger, best_time
+
+
 async def request_fun_ai(
     user_prompt: str,
     *,
     max_tokens: int = 220,
     temperature: float = 0.8,
+    policy_key: str = "fun",
+    fun_mode: str = "spicy",
+    model_override: str | None = None,
+    fallback_models: list[str] | None = None,
 ) -> str:
+    mode_instruction = {
+        "wholesome": "Keep tone warm and playful with very low insult intensity.",
+        "balanced": "Keep tone witty with medium spice and avoid excessive aggression.",
+        "spicy": "Keep tone bold and spicy, but still safe and non-hateful.",
+    }.get(fun_mode, "Keep tone witty and playful.")
     messages = [
         {
             "role": "system",
             "content": (
                 "You are a witty Discord assistant for fun community features. "
                 "Keep outputs entertaining but avoid hate speech, slurs, sexual content about minors, "
-                "or severe harassment. Keep responses compact and readable."
+                "or severe harassment. Keep responses compact and readable. "
+                f"{mode_instruction}"
             ),
         },
         {"role": "user", "content": user_prompt},
@@ -3550,6 +16802,9 @@ async def request_fun_ai(
         messages,
         max_tokens=max_tokens,
         temperature=temperature,
+        policy_key=policy_key,
+        model_override=model_override,
+        fallback_models=fallback_models,
     )
 
 
@@ -3590,11 +16845,12 @@ async def generate_vibe_report(
         ai_messages,
         max_tokens=260,
         temperature=0.35,
+        policy_key="vibe",
     )
 
 
 async def delete_recent_user_messages(
-    channel: discord.TextChannel, user_id: int, limit: int
+    channel: discord.TextChannel | discord.Thread, user_id: int, limit: int
 ) -> int:
     deleted = 0
     async for msg in channel.history(limit=120):
@@ -3621,9 +16877,17 @@ async def apply_automod_action(
     deleted_count = await delete_recent_user_messages(
         message.channel, message.author.id, max(delete_count, 1)
     )
+    strike_count = 1
+    escalation_timeout = 0
+    review_flag = False
+    if get_guild_moderation_escalation_enabled(message.guild.id):
+        strike_count, escalation_timeout, review_flag = register_automod_strike(
+            message.guild.id, message.author.id
+        )
+    effective_timeout = max(timeout_minutes, escalation_timeout)
     timeout_applied = False
 
-    if timeout_minutes > 0 and isinstance(message.author, discord.Member):
+    if effective_timeout > 0 and isinstance(message.author, discord.Member):
         me = message.guild.me
         if me and me.guild_permissions.moderate_members:
             can_timeout = (
@@ -3633,39 +16897,353 @@ async def apply_automod_action(
             )
             if can_timeout:
                 try:
-                    until = discord.utils.utcnow() + timedelta(minutes=timeout_minutes)
+                    until = discord.utils.utcnow() + timedelta(minutes=effective_timeout)
                     await message.author.timeout(until, reason=f"AutoMod: {reason}")
                     timeout_applied = True
                 except discord.HTTPException:
                     timeout_applied = False
 
-    reply = f"{message.author.mention}, your message was removed: {reason}"
+    reply = f"{message.author.mention}, message removed (`strike {strike_count}`)."
     if timeout_applied:
-        reply += f" You were timed out for `{timeout_minutes}` minute(s)."
+        reply += f" Timeout: `{effective_timeout}`m."
+    if review_flag:
+        reply += " Flagged for moderator review."
 
     try:
-        await message.channel.send(reply, delete_after=8)
+        await message.channel.send(reply, delete_after=5)
     except discord.HTTPException:
         pass
 
-    details = f"Deleted messages: `{deleted_count}`."
+    details = f"Deleted messages: `{deleted_count}`. Strike: `{strike_count}`."
     if timeout_applied:
-        details += f" Timeout: `{timeout_minutes}` minute(s)."
+        details += f" Timeout: `{effective_timeout}` minute(s)."
+    if review_flag:
+        details += " Review flag: `yes`."
+    log_channel = message.channel
+    if isinstance(message.channel, discord.Thread) and isinstance(message.channel.parent, discord.TextChannel):
+        log_channel = message.channel.parent
     await send_mod_log(
         message.guild,
         action,
         target=message.author,
         moderator=bot.user,
         reason=reason,
-        channel=message.channel,
+        channel=log_channel,
         details=details,
     )
+    if isinstance(log_channel, discord.TextChannel):
+        await apply_channel_heat_event(
+            log_channel,
+            action=action,
+            moderator=bot.user,
+        )
+
+
+async def _send_automation_message(
+    guild: discord.Guild,
+    content: str,
+    *,
+    prefer_channel: discord.TextChannel | None = None,
+) -> bool:
+    if not get_guild_auto_loops_enabled(guild.id):
+        return False
+    if not can_send_automation_post(guild.id):
+        return False
+    me = guild.me
+    if me is None:
+        return False
+
+    channel: discord.TextChannel | None = None
+    if AUTO_LOOP_HUB_CHANNEL_ONLY:
+        channel = resolve_engagement_channel(guild)
+    else:
+        channel = prefer_channel or resolve_engagement_channel(guild)
+    if channel is None:
+        return False
+    perms = channel.permissions_for(me)
+    if not perms.view_channel or not perms.send_messages:
+        channel = resolve_engagement_channel(guild)
+        if channel is None:
+            return False
+        perms = channel.permissions_for(me)
+        if not perms.view_channel or not perms.send_messages:
+            return False
+    try:
+        await channel.send(content)
+        return True
+    except discord.HTTPException:
+        return False
+
+
+async def maybe_run_daily_engagement_posts(guild: discord.Guild) -> None:
+    if not ENGAGEMENT_ENABLED:
+        return
+    if not get_guild_auto_loops_enabled(guild.id):
+        return
+    guild_state = get_guild_engagement_state(guild.id)
+    automation = guild_state.setdefault("automation", {})
+    day_key = _guild_day_key(guild.id)
+
+    if str(automation.get("icebreaker_day", "")) != day_key:
+        icebreaker = random.choice(ICEBREAKER_PROMPTS)
+        posted = await _send_automation_message(
+            guild,
+            f"ðŸ§Š **Daily Icebreaker**\n{icebreaker}",
+        )
+        if posted:
+            automation["icebreaker_day"] = day_key
+            _mark_engagement_dirty()
+
+    if str(automation.get("challenge_day", "")) != day_key:
+        challenge = random.choice(DAILY_CHALLENGES)
+        posted = await _send_automation_message(
+            guild,
+            f"ðŸŽ¯ **Daily Challenge**\n{challenge}\nUse `&daily` to track quest progress.",
+        )
+        if posted:
+            automation["challenge_day"] = day_key
+            _mark_engagement_dirty()
+
+
+async def maybe_run_recap_nudge(guild: discord.Guild) -> None:
+    if not ENGAGEMENT_ENABLED:
+        return
+    if not get_guild_auto_loops_enabled(guild.id):
+        return
+    guild_state = get_guild_engagement_state(guild.id)
+    automation = guild_state.setdefault("automation", {})
+    now = time.monotonic()
+    last_recap = float(automation.get("last_recap_ts", 0.0))
+    if now - last_recap < 6 * 60 * 60:
+        return
+
+    cutoff = _utc_now() - timedelta(hours=6)
+    active_channel: discord.TextChannel | None = None
+    best_window: list[WindowMessage] = []
+    for channel in get_readable_text_channels(guild)[:18]:
+        window = await get_channel_window_cached(
+            channel,
+            after=cutoff,
+            scan_limit=180,
+            cache_ttl_seconds=90,
+        )
+        if len(window) > len(best_window):
+            best_window = window
+            active_channel = channel
+    if active_channel is None or len(best_window) < 8:
+        return
+    recap = _build_recap_from_window(best_window[-120:])
+    target = active_channel if not AUTO_LOOP_HUB_CHANNEL_ONLY else None
+    posted = await _send_automation_message(
+        guild,
+        f"ðŸ§¾ **Mini Catch-up** (`#{active_channel.name}`)\n{recap}\nUse `&catchup 24` for full summary.",
+        prefer_channel=target,
+    )
+    if posted:
+        automation["last_recap_ts"] = now
+        _mark_engagement_dirty()
+
+
+async def maybe_run_thread_reviver(guild: discord.Guild) -> None:
+    if AUTO_LOOP_HUB_CHANNEL_ONLY:
+        return
+    if not ENGAGEMENT_ENABLED:
+        return
+    if not get_guild_auto_loops_enabled(guild.id):
+        return
+    guild_state = get_guild_engagement_state(guild.id)
+    automation = guild_state.setdefault("automation", {})
+    now = time.monotonic()
+    last_revive = float(automation.get("last_thread_revive_ts", 0.0))
+    if now - last_revive < 10 * 60 * 60:
+        return
+
+    me = guild.me
+    if me is None:
+        return
+    candidate: discord.Thread | None = None
+    for thread in list(guild.threads)[:25]:
+        if thread.locked or thread.archived:
+            continue
+        if not thread.permissions_for(me).send_messages:
+            continue
+        if getattr(thread, "message_count", 0) < 8:
+            continue
+        last_id = getattr(thread, "last_message_id", None)
+        if last_id is None:
+            continue
+        last_ts = discord.utils.snowflake_time(last_id).replace(tzinfo=timezone.utc).timestamp()
+        if time.time() - last_ts < 6 * 60 * 60:
+            continue
+        candidate = thread
+        break
+    if candidate is None:
+        return
+
+    if not can_send_automation_post(guild.id):
+        return
+    try:
+        await candidate.send(random.choice(THREAD_REVIVE_PROMPTS))
+    except discord.HTTPException:
+        return
+    automation["last_thread_revive_ts"] = now
+    _mark_engagement_dirty()
+
+
+async def run_engagement_automation_tick() -> None:
+    for guild in bot.guilds:
+        try:
+            await maybe_run_daily_engagement_posts(guild)
+            await maybe_run_recap_nudge(guild)
+            await maybe_run_thread_reviver(guild)
+        except Exception as error:
+            print(f"[ENGAGEMENT LOOP ERROR] guild={guild.id} error={error}")
+
+
+async def finalize_expired_events() -> None:
+    now = time.monotonic()
+    expired: list[int] = []
+    for guild_id, session in EVENT_SESSIONS.items():
+        ends_at = float(session.get("ends_at", 0.0))
+        if ends_at > 0 and now >= ends_at:
+            expired.append(guild_id)
+    for guild_id in expired:
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            EVENT_SESSIONS.pop(guild_id, None)
+            continue
+        await finalize_event_session(guild, reason="timer")
+
+
+@tasks.loop(seconds=float(ENGAGEMENT_STATE_FLUSH_SECONDS))
+async def engagement_state_flush_loop() -> None:
+    await flush_engagement_state()
+
+
+@tasks.loop(seconds=float(AICRUSH_STATE_FLUSH_SECONDS))
+async def aicrush_state_flush_loop() -> None:
+    await flush_aicrush_state()
+
+
+@tasks.loop(seconds=float(ALTFINDER_STATE_FLUSH_SECONDS))
+async def altfinder_state_flush_loop() -> None:
+    await flush_altfinder_state()
+
+
+@tasks.loop(seconds=float(SOCIALINTEL_STATE_FLUSH_SECONDS))
+async def socialintel_state_flush_loop() -> None:
+    await flush_socialintel_state()
+
+
+@tasks.loop(minutes=1.0)
+async def engagement_tick_loop() -> None:
+    await finalize_expired_events()
+    await release_expired_heat_slowmodes()
+    await run_engagement_automation_tick()
+
+
+@tasks.loop(seconds=30.0)
+async def ai_mod_state_flush_loop() -> None:
+    await flush_ai_mod_state()
+
+
+@tasks.loop(minutes=1.0)
+async def ai_mod_tick_loop() -> None:
+    await run_ai_mod_tick()
+
+
+@tasks.loop(minutes=5.0)
+async def capabilities_catalog_refresh_loop() -> None:
+    try:
+        get_capabilities_catalog(force_refresh=False)
+    except Exception as error:
+        print(f"[CAPABILITY CATALOG REFRESH ERROR] {error}")
+
+
+@tasks.loop(seconds=float(BUSINESS_STATE_FLUSH_SECONDS))
+async def business_state_flush_loop() -> None:
+    await flush_business_state()
+
+
+@tasks.loop(minutes=1.0)
+async def business_tick_loop() -> None:
+    if not BUSINESS_ENABLED:
+        return
+    try:
+        await _business_expire_trades_and_auctions()
+        await run_business_hourly_tick()
+    except Exception as error:
+        print(f"[BUSINESS TICK ERROR] {error}")
+
+
+@tasks.loop(minutes=3.0)
+async def threadrevive_proactive_loop() -> None:
+    try:
+        await run_threadrevive_proactive_tick()
+    except Exception as error:
+        print(f"[THREADREVIVE PROACTIVE ERROR] {error}")
+
+
+@engagement_state_flush_loop.before_loop
+async def _before_engagement_flush_loop() -> None:
+    await bot.wait_until_ready()
+
+
+@altfinder_state_flush_loop.before_loop
+async def _before_altfinder_flush_loop() -> None:
+    await bot.wait_until_ready()
+
+
+@socialintel_state_flush_loop.before_loop
+async def _before_socialintel_flush_loop() -> None:
+    await bot.wait_until_ready()
+
+
+@engagement_tick_loop.before_loop
+async def _before_engagement_tick_loop() -> None:
+    await bot.wait_until_ready()
+
+
+@ai_mod_state_flush_loop.before_loop
+async def _before_ai_mod_state_flush_loop() -> None:
+    await bot.wait_until_ready()
+
+
+@ai_mod_tick_loop.before_loop
+async def _before_ai_mod_tick_loop() -> None:
+    await bot.wait_until_ready()
+
+
+@capabilities_catalog_refresh_loop.before_loop
+async def _before_capabilities_catalog_refresh_loop() -> None:
+    await bot.wait_until_ready()
+
+
+@business_state_flush_loop.before_loop
+async def _before_business_flush_loop() -> None:
+    await bot.wait_until_ready()
+
+
+@business_tick_loop.before_loop
+async def _before_business_tick_loop() -> None:
+    await bot.wait_until_ready()
+
+
+@threadrevive_proactive_loop.before_loop
+async def _before_threadrevive_proactive_loop() -> None:
+    await bot.wait_until_ready()
 
 
 @bot.event
 async def on_ready() -> None:
     global FFMPEG_EXECUTABLE, APP_COMMANDS_SYNCED
     count = reload_bad_words()
+    capabilities_catalog = rebuild_capabilities_catalog()
+    capabilities_count = 0
+    if isinstance(capabilities_catalog, dict):
+        commands_raw = capabilities_catalog.get("commands", {})
+        if isinstance(commands_raw, dict):
+            capabilities_count = len(commands_raw)
     FFMPEG_EXECUTABLE = resolve_ffmpeg_executable()
     if BOT_ACTIVITY_TEXT:
         try:
@@ -3679,6 +17257,7 @@ async def on_ready() -> None:
             pass
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"Bot is online. Loaded {count} blocked words.")
+    print(f"Capability catalog ready with {capabilities_count} commands.")
     if FFMPEG_EXECUTABLE:
         print(f"FFmpeg executable: {FFMPEG_EXECUTABLE}")
     else:
@@ -3690,6 +17269,89 @@ async def on_ready() -> None:
         except Exception as error:
             print(f"[SLASH SYNC ERROR] {error}")
         APP_COMMANDS_SYNCED = True
+    if ENGAGEMENT_ENABLED:
+        if not engagement_state_flush_loop.is_running():
+            engagement_state_flush_loop.start()
+        if not engagement_tick_loop.is_running():
+            engagement_tick_loop.start()
+    if not aicrush_state_flush_loop.is_running():
+        aicrush_state_flush_loop.start()
+    if not altfinder_state_flush_loop.is_running():
+        altfinder_state_flush_loop.start()
+    if not socialintel_state_flush_loop.is_running():
+        socialintel_state_flush_loop.start()
+    if not ai_mod_state_flush_loop.is_running():
+        ai_mod_state_flush_loop.start()
+    if not ai_mod_tick_loop.is_running():
+        ai_mod_tick_loop.start()
+    if not capabilities_catalog_refresh_loop.is_running():
+        capabilities_catalog_refresh_loop.start()
+    if DISCORD_ENABLE_PRESENCE_INTENT:
+        for guild in bot.guilds:
+            try:
+                refresh_altfinder_member_directory(guild)
+                refresh_socialintel_member_directory(guild)
+                for member in guild.members:
+                    if member.bot:
+                        continue
+                    guild_state = get_guild_altfinder_state(guild.id)
+                    row = _altfinder_get_user_row(guild_state, member.id)
+                    _altfinder_sync_presence_snapshot(row, member, increment_history=False)
+            except Exception as error:
+                print(f"[ALTFINDER PRESENCE BOOTSTRAP ERROR] guild={guild.id} error={error}")
+    if THREADREVIVE_PROACTIVE_ENABLED and not threadrevive_proactive_loop.is_running():
+        threadrevive_proactive_loop.start()
+    if BUSINESS_ENABLED:
+        if not business_state_flush_loop.is_running():
+            business_state_flush_loop.start()
+        if not business_tick_loop.is_running():
+            business_tick_loop.start()
+
+
+@bot.event
+async def on_member_join(member: discord.Member) -> None:
+    try:
+        await send_welcome_concierge(member)
+    except Exception as error:
+        print(f"[WELCOME CONCIERGE ERROR] {error}")
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member) -> None:
+    if after.bot:
+        return
+    try:
+        guild_state = get_guild_altfinder_state(after.guild.id)
+        row = _altfinder_get_user_row(guild_state, after.id)
+        _altfinder_apply_user_snapshot(row, after)
+        _altfinder_sync_presence_snapshot(row, after, increment_history=False)
+        _mark_altfinder_dirty()
+        _altfinder_invalidate_guild_cache(after.guild.id)
+    except Exception as error:
+        print(f"[ALTFINDER MEMBER UPDATE ERROR] guild={after.guild.id} user={after.id} error={error}")
+    try:
+        guild_state = get_guild_socialintel_state(after.guild.id)
+        row = _altfinder_get_user_row(guild_state, after.id)
+        _altfinder_apply_user_snapshot(row, after)
+        _altfinder_sync_presence_snapshot(row, after, increment_history=False)
+        _mark_socialintel_dirty()
+        _socialintel_invalidate_guild_cache(after.guild.id)
+    except Exception as error:
+        print(f"[SOCIALINTEL MEMBER UPDATE ERROR] guild={after.guild.id} user={after.id} error={error}")
+
+
+@bot.event
+async def on_presence_update(before: discord.Member, after: discord.Member) -> None:
+    if after.bot:
+        return
+    try:
+        record_altfinder_presence(after)
+    except Exception as error:
+        print(f"[ALTFINDER PRESENCE ERROR] guild={after.guild.id} user={after.id} error={error}")
+    try:
+        record_socialintel_presence(after)
+    except Exception as error:
+        print(f"[SOCIALINTEL PRESENCE ERROR] guild={after.guild.id} user={after.id} error={error}")
 
 
 @bot.event
@@ -3697,9 +17359,9 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
 
-    if not isinstance(message.channel, discord.TextChannel) or message.guild is None:
+    if message.guild is None:
         normalized_dm = " ".join(message.content.strip().lower().split())
-        if message.guild is None and normalized_dm == "remove timeout":
+        if normalized_dm == "remove timeout":
             removed, active_found, failed = await remove_timeout_from_dm_request(message.author.id)
             if removed > 0:
                 await message.channel.send(
@@ -3712,6 +17374,12 @@ async def on_message(message: discord.Message) -> None:
             else:
                 await message.channel.send("You do not currently have an active timeout.")
             return
+
+        try:
+            if await handle_welcome_concierge_dm(message):
+                return
+        except Exception as error:
+            print(f"[WELCOME DM HANDLER ERROR] {error}")
 
         if message.content.startswith(PREFIX):
             await bot.process_commands(message)
@@ -3743,6 +17411,10 @@ async def on_message(message: discord.Message) -> None:
         await bot.process_commands(message)
         return
 
+    if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
+        await bot.process_commands(message)
+        return
+
     if message.content.startswith(PREFIX):
         await bot.process_commands(message)
         return
@@ -3759,55 +17431,81 @@ async def on_message(message: discord.Message) -> None:
     except Exception as error:
         print(f"[ARGUMENT MODE ERROR] {error}")
 
+    member = message.author
+    is_mod_member = isinstance(member, discord.Member) and (
+        member.guild_permissions.administrator or member.guild_permissions.manage_messages
+    )
+    automod_enabled = get_guild_automod_enabled(message.guild.id)
+
+    if automod_enabled and not is_mod_member:
+        bad_word = matches_bad_word(message.content)
+        if bad_word:
+            await apply_automod_action(
+                message,
+                "AutoMod: Blocked Word",
+                f"Blocked word detected: `{bad_word}`.",
+            )
+            return
+
+        if BLOCK_LINKS and LINK_PATTERN.search(message.content):
+            await apply_automod_action(
+                message,
+                "AutoMod: Blocked Link",
+                "Links are not allowed in this server.",
+            )
+            return
+
+        key = (message.guild.id, message.author.id)
+        queue = SPAM_CACHE[key]
+        queue.append(message.created_at.timestamp())
+        if (
+            len(queue) >= SPAM_MSG_THRESHOLD
+            and queue[-1] - queue[-SPAM_MSG_THRESHOLD] <= SPAM_INTERVAL_SECONDS
+        ):
+            queue.clear()
+            await apply_automod_action(
+                message,
+                "AutoMod: Spam",
+                "Spam detected.",
+                timeout_minutes=SPAM_TIMEOUT_MINUTES,
+                delete_count=SPAM_MSG_THRESHOLD,
+            )
+            return
+
+    try:
+        if await maybe_run_ai_guard(message):
+            return
+    except Exception as error:
+        print(f"[AI GUARD PIPELINE ERROR] {error}")
+
+    try:
+        index_aicrush_message(message, backfill=False)
+    except Exception as error:
+        print(f"[AICRUSH INDEX ERROR] {error}")
+
+    try:
+        index_altfinder_message(message, backfill=False)
+    except Exception as error:
+        print(f"[ALTFINDER INDEX ERROR] {error}")
+    try:
+        index_socialintel_message(message, backfill=False)
+    except Exception as error:
+        print(f"[SOCIALINTEL INDEX ERROR] {error}")
+
     try:
         if await handle_conversational_request(message):
             return
     except Exception as error:
         print(f"[CONVERSATIONAL COMMAND ERROR] {error}")
 
-    if not get_guild_automod_enabled(message.guild.id):
-        await bot.process_commands(message)
-        return
-
-    member = message.author
-    if isinstance(member, discord.Member):
-        if member.guild_permissions.administrator or member.guild_permissions.manage_messages:
-            await bot.process_commands(message)
-            return
-
-    bad_word = matches_bad_word(message.content)
-    if bad_word:
-        await apply_automod_action(
-            message,
-            "AutoMod: Blocked Word",
-            f"Blocked word detected: `{bad_word}`.",
-        )
-        return
-
-    if BLOCK_LINKS and LINK_PATTERN.search(message.content):
-        await apply_automod_action(
-            message,
-            "AutoMod: Blocked Link",
-            "Links are not allowed in this server.",
-        )
-        return
-
-    key = (message.guild.id, message.author.id)
-    queue = SPAM_CACHE[key]
-    queue.append(message.created_at.timestamp())
-    if (
-        len(queue) >= SPAM_MSG_THRESHOLD
-        and queue[-1] - queue[-SPAM_MSG_THRESHOLD] <= SPAM_INTERVAL_SECONDS
-    ):
-        queue.clear()
-        await apply_automod_action(
-            message,
-            "AutoMod: Spam",
-            "Spam detected.",
-            timeout_minutes=SPAM_TIMEOUT_MINUTES,
-            delete_count=SPAM_MSG_THRESHOLD,
-        )
-        return
+    try:
+        await process_event_message(message)
+    except Exception as error:
+        print(f"[EVENT TRACK ERROR] {error}")
+    try:
+        apply_message_engagement_progress(message)
+    except Exception as error:
+        print(f"[ENGAGEMENT TRACK ERROR] {error}")
 
     await bot.process_commands(message)
 
@@ -3829,6 +17527,119 @@ async def on_message_delete(message: discord.Message) -> None:
         "content": content[:1800],
         "created_at": message.created_at.isoformat(),
     }
+
+
+def _ai_mod_case_brief(case: dict[str, Any]) -> str:
+    case_id = str(case.get("id", "CASE-?"))
+    category = _ai_mod_normalize_category(case.get("category")).replace("_", "/")
+    risk = _ai_mod_risk_score(case.get("risk_score"))
+    status = str(case.get("status", "open"))
+    action = str(case.get("action", "none"))
+    return f"`{case_id}` | `{category}` | risk `{risk:.2f}` | action `{action}` | status `{status}`"
+
+
+def _ai_mod_append_review_action(
+    *,
+    guild_id: int,
+    case_id: str,
+    reviewer_id: int,
+    action: str,
+    note: str,
+) -> None:
+    state = get_ai_mod_state()
+    review_actions = state.setdefault("review_actions", [])
+    if not isinstance(review_actions, list):
+        review_actions = []
+        state["review_actions"] = review_actions
+    review_actions.append(
+        {
+            "ts": time.time(),
+            "guild_id": int(guild_id),
+            "case_id": case_id,
+            "reviewer_id": int(reviewer_id),
+            "action": action,
+            "note": note[:220],
+        }
+    )
+    if len(review_actions) > 20000:
+        del review_actions[: (len(review_actions) - 20000)]
+    _ai_mod_increment_metric("overrides")
+    _mark_ai_mod_dirty()
+
+
+async def _ai_mod_apply_override_action(
+    ctx: commands.Context,
+    case: dict[str, Any],
+    action: str,
+) -> tuple[bool, str]:
+    guild = ctx.guild
+    if guild is None:
+        return False, "Guild context required."
+    author_id = int(case.get("author_id", 0) or 0)
+    member = guild.get_member(author_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(author_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            member = None
+    channel = guild.get_channel(int(case.get("channel_id", 0) or 0))
+    if action == "none":
+        if isinstance(member, discord.Member):
+            me = guild.me
+            if (
+                me is not None
+                and me.guild_permissions.moderate_members
+                and member != guild.owner
+                and member.top_role < me.top_role
+            ):
+                try:
+                    await member.timeout(None, reason=f"AI Guard override none {case.get('id')}")
+                    return True, "Timeout removed (if active)."
+                except discord.HTTPException:
+                    return True, "Override recorded (could not remove timeout due API error)."
+        return True, "Override recorded."
+    if action == "warn":
+        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+            try:
+                await channel.send(f"<@{author_id}> Moderator override: warning on case `{case.get('id')}`.")
+                return True, "Warn message sent."
+            except discord.HTTPException:
+                return False, "Could not send warning message."
+        return False, "Source channel not found for warning."
+    if action == "timeout":
+        if not isinstance(member, discord.Member):
+            return False, "Target member not found in guild."
+        me = guild.me
+        if (
+            me is None
+            or not me.guild_permissions.moderate_members
+            or member == guild.owner
+            or member.top_role >= me.top_role
+        ):
+            return False, "Missing permission/role hierarchy for timeout."
+        try:
+            until = discord.utils.utcnow() + timedelta(minutes=20)
+            await member.timeout(until, reason=f"AI Guard override timeout {case.get('id')}")
+            return True, "Timeout applied (20m)."
+        except discord.HTTPException:
+            return False, "Timeout API call failed."
+    if action == "ban":
+        if not isinstance(member, discord.Member):
+            return False, "Target member not found in guild."
+        me = guild.me
+        if (
+            me is None
+            or not me.guild_permissions.ban_members
+            or member == guild.owner
+            or member.top_role >= me.top_role
+        ):
+            return False, "Missing permission/role hierarchy for ban."
+        try:
+            await member.ban(reason=f"AI Guard override ban {case.get('id')}")
+            return True, "Ban applied."
+        except discord.HTTPException:
+            return False, "Ban API call failed."
+    return False, "Unsupported override action."
 
 
 @bot.command(name="help")
@@ -3854,7 +17665,22 @@ async def help_command(ctx: commands.Context) -> None:
         f"`{PREFIX}clearmodlog` - Disable mod-log for this server.\n"
         f"`{PREFIX}setgenderroles <@male_role> <@female_role>` - Set role mapping for `aicrush`.\n"
         f"`{PREFIX}genderroles` / `{PREFIX}cleargenderroles`\n"
+        f"`{PREFIX}welcomeconcierge <on|off|status>` - Control AI welcome onboarding DMs.\n"
+        f"`{PREFIX}setintrochannel [#channel]` / `{PREFIX}clearintrochannel`\n"
         f"`{PREFIX}automod <on|off|toggle|status>` - Enable or disable AutoMod in this server.\n"
+        f"`{PREFIX}aiguard <on|off|status>`, `{PREFIX}aiguard layer <0-5>`\n"
+        f"`{PREFIX}aiguard report <#channel|clear|status>` - Layer 1 periodic report destination.\n"
+        f"`{PREFIX}aimodmode <shadow|enforce>` - AI guard rollout mode.\n"
+        f"`{PREFIX}modqueue [open|mine|stats]`, `{PREFIX}case <case_id>`\n"
+        f"`{PREFIX}override <case_id> <none|warn|timeout|ban>`, `{PREFIX}appeal <case_id> <reason>`\n"
+        f"`{PREFIX}funmode <spicy|balanced|wholesome|status>`\n"
+        f"`{PREFIX}engagementlimits <on|off|status>`\n"
+        f"`{PREFIX}escalation <on|off|status>` - AutoMod warn/timeout ladder.\n"
+        f"`{PREFIX}modguard <on|off|status>` - Heat-based temporary slowmode protection.\n"
+        f"`{PREFIX}engagementhub <#channel|status|clear>`\n"
+        f"`{PREFIX}autoloops <on|off|status>` - Daily icebreaker/challenge and recap loops.\n"
+        f"`{PREFIX}questmode <on|off|status>` - Enable/disable daily quest tracking.\n"
+        f"`{PREFIX}engagementtz <IANA timezone>` - Example: `Asia/Kolkata`.\n"
         f"`{PREFIX}reloadbadwords` - Reload `data/bad_words.txt`.\n"
         f"`{PREFIX}say <message>` - Moderator echo command (deletes your command message).\n"
         "\n"
@@ -3866,7 +17692,31 @@ async def help_command(ctx: commands.Context) -> None:
         f"`{PREFIX}poll <question | option1 | option2 ...>` (2-10 options)\n"
         f"`{PREFIX}snipe` - Show last deleted non-bot message in this channel.\n"
         f"`{PREFIX}remind <minutes> <text>` - Sends you a DM reminder.\n"
+        f"`{PREFIX}guide [question]` - Natural-language guide for using Bell features.\n"
+        f"`{PREFIX}catchup [hours]` - Summarize what you missed in this channel.\n"
+        f"`{PREFIX}catchupchannel <#channel> [hours]` - Catch up another channel.\n"
         f"`{PREFIX}cat` / `{PREFIX}food` - Send random cat or Indian veg food image.\n"
+        f"`{PREFIX}rank`, `{PREFIX}leaderboard [daily|weekly|alltime]`\n"
+        f"`{PREFIX}streak`, `{PREFIX}daily`, `{PREFIX}quests`\n"
+        f"`{PREFIX}event start <trivia|hottake|caption>`, `{PREFIX}event stop`, `{PREFIX}event status`\n"
+        "\n"
+        "**Business Commands**\n"
+        f"`{PREFIX}balance`, `{PREFIX}dailyclaim`, `{PREFIX}portfolio`, `{PREFIX}networth`\n"
+        f"`{PREFIX}stocks`, `{PREFIX}market [symbol]`, `{PREFIX}buy <symbol> <qty>`, `{PREFIX}sell <symbol> <qty>`\n"
+        f"`{PREFIX}commodities`, `{PREFIX}buycommodity <symbol> <qty>`, `{PREFIX}sellcommodity <symbol> <qty>`\n"
+        f"`{PREFIX}crypto`, `{PREFIX}buycrypto <symbol> <qty>`, `{PREFIX}sellcrypto <symbol> <qty>`\n"
+        f"`{PREFIX}plots`, `{PREFIX}buyplot <plot_id>`, `{PREFIX}upgrade <property_id>`, `{PREFIX}properties`\n"
+        f"`{PREFIX}sellproperty <id> <price>`, `{PREFIX}buyproperty <id>`\n"
+        f"`{PREFIX}loan`, `{PREFIX}takeloan <amount>`, `{PREFIX}repay <amount>`, `{PREFIX}debts`\n"
+        f"`{PREFIX}startbiz <type> <name>`, `{PREFIX}mybiz`, `{PREFIX}bizhire <id> <count>`, `{PREFIX}bizfire <id> <count>`, `{PREFIX}bizexpand <id>`\n"
+        f"`{PREFIX}salary`, `{PREFIX}taxes`, `{PREFIX}filetax [amount]`, `{PREFIX}credit`, `{PREFIX}markethalt`, `{PREFIX}economystatus`\n"
+        f"`{PREFIX}trade <@user> <cash|stock|property> <asset> <amount> [request_cash]`\n"
+        f"`{PREFIX}trade_accept <id>`, `{PREFIX}trade_decline <id>`\n"
+        f"`{PREFIX}auction_start <stock|property> <id> <start_price> <duration_min> [qty]`, `{PREFIX}bid <id> <amount>`, `{PREFIX}auctions`\n"
+        f"`{PREFIX}bizleaderboard [cash|networth|income]`, `{PREFIX}bizprofile [@user]`, `{PREFIX}marketnews`, `{PREFIX}ledger [@user]`\n"
+        f"`{PREFIX}bizhelp [question]` - Game guide in natural language (example: `how do I start`).\n"
+        f"`{PREFIX}bizadmin <...>` - mod-only economy controls.\n"
+        "Conversational examples: `bell how do I start the game`, `bell explain loans`, `bell how taxes work`.\n"
         "\n"
         "**AI Commands**\n"
         f"`{PREFIX}ai <prompt>` - Ask AI with per-channel memory.\n"
@@ -3874,6 +17724,8 @@ async def help_command(ctx: commands.Context) -> None:
         f"`{PREFIX}aimodel` - Show active AI provider/model.\n"
         f"`{PREFIX}aimodels [limit]` - List currently available models from active provider.\n"
         f"`{PREFIX}aisummary [count]` - Summarize recent channel messages.\n"
+        f"`{PREFIX}translate [text|message link]` - Translate mixed-language chat into English, or reply to a message and run it.\n"
+        f"`{PREFIX}serverinsights [hours]` - Mod-only engagement insights across channels.\n"
         f"`{PREFIX}psych [start|stop|reset|status] [message]` - Listen-first psych mode (replies after pause, asks before advice).\n"
         f"`{PREFIX}roast <@user> [soft|friendly|brutal]` - Personal roast from server-wide chat patterns.\n"
         f"`{PREFIX}serverlore`, `{PREFIX}aicrush <@user>`, `{PREFIX}analyze <@user>`\n"
@@ -3967,6 +17819,52 @@ async def clear_gender_roles(ctx: commands.Context) -> None:
     await ctx.send("Cleared server-specific gender role mapping.")
 
 
+@bot.command(name="welcomeconcierge")
+@commands.has_permissions(manage_guild=True)
+async def welcome_concierge_command(ctx: commands.Context, mode: str | None = None) -> None:
+    current = get_guild_welcome_concierge_enabled(ctx.guild.id)
+    normalized = (mode or "").strip().lower()
+
+    if normalized in {"", "status", "state"}:
+        state_text = "enabled" if current else "disabled"
+        intro_channel = find_intro_channel_for_guild(ctx.guild)
+        intro_text = intro_channel.mention if intro_channel else "(not found)"
+        await ctx.send(
+            f"Welcome concierge is currently **{state_text}**.\n"
+            f"Intro/default channel: {intro_text}"
+        )
+        return
+
+    if normalized in {"on", "enable", "enabled", "true", "1"}:
+        new_state = True
+    elif normalized in {"off", "disable", "disabled", "false", "0"}:
+        new_state = False
+    else:
+        await ctx.send(f"Usage: `{PREFIX}welcomeconcierge <on|off|status>`")
+        return
+
+    set_guild_welcome_concierge_enabled(ctx.guild.id, new_state)
+    state_text = "enabled" if new_state else "disabled"
+    await ctx.send(f"Welcome concierge is now **{state_text}**.")
+
+
+@bot.command(name="setintrochannel")
+@commands.has_permissions(manage_guild=True)
+async def set_intro_channel(
+    ctx: commands.Context, channel: discord.TextChannel | None = None
+) -> None:
+    target = channel or ctx.channel
+    set_guild_intro_channel_id(ctx.guild.id, target.id)
+    await ctx.send(f"Intro channel set to {target.mention}.")
+
+
+@bot.command(name="clearintrochannel")
+@commands.has_permissions(manage_guild=True)
+async def clear_intro_channel(ctx: commands.Context) -> None:
+    set_guild_intro_channel_id(ctx.guild.id, None)
+    await ctx.send("Cleared custom intro channel. Bell will auto-detect intro/general channel.")
+
+
 @bot.command(name="reloadbadwords")
 @commands.has_permissions(manage_guild=True)
 async def reload_bad_words_command(ctx: commands.Context) -> None:
@@ -4010,6 +17908,509 @@ async def automod_command(ctx: commands.Context, mode: str | None = None) -> Non
     )
 
 
+@bot.hybrid_command(name="aiguard")
+@commands.guild_only()
+async def aiguard_command(
+    ctx: commands.Context,
+    action: str | None = None,
+    value: str | None = None,
+) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can manage AI Guard settings.")
+        return
+    normalized_action = (action or "status").strip().lower()
+    if normalized_action in {"status", "state", ""}:
+        enabled = get_guild_ai_guard_enabled(ctx.guild.id)
+        layer = get_guild_ai_guard_layer(ctx.guild.id)
+        configured_mode = get_guild_ai_guard_mode(ctx.guild.id)
+        effective_mode, forced_shadow = _ai_mod_effective_mode(ctx.guild.id)
+        strictness = get_guild_ai_guard_strictness(ctx.guild.id)
+        report_channel_id = get_guild_ai_guard_report_channel_id(ctx.guild.id)
+        report_channel = ctx.guild.get_channel(report_channel_id) if report_channel_id else None
+        await ctx.send(
+            "AI Guard status:\n"
+            f"- Enabled: `{'yes' if enabled else 'no'}`\n"
+            f"- Layer: `{layer}`\n"
+            f"- Mode: configured `{configured_mode}`, effective `{effective_mode}`"
+            + (" (shadow-forced)" if forced_shadow else "")
+            + "\n"
+            f"- Strictness: `{strictness}`\n"
+            f"- Report channel: {report_channel.mention if isinstance(report_channel, discord.TextChannel) else '(not set)'}"
+        )
+        return
+    if normalized_action in {"on", "enable", "enabled", "true", "1"}:
+        set_guild_ai_guard_enabled(ctx.guild.id, True)
+        if get_guild_ai_guard_layer(ctx.guild.id) == 0:
+            set_guild_ai_guard_layer(ctx.guild.id, 1)
+        await ctx.send("AI Guard enabled.")
+        return
+    if normalized_action in {"off", "disable", "disabled", "false", "0"}:
+        set_guild_ai_guard_enabled(ctx.guild.id, False)
+        await ctx.send("AI Guard disabled.")
+        return
+    if normalized_action == "layer":
+        if value is None:
+            await ctx.send(f"Usage: `{PREFIX}aiguard layer <0-5>`")
+            return
+        try:
+            layer = max(0, min(5, int(value)))
+        except ValueError:
+            await ctx.send(f"Layer must be `0` to `5`. Usage: `{PREFIX}aiguard layer <0-5>`")
+            return
+        set_guild_ai_guard_layer(ctx.guild.id, layer)
+        if layer == 0:
+            set_guild_ai_guard_enabled(ctx.guild.id, False)
+        else:
+            set_guild_ai_guard_enabled(ctx.guild.id, True)
+        await ctx.send(f"AI Guard layer set to `{layer}`.")
+        return
+    if normalized_action == "report":
+        raw = (value or "").strip().lower()
+        if raw in {"", "status", "state"}:
+            report_id = get_guild_ai_guard_report_channel_id(ctx.guild.id)
+            report_channel = ctx.guild.get_channel(report_id) if report_id else None
+            await ctx.send(
+                "AI Guard report channel: "
+                + (report_channel.mention if isinstance(report_channel, discord.TextChannel) else "(not set)")
+            )
+            return
+        if raw in {"clear", "none", "off"}:
+            set_guild_ai_guard_report_channel_id(ctx.guild.id, None)
+            await ctx.send("AI Guard report channel cleared.")
+            return
+        candidate: discord.TextChannel | None = None
+        if ctx.message is not None and ctx.message.channel_mentions:
+            mention = ctx.message.channel_mentions[0]
+            if isinstance(mention, discord.TextChannel):
+                candidate = mention
+        if candidate is None:
+            match = re.search(r"\d+", value or "")
+            if match:
+                maybe_channel = ctx.guild.get_channel(int(match.group(0)))
+                if isinstance(maybe_channel, discord.TextChannel):
+                    candidate = maybe_channel
+        if candidate is None:
+            cleaned = raw.replace("#", "").strip()
+            maybe_channel = discord.utils.find(lambda c: c.name.lower() == cleaned, ctx.guild.text_channels)
+            if isinstance(maybe_channel, discord.TextChannel):
+                candidate = maybe_channel
+        if candidate is None:
+            await ctx.send(f"Usage: `{PREFIX}aiguard report <#channel|clear|status>`")
+            return
+        set_guild_ai_guard_report_channel_id(ctx.guild.id, candidate.id)
+        await ctx.send(f"AI Guard report channel set to {candidate.mention}.")
+        return
+    await ctx.send(
+        f"Usage: `{PREFIX}aiguard <on|off|status>`, `{PREFIX}aiguard layer <0-5>`, "
+        f"or `{PREFIX}aiguard report <#channel|clear|status>`"
+    )
+
+
+@bot.hybrid_command(name="aimodmode")
+@commands.guild_only()
+async def aimodmode_command(ctx: commands.Context, mode: str) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can change AI Guard mode.")
+        return
+    normalized = (mode or "").strip().lower()
+    if normalized not in {"shadow", "enforce"}:
+        await ctx.send(f"Usage: `{PREFIX}aimodmode <shadow|enforce>`")
+        return
+    set_guild_ai_guard_mode(ctx.guild.id, normalized)
+    effective, forced = _ai_mod_effective_mode(ctx.guild.id)
+    forced_text = " (temporarily shadow-forced by rollout window)" if forced else ""
+    await ctx.send(f"AI Guard mode set to `{normalized}`. Effective mode: `{effective}`{forced_text}.")
+
+
+@bot.hybrid_command(name="modqueue")
+@commands.guild_only()
+async def modqueue_command(ctx: commands.Context, scope: str | None = None) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can access the AI moderation queue.")
+        return
+    normalized = (scope or "open").strip().lower()
+    state = get_ai_mod_state()
+    if normalized == "stats":
+        open_cases = _ai_mod_open_cases_for_guild(ctx.guild.id)
+        metrics = state.get("metrics", {}) if isinstance(state.get("metrics"), dict) else {}
+        await ctx.send(
+            "AI Guard queue stats:\n"
+            f"- Open cases: `{len(open_cases)}`\n"
+            f"- Evaluated: `{int(metrics.get('evaluated', 0) or 0)}`\n"
+            f"- Cases created: `{int(metrics.get('cases_created', 0) or 0)}`\n"
+            f"- Enforced: `{int(metrics.get('enforced', 0) or 0)}`\n"
+            f"- Overrides: `{int(metrics.get('overrides', 0) or 0)}`\n"
+            f"- Appeals: `{int(metrics.get('appeals', 0) or 0)}`"
+        )
+        return
+    if normalized == "mine":
+        review_actions = state.get("review_actions", [])
+        mine: list[dict[str, Any]] = []
+        if isinstance(review_actions, list):
+            for row in reversed(review_actions):
+                if not isinstance(row, dict):
+                    continue
+                if int(row.get("guild_id", 0) or 0) != ctx.guild.id:
+                    continue
+                if int(row.get("reviewer_id", 0) or 0) != ctx.author.id:
+                    continue
+                mine.append(row)
+                if len(mine) >= 10:
+                    break
+        if not mine:
+            await ctx.send("No review actions found for you in this guild.")
+            return
+        lines = [
+            f"`{row.get('case_id', 'CASE-?')}` -> `{row.get('action', 'none')}` ({int(max(0.0, time.time() - float(row.get('ts', 0.0) or 0.0)) // 60)}m ago)"
+            for row in mine
+        ]
+        await send_chunked(ctx, "Your recent queue actions:\n" + "\n".join(lines))
+        return
+    if normalized not in {"open", ""}:
+        await ctx.send(f"Usage: `{PREFIX}modqueue [open|mine|stats]`")
+        return
+    rows = _ai_mod_open_cases_for_guild(ctx.guild.id)[:12]
+    if not rows:
+        await ctx.send("No open AI Guard cases.")
+        return
+    lines = [_ai_mod_case_brief(row) for row in rows]
+    await send_chunked(ctx, "Open AI Guard cases:\n" + "\n".join(lines))
+
+
+@bot.hybrid_command(name="case")
+@commands.guild_only()
+async def case_command(ctx: commands.Context, case_id: str) -> None:
+    row = _ai_mod_case(case_id)
+    if row is None or int(row.get("guild_id", 0) or 0) != ctx.guild.id:
+        await ctx.send("Case not found in this guild.")
+        return
+    is_owner = int(row.get("author_id", 0) or 0) == ctx.author.id
+    is_mod = isinstance(ctx.author, discord.Member) and is_moderator(ctx.author)
+    if not is_owner and not is_mod:
+        await ctx.send("You can only view your own case unless you are a moderator.")
+        return
+    category = _ai_mod_normalize_category(row.get("category")).replace("_", "/")
+    risk = _ai_mod_risk_score(row.get("risk_score"))
+    confidence = str(row.get("confidence_band", "low"))
+    action = str(row.get("action", "none"))
+    applied = "+".join(str(item) for item in row.get("applied_actions", []) if str(item).strip()) or "none"
+    excerpt = str(row.get("message_excerpt", "")).strip()[:500] or "(no excerpt)"
+    rationale_tags = row.get("rationale_tags", [])
+    tag_text = ", ".join(str(tag) for tag in rationale_tags[:8]) if isinstance(rationale_tags, list) else "n/a"
+    appeal_ids = row.get("appeal_ids", [])
+    appeal_count = len(appeal_ids) if isinstance(appeal_ids, list) else 0
+    text = (
+        f"Case `{row.get('id', case_id.upper())}`\n"
+        f"- User: <@{int(row.get('author_id', 0) or 0)}>\n"
+        f"- Category: `{category}`\n"
+        f"- Risk: `{risk:.2f}` (`{confidence}`)\n"
+        f"- Suggested action: `{action}`\n"
+        f"- Applied action: `{applied}`\n"
+        f"- Status: `{row.get('status', 'open')}`\n"
+        f"- Appeals: `{appeal_count}`\n"
+        f"- Rationale: {tag_text}\n"
+        f"- Excerpt: {excerpt}\n"
+        f"- Jump: {row.get('message_jump_url', 'n/a')}"
+    )
+    await send_chunked(ctx, text)
+
+
+@bot.hybrid_command(name="override")
+@commands.guild_only()
+async def override_command(ctx: commands.Context, case_id: str, action: str) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can override AI Guard cases.")
+        return
+    normalized_action = (action or "").strip().lower()
+    if normalized_action not in {"none", "warn", "timeout", "ban"}:
+        await ctx.send(f"Usage: `{PREFIX}override <case_id> <none|warn|timeout|ban>`")
+        return
+    row = _ai_mod_case(case_id)
+    if row is None or int(row.get("guild_id", 0) or 0) != ctx.guild.id:
+        await ctx.send("Case not found in this guild.")
+        return
+    ok, detail = await _ai_mod_apply_override_action(ctx, row, normalized_action)
+    if not ok:
+        await ctx.send(f"Override failed: {detail}")
+        return
+    review = row.setdefault("review", {})
+    if not isinstance(review, dict):
+        review = {}
+        row["review"] = review
+    review["override_action"] = normalized_action
+    review["reviewer_id"] = int(ctx.author.id)
+    review["review_note"] = detail[:220]
+    review["updated_ts"] = time.time()
+    row["status"] = "overridden"
+    row["updated_ts"] = time.time()
+    _ai_mod_append_review_action(
+        guild_id=ctx.guild.id,
+        case_id=str(row.get("id", case_id.upper())),
+        reviewer_id=ctx.author.id,
+        action=normalized_action,
+        note=detail,
+    )
+    await send_mod_log(
+        ctx.guild,
+        "AI Guard Override",
+        moderator=ctx.author,
+        target=ctx.guild.get_member(int(row.get("author_id", 0) or 0)),
+        channel=ctx.channel,
+        reason=f"Case `{row.get('id')}` override `{normalized_action}`",
+        details=detail,
+    )
+    await ctx.send(f"Case `{row.get('id')}` override applied: `{normalized_action}`. {detail}")
+
+
+@bot.hybrid_command(name="appeal")
+@commands.guild_only()
+async def appeal_command(ctx: commands.Context, case_id: str, *, reason: str) -> None:
+    row = _ai_mod_case(case_id)
+    if row is None or int(row.get("guild_id", 0) or 0) != ctx.guild.id:
+        await ctx.send("Case not found in this guild.")
+        return
+    if not get_guild_ai_guard_appeals_enabled(ctx.guild.id):
+        await ctx.send("Appeals are disabled in this server.")
+        return
+    is_owner = int(row.get("author_id", 0) or 0) == ctx.author.id
+    is_mod = isinstance(ctx.author, discord.Member) and is_moderator(ctx.author)
+    if not is_owner and not is_mod:
+        await ctx.send("You can only appeal your own case.")
+        return
+    clean_reason = " ".join(reason.split()).strip()
+    if len(clean_reason) < 8:
+        await ctx.send("Appeal reason is too short. Add a little more context.")
+        return
+    appeal_id = _ai_mod_next_appeal_id()
+    state = get_ai_mod_state()
+    appeals = state.setdefault("appeals", {})
+    if not isinstance(appeals, dict):
+        appeals = {}
+        state["appeals"] = appeals
+    appeals[appeal_id] = {
+        "id": appeal_id,
+        "case_id": str(row.get("id", case_id.upper())),
+        "guild_id": int(ctx.guild.id),
+        "user_id": int(ctx.author.id),
+        "reason": clean_reason[:1200],
+        "created_ts": time.time(),
+        "status": "open",
+        "reviewer_id": None,
+        "decision_note": "",
+    }
+    appeal_ids = row.get("appeal_ids")
+    if not isinstance(appeal_ids, list):
+        appeal_ids = []
+        row["appeal_ids"] = appeal_ids
+    appeal_ids.append(appeal_id)
+    row["status"] = "appealed"
+    row["updated_ts"] = time.time()
+    _ai_mod_increment_metric("appeals")
+    _mark_ai_mod_dirty()
+    await send_mod_log(
+        ctx.guild,
+        "AI Guard Appeal Submitted",
+        moderator=ctx.author,
+        target=ctx.guild.get_member(int(row.get("author_id", 0) or 0)),
+        channel=ctx.channel,
+        reason=f"Case `{row.get('id')}`",
+        details=f"Appeal `{appeal_id}`: {clean_reason[:180]}",
+    )
+    await ctx.send(
+        f"Appeal submitted: `{appeal_id}` for case `{row.get('id')}`. "
+        "A moderator will review and decide."
+    )
+
+
+@bot.command(name="funmode")
+@commands.guild_only()
+async def funmode_command(ctx: commands.Context, mode: str | None = None) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can change fun mode.")
+        return
+    normalized = (mode or "").strip().lower()
+    if normalized in {"", "status", "state"}:
+        await ctx.send(f"Current fun mode: `{get_guild_fun_mode(ctx.guild.id)}`.")
+        return
+    if normalized not in {"spicy", "balanced", "wholesome"}:
+        await ctx.send(f"Usage: `{PREFIX}funmode <spicy|balanced|wholesome|status>`")
+        return
+    set_guild_fun_mode(ctx.guild.id, normalized)
+    await ctx.send(f"Fun mode set to `{normalized}`.")
+
+
+@bot.command(name="engagementlimits")
+@commands.guild_only()
+async def engagement_limits_command(ctx: commands.Context, mode: str | None = None) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can change engagement limits.")
+        return
+    normalized = (mode or "").strip().lower()
+    current = get_guild_engagement_limits_enabled(ctx.guild.id)
+    if normalized in {"", "status", "state"}:
+        await ctx.send(
+            f"Engagement limits are currently **{'enabled' if current else 'disabled'}**."
+        )
+        return
+    if normalized in {"on", "enable", "enabled", "true", "1"}:
+        new_state = True
+    elif normalized in {"off", "disable", "disabled", "false", "0"}:
+        new_state = False
+    else:
+        await ctx.send(f"Usage: `{PREFIX}engagementlimits <on|off|status>`")
+        return
+    set_guild_engagement_limits_enabled(ctx.guild.id, new_state)
+    await ctx.send(f"Engagement limits are now **{'enabled' if new_state else 'disabled'}**.")
+
+
+@bot.command(name="escalation")
+@commands.guild_only()
+async def moderation_escalation_command(ctx: commands.Context, mode: str | None = None) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can change moderation escalation.")
+        return
+    normalized = (mode or "").strip().lower()
+    current = get_guild_moderation_escalation_enabled(ctx.guild.id)
+    if normalized in {"", "status", "state"}:
+        await ctx.send(
+            f"Moderation escalation is currently **{'enabled' if current else 'disabled'}**."
+        )
+        return
+    if normalized in {"on", "enable", "enabled", "true", "1"}:
+        new_state = True
+    elif normalized in {"off", "disable", "disabled", "false", "0"}:
+        new_state = False
+    else:
+        await ctx.send(f"Usage: `{PREFIX}escalation <on|off|status>`")
+        return
+    set_guild_moderation_escalation_enabled(ctx.guild.id, new_state)
+    await ctx.send(f"Moderation escalation is now **{'enabled' if new_state else 'disabled'}**.")
+
+
+@bot.command(name="modguard")
+@commands.guild_only()
+async def modguard_command(ctx: commands.Context, mode: str | None = None) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can change ModGuard settings.")
+        return
+    normalized = (mode or "").strip().lower()
+    current = get_guild_modguard_enabled(ctx.guild.id)
+    if normalized in {"", "status", "state"}:
+        await ctx.send(f"ModGuard is currently **{'enabled' if current else 'disabled'}**.")
+        return
+    if normalized in {"on", "enable", "enabled", "true", "1"}:
+        new_state = True
+    elif normalized in {"off", "disable", "disabled", "false", "0"}:
+        new_state = False
+    else:
+        await ctx.send(f"Usage: `{PREFIX}modguard <on|off|status>`")
+        return
+    set_guild_modguard_enabled(ctx.guild.id, new_state)
+    await ctx.send(f"ModGuard is now **{'enabled' if new_state else 'disabled'}**.")
+
+
+@bot.command(name="engagementhub")
+@commands.guild_only()
+async def engagementhub_command(
+    ctx: commands.Context, *, target: str | None = None
+) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can set engagement hub channel.")
+        return
+
+    raw = (target or "").strip().lower()
+    if raw in {"", "status", "state"}:
+        configured_id = get_guild_engagement_hub_channel_id(ctx.guild.id)
+        configured = ctx.guild.get_channel(configured_id) if configured_id else None
+        if isinstance(configured, discord.TextChannel):
+            await ctx.send(f"Engagement hub: {configured.mention}")
+        else:
+            await ctx.send("Engagement hub is not set. Bell will fallback to first writable channel.")
+        return
+    if raw in {"clear", "none", "off"}:
+        set_guild_engagement_hub_channel_id(ctx.guild.id, None)
+        await ctx.send("Cleared engagement hub channel.")
+        return
+
+    candidate: discord.TextChannel | None = None
+    if ctx.message.channel_mentions:
+        mention = ctx.message.channel_mentions[0]
+        if isinstance(mention, discord.TextChannel):
+            candidate = mention
+    else:
+        cleaned = raw.replace("#", "").strip()
+        candidate = discord.utils.find(lambda c: c.name.lower() == cleaned, ctx.guild.text_channels)
+
+    if candidate is None:
+        await ctx.send(f"Usage: `{PREFIX}engagementhub <#channel|status|clear>`")
+        return
+    set_guild_engagement_hub_channel_id(ctx.guild.id, candidate.id)
+    await ctx.send(f"Engagement hub set to {candidate.mention}.")
+
+
+@bot.command(name="autoloops")
+@commands.guild_only()
+async def autoloops_command(ctx: commands.Context, mode: str | None = None) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can change automation loops.")
+        return
+    normalized = (mode or "").strip().lower()
+    current = get_guild_auto_loops_enabled(ctx.guild.id)
+    if normalized in {"", "status", "state"}:
+        await ctx.send(f"Automation loops are currently **{'enabled' if current else 'disabled'}**.")
+        return
+    if normalized in {"on", "enable", "enabled", "true", "1"}:
+        new_state = True
+    elif normalized in {"off", "disable", "disabled", "false", "0"}:
+        new_state = False
+    else:
+        await ctx.send(f"Usage: `{PREFIX}autoloops <on|off|status>`")
+        return
+    set_guild_auto_loops_enabled(ctx.guild.id, new_state)
+    await ctx.send(f"Automation loops are now **{'enabled' if new_state else 'disabled'}**.")
+
+
+@bot.command(name="questmode")
+@commands.guild_only()
+async def questmode_command(ctx: commands.Context, mode: str | None = None) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can change quest mode.")
+        return
+    normalized = (mode or "").strip().lower()
+    current = get_guild_quest_mode_enabled(ctx.guild.id)
+    if normalized in {"", "status", "state"}:
+        await ctx.send(f"Quest mode is currently **{'enabled' if current else 'disabled'}**.")
+        return
+    if normalized in {"on", "enable", "enabled", "true", "1"}:
+        new_state = True
+    elif normalized in {"off", "disable", "disabled", "false", "0"}:
+        new_state = False
+    else:
+        await ctx.send(f"Usage: `{PREFIX}questmode <on|off|status>`")
+        return
+    set_guild_quest_mode_enabled(ctx.guild.id, new_state)
+    await ctx.send(f"Quest mode is now **{'enabled' if new_state else 'disabled'}**.")
+
+
+@bot.command(name="engagementtz")
+@commands.guild_only()
+async def engagementtz_command(ctx: commands.Context, *, tz_name: str | None = None) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can change engagement timezone.")
+        return
+    value = (tz_name or "").strip()
+    if not value:
+        await ctx.send(f"Current engagement timezone: `{get_guild_engagement_timezone(ctx.guild.id)}`")
+        return
+    try:
+        ZoneInfo(value)
+    except ZoneInfoNotFoundError:
+        await ctx.send("Invalid timezone. Use IANA format, e.g. `Asia/Kolkata` or `UTC`.")
+        return
+    set_guild_engagement_timezone(ctx.guild.id, value)
+    await ctx.send(f"Engagement timezone set to `{value}`.")
+
+
 @bot.command(name="say")
 @commands.guild_only()
 async def say_command(ctx: commands.Context, *, text: str | None = None) -> None:
@@ -4032,11 +18433,15 @@ async def say_command(ctx: commands.Context, *, text: str | None = None) -> None
 
 @bot.command(name="cat", aliases=["cats"])
 async def cat_command(ctx: commands.Context) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
     await send_random_cat_image(ctx.channel)
 
 
 @bot.command(name="food")
 async def food_command(ctx: commands.Context) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
     await send_random_indian_veg_food(ctx.channel)
 
 
@@ -4173,6 +18578,2109 @@ async def remind_command(ctx: commands.Context, minutes: int, *, reminder_text: 
                 pass
 
     asyncio.create_task(fire_reminder())
+
+
+@bot.hybrid_command(name="rank")
+@commands.cooldown(3, 25, commands.BucketType.user)
+@commands.guild_only()
+async def rank_command(ctx: commands.Context, member: discord.Member | None = None) -> None:
+    target = member or ctx.author
+    snapshot = get_rank_snapshot(ctx.guild.id, target.id)
+    all_pos, all_total = get_user_rank_position(ctx.guild, target.id, "alltime")
+    day_pos, day_total = get_user_rank_position(ctx.guild, target.id, "daily")
+    week_pos, week_total = get_user_rank_position(ctx.guild, target.id, "weekly")
+
+    await ctx.send(
+        f"ðŸ… **Rank for {target.display_name}**\n"
+        f"XP: `{snapshot['xp']}` (Rank: `{all_pos or '-'} / {all_total or '-'}`)\n"
+        f"Daily XP: `{snapshot['daily_xp']}` (Rank: `{day_pos or '-'} / {day_total or '-'}`)\n"
+        f"Weekly points: `{snapshot['weekly_points']}` (Rank: `{week_pos or '-'} / {week_total or '-'}`)\n"
+        f"Streak: `{snapshot['streak']}` days (Best: `{snapshot['best_streak']}`)\n"
+        f"Event points: `{snapshot['event_points']}`"
+    )
+
+
+@bot.hybrid_command(name="leaderboard")
+@commands.cooldown(2, 30, commands.BucketType.user)
+@commands.guild_only()
+async def leaderboard_command(ctx: commands.Context, mode: str = "alltime") -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
+    normalized = normalize_leaderboard_mode(mode)
+    rows = build_leaderboard_rows(ctx.guild, normalized, limit=10)
+    if not rows:
+        await ctx.send("Leaderboard is empty for now. Start chatting to earn XP.")
+        return
+
+    title = {"daily": "Daily", "weekly": "Weekly", "alltime": "All-time"}[normalized]
+    lines = [
+        f"{idx}. **{name}** - `{score}`"
+        for idx, (_, name, score) in enumerate(rows, start=1)
+    ]
+    await ctx.send(
+        f"ðŸ“Š **{title} Leaderboard**\n" + "\n".join(lines)
+    )
+
+
+@bot.hybrid_command(name="streak")
+@commands.cooldown(3, 20, commands.BucketType.user)
+@commands.guild_only()
+async def streak_command(ctx: commands.Context, member: discord.Member | None = None) -> None:
+    target = member or ctx.author
+    snapshot = get_rank_snapshot(ctx.guild.id, target.id)
+    await ctx.send(
+        f"ðŸ”¥ **Streak for {target.display_name}**\n"
+        f"Current streak: `{snapshot['streak']}` day(s)\n"
+        f"Best streak: `{snapshot['best_streak']}` day(s)"
+    )
+
+
+@bot.hybrid_command(name="daily")
+@commands.cooldown(2, 20, commands.BucketType.user)
+@commands.guild_only()
+async def daily_command(ctx: commands.Context) -> None:
+    if not ENGAGEMENT_ENABLED:
+        await ctx.send("Engagement mode is currently disabled.")
+        return
+    if not get_guild_quest_mode_enabled(ctx.guild.id):
+        await ctx.send("Quest mode is disabled in this server.")
+        return
+    day_key, lines, completed_count, total_reward = get_user_quest_view(ctx.guild.id, ctx.author.id)
+    if not lines:
+        await ctx.send("No quests configured right now.")
+        return
+    await ctx.send(
+        f"ðŸ—“ï¸ **Daily Quests ({day_key})**\n"
+        + "\n".join(lines)
+        + f"\n\nCompleted: `{completed_count}/{len(lines)}` | Potential reward: `{total_reward}` XP"
+    )
+
+
+@bot.hybrid_command(name="quests")
+@commands.cooldown(2, 20, commands.BucketType.user)
+@commands.guild_only()
+async def quests_command(ctx: commands.Context) -> None:
+    if not ENGAGEMENT_ENABLED:
+        await ctx.send("Engagement mode is currently disabled.")
+        return
+    if not get_guild_quest_mode_enabled(ctx.guild.id):
+        await ctx.send("Quest mode is disabled in this server.")
+        return
+    day_key, lines, completed_count, total_reward = get_user_quest_view(ctx.guild.id, ctx.author.id)
+    if not lines:
+        await ctx.send("No quests configured right now.")
+        return
+    await ctx.send(
+        f"ðŸ—“ï¸ **Daily Quests ({day_key})**\n"
+        + "\n".join(lines)
+        + f"\n\nCompleted: `{completed_count}/{len(lines)}` | Potential reward: `{total_reward}` XP"
+    )
+
+
+@bot.hybrid_command(name="event")
+@commands.cooldown(2, 15, commands.BucketType.user)
+@commands.guild_only()
+async def event_command(
+    ctx: commands.Context,
+    action: str = "status",
+    event_type: str | None = None,
+) -> None:
+    normalized = action.strip().lower()
+    session = EVENT_SESSIONS.get(ctx.guild.id)
+
+    if normalized in {"status", "state"}:
+        if not session:
+            await ctx.send("No active event in this server.")
+            return
+        channel = ctx.guild.get_channel(int(session.get("channel_id", 0)))
+        ends_at = float(session.get("ends_at", 0.0))
+        remaining = max(0, int(ends_at - time.monotonic()))
+        await ctx.send(
+            f"Active event: `{session.get('type', 'unknown')}` in "
+            f"{channel.mention if isinstance(channel, discord.TextChannel) else 'unknown channel'}.\n"
+            f"Time remaining: `{remaining}s` | Participants: `{len(session.get('scores', {}))}`"
+        )
+        return
+
+    if normalized == "stop":
+        if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+            await ctx.send("Only moderators can stop events.")
+            return
+        if not session:
+            await ctx.send("No active event to stop.")
+            return
+        await finalize_event_session(ctx.guild, reason="manual stop")
+        return
+
+    if normalized != "start":
+        await ctx.send(f"Usage: `{PREFIX}event <start|stop|status> [trivia|hottake|caption]`")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can start events.")
+        return
+    if session:
+        await ctx.send("An event is already running. Use `&event stop` first.")
+        return
+
+    chosen_type = (event_type or "trivia").strip().lower()
+    if chosen_type not in {"trivia", "hottake", "caption"}:
+        await ctx.send("Event type must be one of: `trivia`, `hottake`, `caption`.")
+        return
+
+    prompt, answers = _event_type_prompt(chosen_type)
+    if is_ai_configured():
+        try:
+            prompt = await request_fun_ai(
+                (
+                    "Rewrite this Discord event prompt to be more engaging but still concise.\n"
+                    "Keep meaning same, <= 2 lines.\n"
+                    f"Event type: {chosen_type}\n"
+                    f"Prompt: {prompt}"
+                ),
+                max_tokens=80,
+                temperature=0.8,
+                policy_key="eventhost",
+                fun_mode=get_guild_fun_mode(ctx.guild.id),
+            )
+        except Exception as error:
+            print(f"[EVENT HOST AI ERROR] {error}")
+    EVENT_SESSIONS[ctx.guild.id] = {
+        "type": chosen_type,
+        "channel_id": ctx.channel.id,
+        "started_at": time.monotonic(),
+        "ends_at": time.monotonic() + (EVENT_DEFAULT_DURATION_MINUTES * 60),
+        "host_id": ctx.author.id,
+        "scores": {},
+        "answers": answers,
+    }
+    await ctx.send(
+        f"ðŸŽ® **Event started:** `{chosen_type}` (duration: `{EVENT_DEFAULT_DURATION_MINUTES}` min)\n"
+        f"{prompt}\n\n"
+        "Drop your replies in this channel to earn points."
+    )
+
+
+def _business_active_loans(user: dict[str, Any]) -> list[dict[str, Any]]:
+    loans = user.get("loans", [])
+    if not isinstance(loans, list):
+        return []
+    return [
+        loan
+        for loan in loans
+        if isinstance(loan, dict) and str(loan.get("status", "active")) not in {"paid", "closed"}
+    ]
+
+
+def _business_portfolio_lines(user: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    ranked: list[tuple[str, str, int, float, float]] = []
+    for asset_type, label in (("stock", "STK"), ("commodity", "CMD"), ("crypto", "CRY")):
+        field = _business_holding_field(asset_type)
+        if field is None:
+            continue
+        portfolio = user.get(field, {})
+        if not isinstance(portfolio, dict):
+            continue
+        for symbol, holding in portfolio.items():
+            if not isinstance(holding, dict):
+                continue
+            qty = int(holding.get("qty", 0))
+            avg = float(holding.get("avg_cost", 0.0))
+            if qty <= 0:
+                continue
+            asset = _business_get_asset(asset_type, str(symbol))
+            if asset is None:
+                continue
+            price = float(asset.get("price", 0.0))
+            value = qty * price
+            pnl = (price - avg) * qty
+            ranked.append((label, str(symbol), qty, value, pnl))
+    ranked.sort(key=lambda row: row[3], reverse=True)
+    for label, symbol, qty, value, pnl in ranked[:16]:
+        lines.append(
+            f"`{label}` `{symbol}` x `{qty}` | Value: `{_business_money(value)}` | P/L: `{pnl:+,.0f}`"
+        )
+    return lines
+
+
+@bot.hybrid_command(name="balance")
+@commands.cooldown(3, 12, commands.BucketType.user)
+@commands.guild_only()
+async def business_balance_command(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx):
+        return
+    async with BUSINESS_STATE_LOCK:
+        user = _business_get_user(ctx.author.id)
+        cash = float(user.get("cash", 0.0))
+        debt = _business_debt_total(user)
+        net = _business_networth(ctx.author.id)
+        tax_liability = float(user.get("tax_liability", 0.0) or 0.0)
+        credit_score = int(user.get("credit_score", 650) or 650)
+        frozen = _business_is_user_frozen(ctx.author.id)
+    tip = await _business_get_personalized_tip(
+        ctx.guild.id,
+        ctx.author.id,
+        context="balance_overview",
+    )
+    await ctx.send(
+        f"ðŸ’¼ **Business Balance - {ctx.author.display_name}**\n"
+        f"Cash: `{_business_money(cash)}`\n"
+        f"Debt: `{_business_money(debt)}`\n"
+        f"Net worth: `{_business_money(net)}`\n"
+        f"Tax liability: `{_business_money(tax_liability)}` | Credit: `{credit_score}`\n"
+        f"Status: `{'frozen' if frozen else 'active'}`\n"
+        f"{tip}"
+    )
+
+
+@bot.hybrid_command(name="dailyclaim")
+@commands.cooldown(2, 8, commands.BucketType.user)
+@commands.guild_only()
+async def business_dailyclaim_command(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    async with BUSINESS_STATE_LOCK:
+        success, amount, streak = _business_take_daily_claim(ctx.author.id, ctx.guild.id)
+    if not success:
+        await ctx.send("You already claimed today. Come back after UTC reset.")
+        return
+    tip = await _business_get_personalized_tip(
+        ctx.guild.id,
+        ctx.author.id,
+        context="daily_claim",
+    )
+    await ctx.send(
+        f"âœ… Daily claim received: `{_business_money(amount)}` cash.\n"
+        f"Current claim streak: `{streak}` day(s).\n"
+        f"{tip}"
+    )
+
+
+@bot.hybrid_command(name="portfolio")
+@commands.cooldown(3, 12, commands.BucketType.user)
+@commands.guild_only()
+async def business_portfolio_command(
+    ctx: commands.Context, member: discord.Member | None = None
+) -> None:
+    if not await _business_require_access(ctx, check_cooldown=True):
+        return
+    target = member or ctx.author
+    async with BUSINESS_STATE_LOCK:
+        user = _business_get_user(target.id)
+        cash = float(user.get("cash", 0.0))
+        lines = _business_portfolio_lines(user)
+        stock_value = _business_portfolio_value(user)
+        commodity_value = _business_asset_portfolio_value(user, "commodity")
+        crypto_value = _business_asset_portfolio_value(user, "crypto")
+        total_assets = stock_value + commodity_value + crypto_value
+    owner_label = f"{target.mention} ({target.display_name})"
+    if not lines:
+        await ctx.send(
+            f"**Portfolio - {owner_label}**\n"
+            f"Cash: `{_business_money(cash)}`\n"
+            "No stock holdings yet."
+        )
+        return
+    await ctx.send(
+        f"**Portfolio - {owner_label}**\n"
+        f"Cash: `{_business_money(cash)}` | Asset value: `{_business_money(total_assets)}`\n"
+        + "\n".join(lines)
+    )
+
+
+@bot.hybrid_command(name="networth")
+@commands.cooldown(3, 12, commands.BucketType.user)
+@commands.guild_only()
+async def business_networth_command(
+    ctx: commands.Context, member: discord.Member | None = None
+) -> None:
+    if not await _business_require_access(ctx):
+        return
+    target = member or ctx.author
+    async with BUSINESS_STATE_LOCK:
+        user = _business_get_user(target.id)
+        cash = float(user.get("cash", 0.0))
+        stocks = _business_portfolio_value(user)
+        commodities = _business_asset_portfolio_value(user, "commodity")
+        crypto = _business_asset_portfolio_value(user, "crypto")
+        props = _business_property_value(user)
+        biz_value = _business_business_equity_value(user)
+        debt = _business_debt_total(user)
+        net = _business_networth(target.id)
+    await ctx.send(
+        f"🏦 **Net Worth - {target.display_name}**\n"
+        f"Cash: `{_business_money(cash)}`\n"
+        f"Stocks: `{_business_money(stocks)}`\n"
+        f"Commodities: `{_business_money(commodities)}`\n"
+        f"Crypto: `{_business_money(crypto)}`\n"
+        f"Properties: `{_business_money(props)}`\n"
+        f"Businesses: `{_business_money(biz_value)}`\n"
+        f"Debt: `-{_business_money(debt)}`\n"
+        f"**Total Net Worth:** `{_business_money(net)}`"
+    )
+
+
+@bot.hybrid_command(name="stocks")
+@commands.cooldown(3, 10, commands.BucketType.user)
+@commands.guild_only()
+async def business_stocks_command(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx):
+        return
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        stocks = list(state["market"]["stocks"].values())
+    stocks = [s for s in stocks if isinstance(s, dict)]
+    stocks.sort(key=lambda item: float(item.get("price", 0.0)), reverse=True)
+    lines = [
+        f"`{stock.get('symbol')}` - {stock.get('name')} | `{_business_money(float(stock.get('price', 0.0)))}`"
+        for stock in stocks[: min(20, len(stocks))]
+    ]
+    await ctx.send("ðŸ“ˆ **Market Symbols**\n" + "\n".join(lines))
+
+
+@bot.hybrid_command(name="market")
+@commands.cooldown(3, 8, commands.BucketType.user)
+@commands.guild_only()
+async def business_market_command(ctx: commands.Context, stock: str | None = None) -> None:
+    if not await _business_require_access(ctx):
+        return
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        if stock:
+            symbol = stock.strip().upper()
+            row = state["market"]["stocks"].get(symbol)
+            if not isinstance(row, dict):
+                await ctx.send(f"Unknown stock symbol `{symbol}`.")
+                return
+            history = row.get("history", [])
+            day_change = 0.0
+            if isinstance(history, list) and len(history) >= 2 and float(history[-2]) > 0:
+                day_change = ((float(history[-1]) - float(history[-2])) / float(history[-2])) * 100.0
+            await ctx.send(
+                f"ðŸ“Š **{row.get('name')} ({symbol})**\n"
+                f"Price: `{_business_money(float(row.get('price', 0.0)))}`\n"
+                f"Sector: `{row.get('sector', 'n/a')}`\n"
+                f"Volatility: `{float(row.get('volatility', 0.0)):.3f}`\n"
+                f"Trend: `{float(row.get('trend', 0.0)):+.3f}`\n"
+                f"1-tick change: `{day_change:+.2f}%`"
+            )
+            return
+        market_note = str(state["market"].get("last_news", "No market news yet."))
+    await ctx.send(f"ðŸ“° **Market Summary**\n{market_note}")
+
+
+@bot.hybrid_command(name="commodities")
+@commands.cooldown(3, 10, commands.BucketType.user)
+@commands.guild_only()
+async def business_commodities_command(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx):
+        return
+    if not BUSINESS_ENABLE_COMMODITIES:
+        await ctx.send("Commodities market is disabled.")
+        return
+    async with BUSINESS_STATE_LOCK:
+        assets = list(get_business_state().get("commodities", {}).get("assets", {}).values())
+    assets = [row for row in assets if isinstance(row, dict)]
+    assets.sort(key=lambda row: float(row.get("price", 0.0)), reverse=True)
+    if not assets:
+        await ctx.send("No commodity symbols configured.")
+        return
+    lines: list[str] = []
+    for row in assets[:20]:
+        history = row.get("history", [])
+        change = 0.0
+        if isinstance(history, list) and len(history) >= 2 and float(history[-2] or 0.0) > 0:
+            change = ((float(history[-1]) - float(history[-2])) / float(history[-2])) * 100.0
+        lines.append(
+            f"`{row.get('symbol')}` {row.get('name')} | `{_business_money(float(row.get('price', 0.0)))}` ({change:+.2f}%)"
+        )
+    await ctx.send("🛢️ **Commodities Desk**\n" + "\n".join(lines))
+
+
+@bot.hybrid_command(name="crypto")
+@commands.cooldown(3, 10, commands.BucketType.user)
+@commands.guild_only()
+async def business_crypto_command(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx):
+        return
+    if not BUSINESS_ENABLE_CRYPTO:
+        await ctx.send("Crypto market is disabled.")
+        return
+    async with BUSINESS_STATE_LOCK:
+        assets = list(get_business_state().get("crypto", {}).get("assets", {}).values())
+    assets = [row for row in assets if isinstance(row, dict)]
+    assets.sort(key=lambda row: float(row.get("price", 0.0)), reverse=True)
+    if not assets:
+        await ctx.send("No crypto symbols configured.")
+        return
+    lines: list[str] = []
+    for row in assets[:20]:
+        history = row.get("history", [])
+        change = 0.0
+        if isinstance(history, list) and len(history) >= 2 and float(history[-2] or 0.0) > 0:
+            change = ((float(history[-1]) - float(history[-2])) / float(history[-2])) * 100.0
+        lines.append(
+            f"`{row.get('symbol')}` {row.get('name')} | `{_business_money(float(row.get('price', 0.0)))}` ({change:+.2f}%)"
+        )
+    await ctx.send("🪙 **Crypto Desk**\n" + "\n".join(lines))
+
+
+@bot.hybrid_command(name="buycommodity")
+@commands.cooldown(2, 4, commands.BucketType.user)
+@commands.guild_only()
+async def business_buy_commodity_command(ctx: commands.Context, name: str, qty: int) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    if not BUSINESS_ENABLE_COMMODITIES:
+        await ctx.send("Commodities market is disabled.")
+        return
+    symbol = name.strip().upper()
+    if qty < 1 or qty > 50000:
+        await ctx.send("Quantity must be between `1` and `50000`.")
+        return
+    async with BUSINESS_STATE_LOCK:
+        ok, text, total = _business_execute_asset_buy(
+            user_id=ctx.author.id,
+            guild_id=ctx.guild.id,
+            asset_type="commodity",
+            symbol=symbol,
+            qty=qty,
+            source="command",
+        )
+    if not ok:
+        await ctx.send(text)
+        return
+    await ctx.send(f"✅ {text}\nTotal cost: `{_business_money(total)}`")
+
+
+@bot.hybrid_command(name="sellcommodity")
+@commands.cooldown(2, 4, commands.BucketType.user)
+@commands.guild_only()
+async def business_sell_commodity_command(ctx: commands.Context, name: str, qty: int) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    if not BUSINESS_ENABLE_COMMODITIES:
+        await ctx.send("Commodities market is disabled.")
+        return
+    symbol = name.strip().upper()
+    if qty < 1 or qty > 50000:
+        await ctx.send("Quantity must be between `1` and `50000`.")
+        return
+    async with BUSINESS_STATE_LOCK:
+        ok, text, net = _business_execute_asset_sell(
+            user_id=ctx.author.id,
+            guild_id=ctx.guild.id,
+            asset_type="commodity",
+            symbol=symbol,
+            qty=qty,
+            source="command",
+        )
+    if not ok:
+        await ctx.send(text)
+        return
+    await ctx.send(f"✅ {text}\nNet after fees/penalties: `{_business_money(net)}`")
+
+
+@bot.hybrid_command(name="buycrypto")
+@commands.cooldown(2, 4, commands.BucketType.user)
+@commands.guild_only()
+async def business_buy_crypto_command(ctx: commands.Context, symbol: str, qty: int) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    if not BUSINESS_ENABLE_CRYPTO:
+        await ctx.send("Crypto market is disabled.")
+        return
+    code = symbol.strip().upper()
+    if qty < 1 or qty > 200000:
+        await ctx.send("Quantity must be between `1` and `200000`.")
+        return
+    async with BUSINESS_STATE_LOCK:
+        ok, text, total = _business_execute_asset_buy(
+            user_id=ctx.author.id,
+            guild_id=ctx.guild.id,
+            asset_type="crypto",
+            symbol=code,
+            qty=qty,
+            source="command",
+        )
+    if not ok:
+        await ctx.send(text)
+        return
+    await ctx.send(f"✅ {text}\nTotal cost: `{_business_money(total)}`")
+
+
+@bot.hybrid_command(name="sellcrypto")
+@commands.cooldown(2, 4, commands.BucketType.user)
+@commands.guild_only()
+async def business_sell_crypto_command(ctx: commands.Context, symbol: str, qty: int) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    if not BUSINESS_ENABLE_CRYPTO:
+        await ctx.send("Crypto market is disabled.")
+        return
+    code = symbol.strip().upper()
+    if qty < 1 or qty > 200000:
+        await ctx.send("Quantity must be between `1` and `200000`.")
+        return
+    async with BUSINESS_STATE_LOCK:
+        ok, text, net = _business_execute_asset_sell(
+            user_id=ctx.author.id,
+            guild_id=ctx.guild.id,
+            asset_type="crypto",
+            symbol=code,
+            qty=qty,
+            source="command",
+        )
+    if not ok:
+        await ctx.send(text)
+        return
+    await ctx.send(f"✅ {text}\nNet after fees/penalties: `{_business_money(net)}`")
+
+
+@bot.hybrid_command(name="startbiz")
+@commands.cooldown(2, 6, commands.BucketType.user)
+@commands.guild_only()
+async def business_start_biz_command(ctx: commands.Context, biz_type: str, *, name: str) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    if not BUSINESS_ENABLE_PRIVATE_BUSINESSES:
+        await ctx.send("Private businesses are disabled.")
+        return
+    normalized = biz_type.strip().lower()
+    clean_name = " ".join(name.split()).strip()[:60]
+    if not clean_name:
+        await ctx.send("Business name cannot be empty.")
+        return
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        profiles = state.get("businesses", {}).get("profiles", {})
+        profile = profiles.get(normalized) if isinstance(profiles, dict) else None
+        if not isinstance(profile, dict):
+            available = ", ".join(sorted(profiles.keys())[:8]) if isinstance(profiles, dict) else "restaurant, tech, retail"
+            await ctx.send(f"Unknown business type. Available: `{available}`")
+            return
+        user = _business_get_user(ctx.author.id)
+        current = [biz_id for biz_id in user.get("business_ids", []) if str(biz_id)]
+        if len(current) >= 6:
+            await ctx.send("You already run the max number of businesses (`6`).")
+            return
+        setup_cost = float(profile.get("expand_cost", 7000.0) or 7000.0) * 0.65
+        if float(user.get("cash", 0.0)) < setup_cost:
+            await ctx.send(f"Insufficient cash. Need `{_business_money(setup_cost)}`.")
+            return
+        user["cash"] = float(user.get("cash", 0.0)) - setup_cost
+        biz_id = _business_next_id("biz")
+        entry = {
+            "id": biz_id,
+            "owner_id": ctx.author.id,
+            "name": clean_name,
+            "type": normalized,
+            "level": 1,
+            "employees": 0,
+            "status": "active",
+            "debt": 0.0,
+            "cash_reserve": 0.0,
+            "base_value": setup_cost * 1.15,
+            "stress_cycles": 0,
+            "created_ts": _business_now_ts(),
+        }
+        state["businesses"]["registry"][biz_id] = entry
+        user["business_ids"] = current + [biz_id]
+        user["salary_tier"] = max(int(user.get("salary_tier", 1) or 1), 1 + (len(user["business_ids"]) // 2))
+        _business_add_ledger_entry(
+            action="business_start",
+            user_id=ctx.author.id,
+            amount=-setup_cost,
+            details={"biz_id": biz_id, "type": normalized},
+        )
+        _mark_business_dirty()
+    await ctx.send(
+        f"🏢 Business started: **{clean_name}** (`{biz_id}`)\n"
+        f"Type: `{normalized}` | Setup cost: `{_business_money(setup_cost)}`"
+    )
+
+
+@bot.hybrid_command(name="mybiz")
+@commands.cooldown(3, 8, commands.BucketType.user)
+@commands.guild_only()
+async def business_mybiz_command(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx):
+        return
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        user = _business_get_user(ctx.author.id)
+        registry = state.get("businesses", {}).get("registry", {})
+        if not isinstance(registry, dict):
+            registry = {}
+        lines: list[str] = []
+        for biz_id in user.get("business_ids", [])[:10]:
+            biz = registry.get(str(biz_id))
+            if not isinstance(biz, dict):
+                continue
+            lines.append(
+                f"`{biz.get('id')}` **{biz.get('name')}** | `{biz.get('type')}` | "
+                f"Lvl `{biz.get('level', 1)}` | Staff `{biz.get('employees', 0)}` | "
+                f"Debt `{_business_money(float(biz.get('debt', 0.0) or 0.0))}` | `{biz.get('status', 'active')}`"
+            )
+    if not lines:
+        await ctx.send("You do not own any private businesses yet. Use `&startbiz <type> <name>`.")
+        return
+    await ctx.send("🏬 **Your Businesses**\n" + "\n".join(lines))
+
+
+def _business_get_owned_biz_or_error(state: dict[str, Any], user_id: int, biz_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    registry = state.get("businesses", {}).get("registry", {})
+    if not isinstance(registry, dict):
+        return None, "Business registry is unavailable."
+    biz = registry.get(biz_id)
+    if not isinstance(biz, dict):
+        return None, "Business ID not found."
+    if int(biz.get("owner_id", 0) or 0) != user_id:
+        return None, "You do not own this business."
+    if str(biz.get("status", "active")) != "active":
+        return None, "This business is not active."
+    return biz, None
+
+
+@bot.hybrid_command(name="bizhire")
+@commands.cooldown(2, 5, commands.BucketType.user)
+@commands.guild_only()
+async def business_bizhire_command(ctx: commands.Context, biz_id: str, count: int) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    if count < 1 or count > 30:
+        await ctx.send("Hire count must be between `1` and `30`.")
+        return
+    target_id = biz_id.strip().upper()
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        biz, error = _business_get_owned_biz_or_error(state, ctx.author.id, target_id)
+        if error:
+            await ctx.send(error)
+            return
+        user = _business_get_user(ctx.author.id)
+        cost = float(count) * 420.0
+        if float(user.get("cash", 0.0)) < cost:
+            await ctx.send(f"Insufficient cash. Need `{_business_money(cost)}`.")
+            return
+        user["cash"] = float(user.get("cash", 0.0)) - cost
+        biz["employees"] = max(0, int(biz.get("employees", 0) or 0) + count)
+        _business_add_ledger_entry(
+            action="business_hire",
+            user_id=ctx.author.id,
+            amount=-cost,
+            details={"biz_id": target_id, "count": count},
+        )
+        _mark_business_dirty()
+    await ctx.send(f"👥 Hired `{count}` staff for `{target_id}`. Cost: `{_business_money(cost)}`.")
+
+
+@bot.hybrid_command(name="bizfire")
+@commands.cooldown(2, 5, commands.BucketType.user)
+@commands.guild_only()
+async def business_bizfire_command(ctx: commands.Context, biz_id: str, count: int) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    if count < 1 or count > 30:
+        await ctx.send("Fire count must be between `1` and `30`.")
+        return
+    target_id = biz_id.strip().upper()
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        biz, error = _business_get_owned_biz_or_error(state, ctx.author.id, target_id)
+        if error:
+            await ctx.send(error)
+            return
+        employees = int(biz.get("employees", 0) or 0)
+        if employees < count:
+            await ctx.send("You do not have that many employees to fire.")
+            return
+        biz["employees"] = employees - count
+        _business_add_ledger_entry(
+            action="business_fire",
+            user_id=ctx.author.id,
+            amount=0.0,
+            details={"biz_id": target_id, "count": count},
+        )
+        _mark_business_dirty()
+    await ctx.send(f"🧹 Fired `{count}` staff from `{target_id}`.")
+
+
+@bot.hybrid_command(name="bizexpand")
+@commands.cooldown(2, 6, commands.BucketType.user)
+@commands.guild_only()
+async def business_bizexpand_command(ctx: commands.Context, biz_id: str) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    target_id = biz_id.strip().upper()
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        profiles = state.get("businesses", {}).get("profiles", {})
+        biz, error = _business_get_owned_biz_or_error(state, ctx.author.id, target_id)
+        if error:
+            await ctx.send(error)
+            return
+        level = max(1, int(biz.get("level", 1) or 1))
+        if level >= 12:
+            await ctx.send("Business is already at max level (`12`).")
+            return
+        biz_type = str(biz.get("type", "retail"))
+        profile = profiles.get(biz_type) if isinstance(profiles, dict) else None
+        if not isinstance(profile, dict):
+            profile = {"expand_cost": 7000.0}
+        cost = float(profile.get("expand_cost", 7000.0) or 7000.0) * (1 + ((level - 1) * 0.62))
+        user = _business_get_user(ctx.author.id)
+        if float(user.get("cash", 0.0)) < cost:
+            await ctx.send(f"Insufficient cash. Need `{_business_money(cost)}`.")
+            return
+        user["cash"] = float(user.get("cash", 0.0)) - cost
+        biz["level"] = level + 1
+        biz["base_value"] = float(biz.get("base_value", 0.0) or 0.0) + (cost * 0.75)
+        user["salary_tier"] = max(int(user.get("salary_tier", 1) or 1), 1 + ((level + 1) // 3))
+        _business_add_ledger_entry(
+            action="business_expand",
+            user_id=ctx.author.id,
+            amount=-cost,
+            details={"biz_id": target_id, "new_level": int(biz["level"])},
+        )
+        _mark_business_dirty()
+    await ctx.send(f"📈 Expanded `{target_id}` to level `{level + 1}`. Cost: `{_business_money(cost)}`.")
+
+
+@bot.hybrid_command(name="salary")
+@commands.cooldown(2, 6, commands.BucketType.user)
+@commands.guild_only()
+async def business_salary_command(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    async with BUSINESS_STATE_LOCK:
+        user = _business_get_user(ctx.author.id)
+        cooldowns = user.setdefault("cooldowns", {})
+        if not isinstance(cooldowns, dict):
+            cooldowns = {}
+            user["cooldowns"] = cooldowns
+        now_ts = _business_now_ts()
+        last_claim = float(cooldowns.get("salary_claim_ts", 0.0) or 0.0)
+        wait_seconds = 20 * 3600
+        remaining = (last_claim + wait_seconds) - now_ts
+        if remaining > 0:
+            await ctx.send(f"Salary already claimed. Try again in `{int(remaining // 3600)}h`.")
+            return
+        tier = max(1, int(user.get("salary_tier", 1) or 1))
+        business_count = len(list(user.get("business_ids", [])))
+        credit_score = int(user.get("credit_score", 650) or 650)
+        base = 700.0 + (tier * 380.0) + (business_count * 180.0) + max(0, credit_score - 600)
+        payout = max(400.0, base * random.uniform(0.9, 1.15))
+        user["cash"] = float(user.get("cash", 0.0)) + payout
+        user["weekly_income"] = float(user.get("weekly_income", 0.0)) + payout
+        user["income_total"] = float(user.get("income_total", 0.0)) + payout
+        cooldowns["salary_claim_ts"] = now_ts
+        _business_add_ledger_entry(
+            action="salary_claim",
+            user_id=ctx.author.id,
+            amount=payout,
+            details={"tier": tier, "business_count": business_count},
+        )
+        _mark_business_dirty()
+    await ctx.send(f"💸 Salary credited: `{_business_money(payout)}`.")
+
+
+@bot.hybrid_command(name="taxes")
+@commands.cooldown(2, 8, commands.BucketType.user)
+@commands.guild_only()
+async def business_taxes_command(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx):
+        return
+    async with BUSINESS_STATE_LOCK:
+        user = _business_get_user(ctx.author.id)
+        tax_state = get_business_state().get("tax", {})
+        liability = float(user.get("tax_liability", 0.0) or 0.0)
+        paid_total = float(user.get("taxes_paid_total", 0.0) or 0.0)
+        weekly_income = float(user.get("weekly_income", 0.0) or 0.0)
+        short_gain = float(user.get("weekly_realized_gains_short", 0.0) or 0.0)
+        long_gain = float(user.get("weekly_realized_gains_long", 0.0) or 0.0)
+        short_rate = float(tax_state.get("capital_gains_short_rate", BUSINESS_CAPITAL_GAINS_SHORT_RATE) or BUSINESS_CAPITAL_GAINS_SHORT_RATE)
+        long_rate = float(tax_state.get("capital_gains_long_rate", BUSINESS_CAPITAL_GAINS_LONG_RATE) or BUSINESS_CAPITAL_GAINS_LONG_RATE)
+    projected_income_tax = _business_progressive_income_tax(weekly_income)
+    projected_gains_tax = max(0.0, short_gain) * short_rate + max(0.0, long_gain) * long_rate
+    await ctx.send(
+        "🧾 **Tax Desk**\n"
+        f"Outstanding liability: `{_business_money(liability)}`\n"
+        f"Taxes paid (lifetime): `{_business_money(paid_total)}`\n"
+        f"Projected this cycle: income `{_business_money(projected_income_tax)}`, gains `{_business_money(projected_gains_tax)}`"
+    )
+
+
+@bot.hybrid_command(name="filetax")
+@commands.cooldown(2, 6, commands.BucketType.user)
+@commands.guild_only()
+async def business_filetax_command(ctx: commands.Context, amount: float | None = None) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    async with BUSINESS_STATE_LOCK:
+        user = _business_get_user(ctx.author.id)
+        liability = float(user.get("tax_liability", 0.0) or 0.0)
+        if liability <= 0:
+            await ctx.send("You have no outstanding tax liability.")
+            return
+        cash = float(user.get("cash", 0.0) or 0.0)
+        target = liability if amount is None else float(amount)
+        if target <= 0:
+            await ctx.send("Amount must be positive.")
+            return
+        paid = min(target, liability, cash)
+        if paid <= 0:
+            await ctx.send("Not enough cash to file taxes.")
+            return
+        user["cash"] = cash - paid
+        user["tax_liability"] = max(0.0, liability - paid)
+        user["taxes_paid_total"] = float(user.get("taxes_paid_total", 0.0)) + paid
+        if user["tax_liability"] <= 1.0:
+            _business_apply_credit_score_delta(user, 3)
+        _business_add_ledger_entry(
+            action="tax_filing",
+            user_id=ctx.author.id,
+            amount=-paid,
+            details={"remaining_liability": float(user.get("tax_liability", 0.0))},
+        )
+        _mark_business_dirty()
+    await ctx.send(
+        f"✅ Tax payment recorded: `{_business_money(paid)}`\n"
+        f"Remaining liability: `{_business_money(float(user.get('tax_liability', 0.0)))}`"
+    )
+
+
+@bot.hybrid_command(name="credit")
+@commands.cooldown(2, 8, commands.BucketType.user)
+@commands.guild_only()
+async def business_credit_command(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx):
+        return
+    async with BUSINESS_STATE_LOCK:
+        user = _business_get_user(ctx.author.id)
+        debt = _business_debt_total(user)
+        net = _business_networth(ctx.author.id)
+        score = int(user.get("credit_score", 650) or 650)
+        cap_multiplier = _business_clamp_float(0.60 + ((score - 500) / 500), 0.55, 1.35)
+        approx_cap = max(15000.0, net * cap_multiplier)
+    await ctx.send(
+        "📊 **Credit Report**\n"
+        f"Score: `{score}` (range 500-850)\n"
+        f"Debt: `{_business_money(debt)}` | Net worth: `{_business_money(net)}`\n"
+        f"Approx loan cap: `{_business_money(approx_cap)}`"
+    )
+
+
+@bot.hybrid_command(name="markethalt")
+@commands.cooldown(2, 6, commands.BucketType.user)
+@commands.guild_only()
+async def business_markethalt_command(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx):
+        return
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        market_halt = state.get("market_halts", {}).get("market", {})
+        assets = state.get("market_halts", {}).get("assets", {})
+        remaining = int(market_halt.get("remaining_ticks", 0) or 0) if isinstance(market_halt, dict) else 0
+        reason = str(market_halt.get("reason", "n/a")) if isinstance(market_halt, dict) else "n/a"
+        halted_assets = []
+        if isinstance(assets, dict):
+            for key, row in assets.items():
+                if not isinstance(row, dict):
+                    continue
+                ticks = int(row.get("remaining_ticks", 0) or 0)
+                if ticks > 0:
+                    halted_assets.append(f"`{key}` `{ticks}` tick(s)")
+    lines = [
+        "⛔ **Market Halt Status**",
+        f"Global halt ticks remaining: `{remaining}`",
+        f"Reason: `{reason}`",
+        "Asset halts: " + (", ".join(halted_assets[:8]) if halted_assets else "`none`"),
+    ]
+    await ctx.send("\n".join(lines))
+
+
+@bot.hybrid_command(name="economystatus")
+@commands.cooldown(2, 8, commands.BucketType.user)
+@commands.guild_only()
+async def business_economystatus_command(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx):
+        return
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        meta = state.get("meta", {})
+        users = state.get("users", {})
+        market_note = str(state.get("market", {}).get("last_news", "No market update yet."))
+        event = state.get("market", {}).get("active_event")
+        event_name = str(event.get("name")) if isinstance(event, dict) else "none"
+        event_left = int(event.get("remaining_ticks", 0) or 0) if isinstance(event, dict) else 0
+        global_halt = _business_market_halt_remaining()
+    await ctx.send(
+        "🌐 **Economy Status (v1.5)**\n"
+        f"Schema: `{state.get('schema_version', 1)}` | Users: `{len(users)}`\n"
+        f"Tick pace: market `{BUSINESS_MARKET_TICK_MINUTES}m`, world `{BUSINESS_WORLD_EVENT_INTERVAL_MINUTES}m`, weekly `{BUSINESS_WEEKLY_CYCLE_DAYS}d`\n"
+        f"Current event: `{event_name}` (`{event_left}` tick(s) left)\n"
+        f"Global halt ticks: `{global_halt}`\n"
+        f"Last market key: `{meta.get('last_market_tick_key', '-')}` | Last world key: `{meta.get('last_world_event_tick_key', '-')}`\n"
+        f"Market note: {market_note}"
+    )
+
+
+@bot.hybrid_command(name="bizhelp")
+@commands.cooldown(2, 5, commands.BucketType.user)
+@commands.guild_only()
+async def business_help_command(ctx: commands.Context, *, query: str | None = None) -> None:
+    if not await _business_require_access(
+        ctx,
+        check_cooldown=False,
+        mutate=False,
+        allow_when_disabled=True,
+    ):
+        return
+    prompt = (query or "").strip() or "how do i start the game"
+    await send_business_help_query_response(ctx, prompt)
+
+
+@bot.hybrid_command(name="guide")
+@commands.cooldown(2, 5, commands.BucketType.user)
+async def guide_command(ctx: commands.Context, *, query: str | None = None) -> None:
+    prompt = (query or "").strip() or "what can you do"
+    if parse_business_help_query(prompt) is not None:
+        await send_business_help_query_response(ctx, prompt)
+        return
+    await send_general_guide_query_response(ctx, prompt)
+
+
+@bot.hybrid_command(name="buy")
+@commands.cooldown(2, 4, commands.BucketType.user)
+@commands.guild_only()
+async def business_buy_stock_command(ctx: commands.Context, stock: str, qty: int) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    symbol = stock.strip().upper()
+    if qty < 1 or qty > 50000:
+        await ctx.send("Quantity must be between `1` and `50000`.")
+        return
+    if _business_market_paused(ctx.guild.id):
+        await ctx.send("Market is currently paused by admins.")
+        return
+
+    async with BUSINESS_STATE_LOCK:
+        ok, text, total = _business_execute_asset_buy(
+            user_id=ctx.author.id,
+            guild_id=ctx.guild.id,
+            asset_type="stock",
+            symbol=symbol,
+            qty=qty,
+            source="command",
+        )
+    if not ok:
+        await ctx.send(text)
+        return
+
+    await ctx.send(f"✅ {text}\nTotal cost (incl fee): `{_business_money(total)}`")
+@bot.hybrid_command(name="sell")
+@commands.cooldown(2, 4, commands.BucketType.user)
+@commands.guild_only()
+async def business_sell_stock_command(ctx: commands.Context, stock: str, qty: int) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    symbol = stock.strip().upper()
+    if qty < 1 or qty > 50000:
+        await ctx.send("Quantity must be between `1` and `50000`.")
+        return
+    if _business_market_paused(ctx.guild.id):
+        await ctx.send("Market is currently paused by admins.")
+        return
+
+    async with BUSINESS_STATE_LOCK:
+        ok, text, net = _business_execute_asset_sell(
+            user_id=ctx.author.id,
+            guild_id=ctx.guild.id,
+            asset_type="stock",
+            symbol=symbol,
+            qty=qty,
+            source="command",
+        )
+    if not ok:
+        await ctx.send(text)
+        return
+
+    await ctx.send(f"✅ {text}\nNet after fees/penalties: `{_business_money(net)}`")
+@bot.hybrid_command(name="plots")
+@commands.cooldown(3, 12, commands.BucketType.user)
+@commands.guild_only()
+async def business_plots_command(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx):
+        return
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        plots = list(state["real_estate"]["plots"].values())
+    open_plots = [p for p in plots if isinstance(p, dict) and not p.get("owner_id")]
+    open_plots.sort(key=lambda p: float(p.get("base_price", 0.0)))
+    lines = []
+    for plot in open_plots[:15]:
+        lines.append(
+            f"`{plot.get('id')}` | `{plot.get('zone')}` | Price `{_business_money(float(plot.get('base_price', 0.0)))}`"
+        )
+    if not lines:
+        await ctx.send("No open plots right now. Check property listings or auctions.")
+        return
+    await ctx.send("ðŸ˜ï¸ **Available Plots**\n" + "\n".join(lines))
+
+
+@bot.hybrid_command(name="buyplot")
+@commands.cooldown(2, 6, commands.BucketType.user)
+@commands.guild_only()
+async def business_buy_plot_command(ctx: commands.Context, plot_id: str) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    pid = plot_id.strip().upper()
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        plot = state["real_estate"]["plots"].get(pid)
+        if not isinstance(plot, dict):
+            await ctx.send("Unknown plot id.")
+            return
+        if plot.get("owner_id"):
+            await ctx.send("This plot already has an owner.")
+            return
+        user = _business_get_user(ctx.author.id)
+        price = float(plot.get("base_price", 0.0))
+        rates = _business_rates_for_guild(ctx.guild.id)
+        fee = price * max(0.0, float(rates["transaction_fee_rate"]))
+        total = price + fee
+        cash = float(user.get("cash", 0.0))
+        if cash < total:
+            await ctx.send(f"Insufficient cash. Need `{_business_money(total)}`.")
+            return
+        user["cash"] = cash - total
+        plot["owner_id"] = str(ctx.author.id)
+        plot["tier"] = 0
+        plot["listed_price"] = None
+        plot["auction_lock"] = None
+        props = user.setdefault("properties", [])
+        if pid not in props:
+            props.append(pid)
+        tx_id = _business_add_ledger_entry(
+            action="plot_buy",
+            user_id=ctx.author.id,
+            amount=-total,
+            details={"plot_id": pid, "price": price, "fee": fee},
+        )
+        _mark_business_dirty()
+    await ctx.send(
+        f"âœ… You bought plot `{pid}` for `{_business_money(price)}` (+fee `{_business_money(fee)}`). "
+        f"Tx: `{tx_id}`"
+    )
+
+
+@bot.hybrid_command(name="upgrade")
+@commands.cooldown(2, 6, commands.BucketType.user)
+@commands.guild_only()
+async def business_upgrade_property_command(ctx: commands.Context, property_id: str) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    pid = property_id.strip().upper()
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        plot = state["real_estate"]["plots"].get(pid)
+        if not isinstance(plot, dict):
+            await ctx.send("Unknown property id.")
+            return
+        if str(plot.get("owner_id")) != str(ctx.author.id):
+            await ctx.send("You do not own this property.")
+            return
+        if plot.get("auction_lock"):
+            await ctx.send("This property is locked in an active auction.")
+            return
+        tier = int(plot.get("tier", 0))
+        if tier >= 5:
+            await ctx.send("Property is already max tier (`5`).")
+            return
+        user = _business_get_user(ctx.author.id)
+        base_price = float(plot.get("base_price", 0.0))
+        cost = base_price * (0.46 + (tier * 0.24))
+        rates = _business_rates_for_guild(ctx.guild.id)
+        fee = cost * max(0.0, float(rates["transaction_fee_rate"]))
+        total = cost + fee
+        if float(user.get("cash", 0.0)) < total:
+            await ctx.send(f"Insufficient cash. Need `{_business_money(total)}`.")
+            return
+        user["cash"] = float(user.get("cash", 0.0)) - total
+        plot["tier"] = tier + 1
+        tx_id = _business_add_ledger_entry(
+            action="property_upgrade",
+            user_id=ctx.author.id,
+            amount=-total,
+            details={"property_id": pid, "new_tier": tier + 1},
+        )
+        _mark_business_dirty()
+    await ctx.send(
+        f"ðŸ—ï¸ Upgraded `{pid}` to tier `{tier + 1}`.\n"
+        f"Upgrade spend: `{_business_money(total)}` | Tx: `{tx_id}`"
+    )
+
+
+@bot.hybrid_command(name="properties")
+@commands.cooldown(3, 12, commands.BucketType.user)
+@commands.guild_only()
+async def business_properties_command(
+    ctx: commands.Context, member: discord.Member | None = None
+) -> None:
+    if not await _business_require_access(ctx):
+        return
+    target = member or ctx.author
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        user = _business_get_user(target.id)
+        plots = state["real_estate"]["plots"]
+        lines: list[str] = []
+        for plot_id in list(user.get("properties", []))[:20]:
+            plot = plots.get(str(plot_id))
+            if not isinstance(plot, dict):
+                continue
+            value = _business_plot_value(plot)
+            listed_price = plot.get("listed_price")
+            listed_text = f" | Listed `{_business_money(float(listed_price))}`" if listed_price else ""
+            lines.append(
+                f"`{plot_id}` `{plot.get('zone')}` Tier `{int(plot.get('tier', 0))}` "
+                f"| Value `{_business_money(value)}`{listed_text}"
+            )
+    if not lines:
+        await ctx.send(f"{target.display_name} does not own properties yet.")
+        return
+    await ctx.send(f"ðŸ  **Properties - {target.display_name}**\n" + "\n".join(lines))
+
+
+@bot.hybrid_command(name="sellproperty")
+@commands.cooldown(2, 6, commands.BucketType.user)
+@commands.guild_only()
+async def business_sell_property_command(ctx: commands.Context, property_id: str, price: float) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    pid = property_id.strip().upper()
+    if price <= 0:
+        await ctx.send("Price must be positive.")
+        return
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        plot = state["real_estate"]["plots"].get(pid)
+        if not isinstance(plot, dict):
+            await ctx.send("Unknown property id.")
+            return
+        if str(plot.get("owner_id")) != str(ctx.author.id):
+            await ctx.send("You do not own this property.")
+            return
+        if plot.get("auction_lock"):
+            await ctx.send("This property is locked by an active auction.")
+            return
+        plot["listed_price"] = float(price)
+        state["real_estate"]["listed_properties"][pid] = {
+            "owner_id": str(ctx.author.id),
+            "price": float(price),
+            "listed_ts": _business_now_ts(),
+        }
+        _mark_business_dirty()
+    await ctx.send(f"ðŸ·ï¸ Property `{pid}` listed for `{_business_money(price)}`.")
+
+
+@bot.hybrid_command(name="buyproperty")
+@commands.cooldown(2, 6, commands.BucketType.user)
+@commands.guild_only()
+async def business_buy_property_command(ctx: commands.Context, property_id: str) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    pid = property_id.strip().upper()
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        listing = state["real_estate"]["listed_properties"].get(pid)
+        plot = state["real_estate"]["plots"].get(pid)
+        if not isinstance(listing, dict) or not isinstance(plot, dict):
+            await ctx.send("This property is not listed.")
+            return
+        seller_id = int(listing.get("owner_id", 0))
+        if seller_id == ctx.author.id:
+            await ctx.send("You cannot buy your own listing.")
+            return
+        seller = _business_get_user(seller_id)
+        buyer = _business_get_user(ctx.author.id)
+        price = float(listing.get("price", 0.0))
+        rates = _business_rates_for_guild(ctx.guild.id)
+        fee = price * max(0.0, float(rates["transaction_fee_rate"]))
+        transfer_tax = price * max(0.0, float(rates["property_tax_rate"]))
+        total = price + fee + transfer_tax
+        if float(buyer.get("cash", 0.0)) < total:
+            await ctx.send(
+                f"Insufficient cash. Need `{_business_money(total)}` including fee/tax."
+            )
+            return
+        buyer["cash"] = float(buyer.get("cash", 0.0)) - total
+        seller["cash"] = float(seller.get("cash", 0.0)) + max(0.0, price - fee)
+        plot["owner_id"] = str(ctx.author.id)
+        plot["listed_price"] = None
+        seller["properties"] = [x for x in seller.get("properties", []) if x != pid]
+        buyer_props = buyer.setdefault("properties", [])
+        if pid not in buyer_props:
+            buyer_props.append(pid)
+        state["real_estate"]["listed_properties"].pop(pid, None)
+        tx_id = _business_add_ledger_entry(
+            action="property_transfer",
+            user_id=ctx.author.id,
+            amount=-total,
+            details={"property_id": pid, "seller_id": seller_id, "price": price},
+        )
+        _mark_business_dirty()
+    await ctx.send(
+        f"âœ… You bought property `{pid}` for `{_business_money(price)}`.\n"
+        f"Total spend: `{_business_money(total)}` | Tx: `{tx_id}`"
+    )
+
+
+@bot.hybrid_command(name="loan")
+@commands.cooldown(3, 10, commands.BucketType.user)
+@commands.guild_only()
+async def business_loan_command(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx):
+        return
+    async with BUSINESS_STATE_LOCK:
+        user = _business_get_user(ctx.author.id)
+        active = _business_active_loans(user)
+        debt = _business_debt_total(user)
+        net = _business_networth(ctx.author.id)
+    if not active:
+        await ctx.send(
+            f"ðŸ’³ No active loans.\n"
+            f"Debt: `{_business_money(debt)}` | Net worth: `{_business_money(net)}`"
+        )
+        return
+    lines = []
+    for loan in active[:8]:
+        due_hours = max(0, int((float(loan.get('due_ts', 0.0)) - _business_now_ts()) / 3600))
+        lines.append(
+            f"`{loan.get('id')}` balance `{_business_money(float(loan.get('balance', 0.0)))}` "
+            f"| status `{loan.get('status', 'current')}` | due in `{due_hours}h`"
+        )
+    await ctx.send(
+        f"ðŸ’³ **Active Loans**\nDebt total: `{_business_money(debt)}`\n" + "\n".join(lines)
+    )
+
+
+@bot.hybrid_command(name="takeloan")
+@commands.cooldown(2, 6, commands.BucketType.user)
+@commands.guild_only()
+async def business_take_loan_command(ctx: commands.Context, amount: float) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    if amount <= 0:
+        await ctx.send("Amount must be positive.")
+        return
+    loan_rate = None
+    async with BUSINESS_STATE_LOCK:
+        ok, data = _business_issue_loan(ctx.author.id, float(amount))
+        if ok:
+            user = _business_get_user(ctx.author.id)
+            for loan in user.get("loans", []):
+                if isinstance(loan, dict) and str(loan.get("id")) == str(data):
+                    loan_rate = float(loan.get("rate", BUSINESS_HOURLY_INTEREST_RATE) or BUSINESS_HOURLY_INTEREST_RATE)
+                    break
+    if not ok:
+        await ctx.send(data)
+        return
+    await ctx.send(
+        f"ðŸ¦ Loan approved. Loan ID: `{data}` | Amount: `{_business_money(float(amount))}`\n"
+        f"Interest accrues hourly at `{(loan_rate if loan_rate is not None else BUSINESS_HOURLY_INTEREST_RATE) * 100:.3f}%`."
+    )
+
+
+@bot.hybrid_command(name="repay")
+@commands.cooldown(2, 4, commands.BucketType.user)
+@commands.guild_only()
+async def business_repay_loan_command(ctx: commands.Context, amount: float) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    if amount <= 0:
+        await ctx.send("Amount must be positive.")
+        return
+    async with BUSINESS_STATE_LOCK:
+        paid, closed = _business_repay_loans_from_cash(
+            ctx.author.id,
+            float(amount),
+            source="manual",
+        )
+    if paid <= 0:
+        await ctx.send("No repayment executed. Check your debt and cash balance.")
+        return
+    await ctx.send(
+        f"âœ… Repaid `{_business_money(paid)}`. Closed loans: `{closed}`."
+    )
+
+
+@bot.hybrid_command(name="debts")
+@commands.cooldown(3, 10, commands.BucketType.user)
+@commands.guild_only()
+async def business_debts_command(ctx: commands.Context, member: discord.Member | None = None) -> None:
+    if not await _business_require_access(ctx):
+        return
+    target = member or ctx.author
+    async with BUSINESS_STATE_LOCK:
+        user = _business_get_user(target.id)
+        active = _business_active_loans(user)
+        debt = _business_debt_total(user)
+    if not active:
+        await ctx.send(f"{target.display_name} has no active debt.")
+        return
+    lines = []
+    for loan in active[:10]:
+        lines.append(
+            f"`{loan.get('id')}` `{loan.get('status', 'current')}` | "
+            f"balance `{_business_money(float(loan.get('balance', 0.0)))}` | "
+            f"overdue `{int(loan.get('overdue_hours', 0))}h`"
+        )
+    await ctx.send(
+        f"ðŸ“‰ **Debt Status - {target.display_name}**\n"
+        f"Total debt: `{_business_money(debt)}`\n" + "\n".join(lines)
+    )
+
+
+@bot.hybrid_command(name="trade")
+@commands.cooldown(2, 5, commands.BucketType.user)
+@commands.guild_only()
+async def business_trade_command(
+    ctx: commands.Context,
+    member: discord.Member,
+    offer_type: str,
+    asset: str,
+    amount: int,
+    request_cash: float = 0.0,
+) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    if member.bot or member.id == ctx.author.id:
+        await ctx.send("Choose a valid user for trading.")
+        return
+    if amount <= 0:
+        await ctx.send("Amount must be positive.")
+        return
+    normalized = offer_type.strip().lower()
+    if normalized not in {"cash", "stock", "property"}:
+        await ctx.send("offer_type must be `cash`, `stock`, or `property`.")
+        return
+
+    async with BUSINESS_STATE_LOCK:
+        if _business_user_open_trade_count(ctx.author.id) >= BUSINESS_MAX_OPEN_TRADES:
+            await ctx.send(f"You already have `{BUSINESS_MAX_OPEN_TRADES}` open trades.")
+            return
+        if _business_user_open_trade_count(member.id) >= BUSINESS_MAX_OPEN_TRADES:
+            await ctx.send(f"{member.mention} already has too many open trades.")
+            return
+        sender = _business_get_user(ctx.author.id)
+        recipient = _business_get_user(member.id)
+        if normalized == "cash":
+            if float(sender.get("cash", 0.0)) < float(amount):
+                await ctx.send("Insufficient cash for this trade offer.")
+                return
+        elif normalized == "stock":
+            symbol = asset.strip().upper()
+            holding = sender.get("portfolio", {}).get(symbol)
+            if not isinstance(holding, dict) or int(holding.get("qty", 0)) < amount:
+                await ctx.send(f"You do not have `{amount}` shares of `{symbol}`.")
+                return
+        elif normalized == "property":
+            property_id = asset.strip().upper()
+            state = get_business_state()
+            plot = state["real_estate"]["plots"].get(property_id)
+            if not isinstance(plot, dict) or str(plot.get("owner_id")) != str(ctx.author.id):
+                await ctx.send("You do not own that property.")
+                return
+            if plot.get("auction_lock"):
+                await ctx.send("Property is locked by an active auction.")
+                return
+
+        trade_id = _business_next_id("trade")
+        offer = {
+            "id": trade_id,
+            "from_user_id": ctx.author.id,
+            "to_user_id": member.id,
+            "offer_type": normalized,
+            "asset": asset.strip().upper(),
+            "amount": int(amount),
+            "request_cash": max(0.0, float(request_cash)),
+            "created_ts": _business_now_ts(),
+            "expires_ts": _business_now_ts() + (20 * 60),
+            "guild_id": ctx.guild.id,
+            "channel_id": ctx.channel.id,
+        }
+        get_business_state()["trades"]["open"][trade_id] = offer
+        _mark_business_dirty()
+
+    await ctx.send(
+        f"ðŸ¤ Trade offer `{trade_id}` created for {member.mention}.\n"
+        f"Offer: `{normalized} {asset.upper()} x {amount}` | Request cash: `{_business_money(float(request_cash))}`\n"
+        f"Use `{PREFIX}trade_accept {trade_id}` or `{PREFIX}trade_decline {trade_id}`."
+    )
+
+
+@bot.hybrid_command(name="trade_accept")
+@commands.cooldown(2, 5, commands.BucketType.user)
+@commands.guild_only()
+async def business_trade_accept_command(ctx: commands.Context, trade_id: str) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    tid = trade_id.strip().upper()
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        offer = state["trades"]["open"].get(tid)
+        if not isinstance(offer, dict):
+            await ctx.send("Trade not found or expired.")
+            return
+        if int(offer.get("to_user_id", 0)) != ctx.author.id:
+            await ctx.send("This trade is not addressed to you.")
+            return
+        if _business_now_ts() >= float(offer.get("expires_ts", 0.0)):
+            state["trades"]["open"].pop(tid, None)
+            _mark_business_dirty()
+            await ctx.send("Trade offer expired.")
+            return
+
+        sender_id = int(offer.get("from_user_id", 0))
+        sender = _business_get_user(sender_id)
+        receiver = _business_get_user(ctx.author.id)
+        kind = str(offer.get("offer_type", ""))
+        asset = str(offer.get("asset", ""))
+        amount = int(offer.get("amount", 0))
+        request_cash = float(offer.get("request_cash", 0.0))
+        rates = _business_rates_for_guild(ctx.guild.id)
+        fee_rate = max(0.0, float(rates["transaction_fee_rate"]))
+
+        if float(receiver.get("cash", 0.0)) < request_cash:
+            await ctx.send("You do not have enough cash to accept this trade.")
+            return
+
+        if kind == "cash":
+            if float(sender.get("cash", 0.0)) < amount:
+                await ctx.send("Trade failed: sender no longer has enough cash.")
+                return
+            sender["cash"] = float(sender.get("cash", 0.0)) - amount
+            receiver["cash"] = float(receiver.get("cash", 0.0)) + amount
+        elif kind == "stock":
+            holding = sender.get("portfolio", {}).get(asset)
+            if not isinstance(holding, dict) or int(holding.get("qty", 0)) < amount:
+                await ctx.send("Trade failed: sender no longer has those shares.")
+                return
+            if not _business_remove_stock_from_user(sender, asset, amount):
+                await ctx.send("Trade failed while transferring stock.")
+                return
+            _business_add_stock_to_user(receiver, asset, amount, 0.0)
+        elif kind == "property":
+            plot = state["real_estate"]["plots"].get(asset)
+            if not isinstance(plot, dict) or str(plot.get("owner_id")) != str(sender_id):
+                await ctx.send("Trade failed: property is no longer owned by sender.")
+                return
+            if plot.get("auction_lock"):
+                await ctx.send("Trade failed: property is locked in auction.")
+                return
+            plot["owner_id"] = str(ctx.author.id)
+            plot["listed_price"] = None
+            sender["properties"] = [pid for pid in sender.get("properties", []) if pid != asset]
+            receiver_props = receiver.setdefault("properties", [])
+            if asset not in receiver_props:
+                receiver_props.append(asset)
+        else:
+            await ctx.send("Unsupported trade type.")
+            return
+
+        if request_cash > 0:
+            fee = request_cash * fee_rate
+            receiver["cash"] = float(receiver.get("cash", 0.0)) - request_cash
+            sender["cash"] = float(sender.get("cash", 0.0)) + max(0.0, request_cash - fee)
+
+        state["trades"]["open"].pop(tid, None)
+        _business_add_ledger_entry(
+            action="trade_accept",
+            user_id=ctx.author.id,
+            amount=-request_cash,
+            details={"trade_id": tid, "from_user_id": sender_id, "offer_type": kind, "asset": asset, "amount": amount},
+        )
+        _mark_business_dirty()
+    await ctx.send(f"âœ… Trade `{tid}` accepted.")
+    if request_cash >= max(50000.0, BUSINESS_STARTER_CASH * 15) and get_guild_business_moderation_enabled(ctx.guild.id):
+        await send_mod_log(
+            ctx.guild,
+            "Business Suspicious Transfer",
+            moderator=ctx.author,
+            target=ctx.author,
+            channel=ctx.channel,
+            details=(
+                f"Trade `{tid}` settled with high requested cash `{_business_money(request_cash)}` "
+                f"from `<@{sender_id}>` to `<@{ctx.author.id}>`."
+            ),
+        )
+
+
+@bot.hybrid_command(name="trade_decline")
+@commands.cooldown(2, 5, commands.BucketType.user)
+@commands.guild_only()
+async def business_trade_decline_command(ctx: commands.Context, trade_id: str) -> None:
+    if not await _business_require_access(ctx, mutate=False):
+        return
+    tid = trade_id.strip().upper()
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        offer = state["trades"]["open"].get(tid)
+        if not isinstance(offer, dict):
+            await ctx.send("Trade not found.")
+            return
+        if int(offer.get("to_user_id", 0)) != ctx.author.id and int(offer.get("from_user_id", 0)) != ctx.author.id:
+            await ctx.send("You cannot decline this trade.")
+            return
+        state["trades"]["open"].pop(tid, None)
+        _mark_business_dirty()
+    await ctx.send(f"âŒ Trade `{tid}` declined.")
+
+
+@bot.hybrid_command(name="auction_start")
+@commands.cooldown(2, 8, commands.BucketType.user)
+@commands.guild_only()
+async def business_auction_start_command(
+    ctx: commands.Context,
+    asset_type: str,
+    asset_id: str,
+    start_price: float,
+    duration_minutes: int,
+    qty: int = 1,
+) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    if start_price <= 0:
+        await ctx.send("Start price must be positive.")
+        return
+    if duration_minutes < 1 or duration_minutes > 240:
+        await ctx.send("Duration must be between `1` and `240` minutes.")
+        return
+    normalized = asset_type.strip().lower()
+    if normalized not in {"stock", "property"}:
+        await ctx.send("asset_type must be `stock` or `property`.")
+        return
+
+    async with BUSINESS_STATE_LOCK:
+        if _business_user_open_auction_count(ctx.author.id) >= BUSINESS_MAX_OPEN_AUCTIONS:
+            await ctx.send(f"You already have `{BUSINESS_MAX_OPEN_AUCTIONS}` open auctions.")
+            return
+        state = get_business_state()
+        seller = _business_get_user(ctx.author.id)
+        ref = asset_id.strip().upper()
+        if normalized == "stock":
+            if qty < 1:
+                await ctx.send("Quantity must be at least `1`.")
+                return
+            holding = seller.get("portfolio", {}).get(ref)
+            if not isinstance(holding, dict) or int(holding.get("qty", 0)) < qty:
+                await ctx.send(f"You do not have `{qty}` `{ref}` shares.")
+                return
+            if not _business_remove_stock_from_user(seller, ref, qty):
+                await ctx.send("Failed to lock stock for auction.")
+                return
+        else:
+            plot = state["real_estate"]["plots"].get(ref)
+            if not isinstance(plot, dict) or str(plot.get("owner_id")) != str(ctx.author.id):
+                await ctx.send("You do not own this property.")
+                return
+            if plot.get("auction_lock"):
+                await ctx.send("This property is already in an auction.")
+                return
+            plot["auction_lock"] = True
+            qty = 1
+
+        auction_id = _business_next_id("auction")
+        auction = {
+            "id": auction_id,
+            "seller_id": ctx.author.id,
+            "asset_type": normalized,
+            "asset_ref": ref,
+            "qty": int(qty),
+            "start_price": float(start_price),
+            "highest_bid": 0.0,
+            "highest_bidder": None,
+            "bids": [],
+            "start_ts": _business_now_ts(),
+            "end_ts": _business_now_ts() + (duration_minutes * 60),
+            "guild_id": ctx.guild.id,
+            "channel_id": ctx.channel.id,
+        }
+        state["auctions"]["active"][auction_id] = auction
+        _mark_business_dirty()
+    await ctx.send(
+        f"ðŸ“£ Auction `{auction_id}` started.\n"
+        f"Asset: `{normalized} {asset_id.upper()} x{qty}` | Start: `{_business_money(start_price)}` | "
+        f"Duration: `{duration_minutes}` min"
+    )
+
+
+@bot.hybrid_command(name="bid")
+@commands.cooldown(2, 4, commands.BucketType.user)
+@commands.guild_only()
+async def business_bid_command(ctx: commands.Context, auction_id: str, amount: float) -> None:
+    if not await _business_require_access(ctx, mutate=True):
+        return
+    aid = auction_id.strip().upper()
+    if amount <= 0:
+        await ctx.send("Bid amount must be positive.")
+        return
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        auction = state["auctions"]["active"].get(aid)
+        if not isinstance(auction, dict):
+            await ctx.send("Auction not found.")
+            return
+        if _business_now_ts() >= float(auction.get("end_ts", 0.0)):
+            pass
+    if _business_now_ts() >= float(auction.get("end_ts", 0.0)):
+        summary = await _business_settle_auction(aid, reason="late_bid")
+        await ctx.send(f"Auction already ended. {summary}")
+        return
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        auction = state["auctions"]["active"].get(aid)
+        if not isinstance(auction, dict):
+            await ctx.send("Auction not found.")
+            return
+        if int(auction.get("seller_id", 0)) == ctx.author.id:
+            await ctx.send("You cannot bid on your own auction.")
+            return
+        user = _business_get_user(ctx.author.id)
+        if float(user.get("cash", 0.0)) < amount:
+            await ctx.send("Insufficient cash for this bid.")
+            return
+        minimum = float(auction.get("highest_bid", 0.0))
+        if minimum <= 0:
+            minimum = float(auction.get("start_price", 0.0))
+        else:
+            minimum += max(50.0, minimum * 0.02)
+        if amount < minimum:
+            await ctx.send(f"Bid too low. Minimum required: `{_business_money(minimum)}`.")
+            return
+
+        auction["highest_bid"] = float(amount)
+        auction["highest_bidder"] = ctx.author.id
+        bids = auction.setdefault("bids", [])
+        if isinstance(bids, list):
+            bids.append({"user_id": ctx.author.id, "amount": float(amount), "ts": _business_now_ts()})
+            if len(bids) > 40:
+                del bids[:-40]
+        remaining = float(auction.get("end_ts", 0.0)) - _business_now_ts()
+        if remaining <= BUSINESS_AUCTION_SNIPING_WINDOW_SECONDS:
+            auction["end_ts"] = float(auction.get("end_ts", 0.0)) + BUSINESS_AUCTION_SNIPING_EXTEND_SECONDS
+        _mark_business_dirty()
+    await ctx.send(f"âœ… Bid accepted on `{aid}`: `{_business_money(amount)}`.")
+
+
+@bot.hybrid_command(name="auctions")
+@commands.cooldown(3, 8, commands.BucketType.user)
+@commands.guild_only()
+async def business_auctions_command(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx):
+        return
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        active = list(state["auctions"]["active"].values())
+    if not active:
+        await ctx.send("No active auctions right now.")
+        return
+    lines = []
+    now_ts = _business_now_ts()
+    for auction in sorted(active, key=lambda a: float(a.get("end_ts", 0.0)))[:15]:
+        if not isinstance(auction, dict):
+            continue
+        left = max(0, int((float(auction.get("end_ts", 0.0)) - now_ts) / 60))
+        price = float(auction.get("highest_bid", 0.0) or 0.0)
+        if price <= 0:
+            price = float(auction.get("start_price", 0.0))
+        lines.append(
+            f"`{auction.get('id')}` {auction.get('asset_type')} `{auction.get('asset_ref')}` "
+            f"x{auction.get('qty')} | bid `{_business_money(price)}` | `{left}m` left"
+        )
+    await ctx.send("ðŸ **Active Auctions**\n" + "\n".join(lines))
+
+
+@bot.hybrid_command(name="bizleaderboard")
+@commands.cooldown(2, 10, commands.BucketType.user)
+@commands.guild_only()
+async def business_leaderboard_command(ctx: commands.Context, metric: str = "networth") -> None:
+    if not await _business_require_access(ctx):
+        return
+    normalized = metric.strip().lower()
+    if normalized not in {"cash", "networth", "income"}:
+        await ctx.send("Metric must be `cash`, `networth`, or `income`.")
+        return
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        rows: list[tuple[int, float]] = []
+        for uid_text, payload in state["users"].items():
+            if not str(uid_text).isdigit() or not isinstance(payload, dict):
+                continue
+            uid = int(uid_text)
+            if normalized == "cash":
+                score = float(payload.get("cash", 0.0))
+            elif normalized == "income":
+                score = float(payload.get("income_total", 0.0))
+            else:
+                score = _business_networth(uid)
+            rows.append((uid, score))
+    rows.sort(key=lambda item: item[1], reverse=True)
+    if not rows:
+        await ctx.send("Business leaderboard is empty.")
+        return
+    lines: list[str] = []
+    for idx, (uid, score) in enumerate(rows[:10], start=1):
+        member = ctx.guild.get_member(uid)
+        name = member.display_name if isinstance(member, discord.Member) else str(uid)
+        lines.append(f"{idx}. **{name}** - `{_business_money(score)}`")
+    await ctx.send(f"ðŸ† **Business Leaderboard ({normalized})**\n" + "\n".join(lines))
+
+
+@bot.hybrid_command(name="bizprofile")
+@commands.cooldown(3, 12, commands.BucketType.user)
+@commands.guild_only()
+async def business_profile_command(ctx: commands.Context, member: discord.Member | None = None) -> None:
+    if not await _business_require_access(ctx):
+        return
+    target = member or ctx.author
+    async with BUSINESS_STATE_LOCK:
+        user = _business_get_user(target.id)
+        cash = float(user.get("cash", 0.0))
+        net = _business_networth(target.id)
+        debt = _business_debt_total(user)
+        properties = len(list(user.get("properties", [])))
+        stock_holdings = len(list(user.get("portfolio", {}).keys())) if isinstance(user.get("portfolio"), dict) else 0
+        commodity_holdings = (
+            len(list(user.get("commodity_portfolio", {}).keys()))
+            if isinstance(user.get("commodity_portfolio"), dict)
+            else 0
+        )
+        crypto_holdings = (
+            len(list(user.get("crypto_portfolio", {}).keys()))
+            if isinstance(user.get("crypto_portfolio"), dict)
+            else 0
+        )
+        businesses = len(list(user.get("business_ids", [])))
+        credit_score = int(user.get("credit_score", 650) or 650)
+        tax_liability = float(user.get("tax_liability", 0.0) or 0.0)
+        income_total = float(user.get("income_total", 0.0))
+        claim_streak = int(user.get("daily", {}).get("streak", 0)) if isinstance(user.get("daily"), dict) else 0
+    tip = ""
+    if target.id == ctx.author.id:
+        tip = await _business_get_personalized_tip(
+            ctx.guild.id,
+            ctx.author.id,
+            context="profile_review",
+        )
+    await ctx.send(
+        f"ðŸ‘¤ **Business Profile - {target.display_name}**\n"
+        f"Cash: `{_business_money(cash)}`\n"
+        f"Net worth: `{_business_money(net)}`\n"
+        f"Debt: `{_business_money(debt)}`\n"
+        f"Holdings: stocks `{stock_holdings}` | commodities `{commodity_holdings}` | crypto `{crypto_holdings}`\n"
+        f"Properties: `{properties}` | Businesses: `{businesses}`\n"
+        f"Credit score: `{credit_score}` | Tax liability: `{_business_money(tax_liability)}`\n"
+        f"Total passive income earned: `{_business_money(income_total)}`\n"
+        f"Daily claim streak: `{claim_streak}`"
+        + (f"\n{tip}" if tip else "")
+    )
+
+
+@bot.hybrid_command(name="marketnews")
+@commands.cooldown(3, 8, commands.BucketType.user)
+@commands.guild_only()
+async def business_market_news_command(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx):
+        return
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        news = str(state["market"].get("last_news", "No market update yet."))
+        commodity_news = str(state.get("commodities", {}).get("last_news", ""))
+        crypto_news = str(state.get("crypto", {}).get("last_news", ""))
+        history = state["market"].get("history", [])
+        recent = history[-3:] if isinstance(history, list) else []
+        dynamic = _business_get_ai_dynamic(state)
+        headline = str(dynamic.get("headline", "")).strip()
+    lines = [f"- {item.get('news', '')}" for item in recent if isinstance(item, dict)]
+    if not lines:
+        lines = ["- No recent events."]
+    headline_line = f"\nAI mood: `{headline}`" if headline else ""
+    await ctx.send(
+        "ðŸ—žï¸ **Market News**\n"
+        + news
+        + (f"\n{commodity_news}" if commodity_news else "")
+        + (f"\n{crypto_news}" if crypto_news else "")
+        + headline_line
+        + "\n\nRecent updates:\n"
+        + "\n".join(lines)
+    )
+
+
+@bot.hybrid_command(name="ledger")
+@commands.cooldown(3, 10, commands.BucketType.user)
+@commands.guild_only()
+async def business_ledger_command(ctx: commands.Context, member: discord.Member | None = None) -> None:
+    if not await _business_require_access(ctx):
+        return
+    target_id = member.id if member else None
+    async with BUSINESS_STATE_LOCK:
+        entries = list(get_business_state().get("ledger", []))
+    entries = [entry for entry in entries if isinstance(entry, dict)]
+    if target_id is not None:
+        entries = [entry for entry in entries if int(entry.get("user_id", 0) or 0) == target_id]
+    if not entries:
+        await ctx.send("No ledger entries found.")
+        return
+    entries = entries[-12:]
+    lines = []
+    for entry in entries:
+        amount = float(entry.get("amount", 0.0))
+        lines.append(
+            f"`{entry.get('id')}` `{entry.get('action')}` `{amount:+,.0f}` "
+            f"user `{entry.get('user_id')}`"
+        )
+    await ctx.send("ðŸ“’ **Business Ledger (latest)**\n" + "\n".join(lines))
+
+
+@bot.hybrid_group(name="bizadmin", invoke_without_command=True)
+@commands.guild_only()
+async def bizadmin_group(ctx: commands.Context) -> None:
+    if not await _business_require_access(ctx, require_mod=True, check_cooldown=False):
+        return
+    await ctx.send(
+        f"Usage: `{PREFIX}bizadmin <freeze|unfreeze|grant|setcash|reverse|settax|marketpause|audit>` ..."
+    )
+
+
+@bizadmin_group.command(name="freeze")
+async def bizadmin_freeze(ctx: commands.Context, member: discord.Member) -> None:
+    if not await _business_require_access(ctx, require_mod=True, check_cooldown=False):
+        return
+    async with BUSINESS_STATE_LOCK:
+        _business_set_user_frozen(member.id, True)
+    await ctx.send(f"ðŸ”’ Froze business account for {member.mention}.")
+
+
+@bizadmin_group.command(name="unfreeze")
+async def bizadmin_unfreeze(ctx: commands.Context, member: discord.Member) -> None:
+    if not await _business_require_access(ctx, require_mod=True, check_cooldown=False):
+        return
+    async with BUSINESS_STATE_LOCK:
+        _business_set_user_frozen(member.id, False)
+    await ctx.send(f"ðŸ”“ Unfroze business account for {member.mention}.")
+
+
+@bizadmin_group.command(name="grant")
+async def bizadmin_grant(ctx: commands.Context, member: discord.Member, amount: float) -> None:
+    if not await _business_require_access(ctx, require_mod=True, check_cooldown=False):
+        return
+    if amount <= 0:
+        await ctx.send("Amount must be positive.")
+        return
+    async with BUSINESS_STATE_LOCK:
+        user = _business_get_user(member.id)
+        user["cash"] = float(user.get("cash", 0.0)) + amount
+        tx_id = _business_add_ledger_entry(
+            action="admin_grant",
+            user_id=member.id,
+            amount=amount,
+            details={"moderator_id": ctx.author.id},
+        )
+        _mark_business_dirty()
+    await ctx.send(f"Granted `{_business_money(amount)}` to {member.mention}. Tx: `{tx_id}`")
+    if amount >= max(50000.0, BUSINESS_STARTER_CASH * 15) and get_guild_business_moderation_enabled(ctx.guild.id):
+        await send_mod_log(
+            ctx.guild,
+            "Business Suspicious Transfer",
+            moderator=ctx.author,
+            target=member,
+            channel=ctx.channel,
+            details=f"Large grant `{_business_money(amount)}` | tx `{tx_id}`",
+        )
+
+
+@bizadmin_group.command(name="setcash")
+async def bizadmin_setcash(ctx: commands.Context, member: discord.Member, amount: float) -> None:
+    if not await _business_require_access(ctx, require_mod=True, check_cooldown=False):
+        return
+    if amount < 0:
+        await ctx.send("Cash cannot be negative.")
+        return
+    async with BUSINESS_STATE_LOCK:
+        user = _business_get_user(member.id)
+        old_cash = float(user.get("cash", 0.0))
+        user["cash"] = float(amount)
+        tx_id = _business_add_ledger_entry(
+            action="admin_setcash",
+            user_id=member.id,
+            amount=float(amount) - old_cash,
+            details={"moderator_id": ctx.author.id, "old_cash": old_cash, "new_cash": amount},
+        )
+        _mark_business_dirty()
+    await ctx.send(
+        f"Set cash for {member.mention} from `{_business_money(old_cash)}` to `{_business_money(amount)}`. "
+        f"Tx: `{tx_id}`"
+    )
+
+
+@bizadmin_group.command(name="reverse")
+async def bizadmin_reverse(ctx: commands.Context, tx_id: str) -> None:
+    if not await _business_require_access(ctx, require_mod=True, check_cooldown=False):
+        return
+    tid = tx_id.strip().upper()
+    async with BUSINESS_STATE_LOCK:
+        rollback = BUSINESS_TX_ROLLBACK_CACHE.get(tid)
+        if not isinstance(rollback, dict):
+            await ctx.send("Rollback data not available for this transaction.")
+            return
+        rollback_type = str(rollback.get("type", ""))
+        user_id = int(rollback.get("user_id", 0))
+        user = _business_get_user(user_id)
+        if rollback_type == "stock_buy":
+            symbol = str(rollback.get("symbol", ""))
+            qty = int(rollback.get("qty", 0))
+            if qty > 0:
+                _business_remove_stock_from_user(user, symbol, qty)
+            user["cash"] = float(user.get("cash", 0.0)) + float(rollback.get("cash_delta", 0.0))
+        elif rollback_type == "stock_sell":
+            symbol = str(rollback.get("symbol", ""))
+            qty = int(rollback.get("qty", 0))
+            user["cash"] = float(user.get("cash", 0.0)) + float(rollback.get("cash_delta", 0.0))
+            _business_add_stock_to_user(user, symbol, qty, 0.0)
+        else:
+            await ctx.send("This transaction type is not reversible automatically.")
+            return
+        _business_add_ledger_entry(
+            action="admin_reverse",
+            user_id=user_id,
+            amount=0.0,
+            details={"moderator_id": ctx.author.id, "source_tx_id": tid, "rollback_type": rollback_type},
+        )
+        _mark_business_dirty()
+    await ctx.send(f"Reversed transaction `{tid}`.")
+
+
+@bizadmin_group.command(name="settax")
+async def bizadmin_settax(ctx: commands.Context, key: str, value: float) -> None:
+    if not await _business_require_access(ctx, require_mod=True, check_cooldown=False):
+        return
+    key_map = {
+        "transaction": "transaction_fee_rate",
+        "transaction_fee_rate": "transaction_fee_rate",
+        "property_tax": "property_tax_rate",
+        "property_tax_rate": "property_tax_rate",
+        "maintenance": "property_maintenance_rate",
+        "property_maintenance_rate": "property_maintenance_rate",
+        "gains_short": "capital_gains_short_rate",
+        "capital_gains_short_rate": "capital_gains_short_rate",
+        "gains_long": "capital_gains_long_rate",
+        "capital_gains_long_rate": "capital_gains_long_rate",
+    }
+    normalized = key_map.get(key.strip().lower())
+    if normalized is None:
+        await ctx.send("Key must be transaction/property_tax/maintenance/gains_short/gains_long.")
+        return
+    if value < 0 or value > 0.5:
+        await ctx.send("Value must be between `0` and `0.5`.")
+        return
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        if normalized in {"capital_gains_short_rate", "capital_gains_long_rate"}:
+            tax_state = state.setdefault("tax", {})
+            tax_state[normalized] = float(value)
+        else:
+            state["governance"][normalized] = float(value)
+            set_guild_business_tax_overrides(ctx.guild.id, {normalized: float(value)})
+        _mark_business_dirty()
+    await ctx.send(f"Updated `{normalized}` to `{value:.4f}`.")
+
+
+@bizadmin_group.command(name="marketpause")
+async def bizadmin_marketpause(ctx: commands.Context, mode: str) -> None:
+    if not await _business_require_access(ctx, require_mod=True, check_cooldown=False):
+        return
+    normalized = mode.strip().lower()
+    if normalized not in {"on", "off"}:
+        await ctx.send(f"Usage: `{PREFIX}bizadmin marketpause <on|off>`")
+        return
+    paused = normalized == "on"
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        state["governance"]["market_paused"] = paused
+        set_guild_business_market_paused(ctx.guild.id, paused)
+        _mark_business_dirty()
+    await ctx.send(f"Market pause is now **{'on' if paused else 'off'}**.")
+
+
+@bizadmin_group.command(name="enable")
+async def bizadmin_enable(ctx: commands.Context, mode: str) -> None:
+    if not await _business_require_access(
+        ctx,
+        require_mod=True,
+        check_cooldown=False,
+        allow_when_disabled=True,
+    ):
+        return
+    normalized = mode.strip().lower()
+    if normalized not in {"on", "off"}:
+        await ctx.send(f"Usage: `{PREFIX}bizadmin enable <on|off>`")
+        return
+    enabled = normalized == "on"
+    set_guild_business_enabled(ctx.guild.id, enabled)
+    await ctx.send(f"Business mode is now **{'enabled' if enabled else 'disabled'}** in this server.")
+
+
+@bizadmin_group.command(name="moderation")
+async def bizadmin_moderation(ctx: commands.Context, mode: str) -> None:
+    if not await _business_require_access(ctx, require_mod=True, check_cooldown=False):
+        return
+    normalized = mode.strip().lower()
+    if normalized not in {"on", "off"}:
+        await ctx.send(f"Usage: `{PREFIX}bizadmin moderation <on|off>`")
+        return
+    enabled = normalized == "on"
+    set_guild_business_moderation_enabled(ctx.guild.id, enabled)
+    await ctx.send(f"Business moderation hooks are now **{'enabled' if enabled else 'disabled'}**.")
+
+
+@bizadmin_group.command(name="audit")
+async def bizadmin_audit(ctx: commands.Context, audit_type: str = "user", value: str | None = None) -> None:
+    if not await _business_require_access(ctx, require_mod=True, check_cooldown=False):
+        return
+    kind = audit_type.strip().lower()
+    async with BUSINESS_STATE_LOCK:
+        state = get_business_state()
+        if kind == "tx" and value:
+            tx = next((entry for entry in state["ledger"] if str(entry.get("id")) == value.upper()), None)
+            if not isinstance(tx, dict):
+                await ctx.send("Transaction not found.")
+                return
+            await ctx.send(
+                f"Audit tx `{tx.get('id')}`: action `{tx.get('action')}`, user `{tx.get('user_id')}`, "
+                f"amount `{float(tx.get('amount', 0.0)):+,.0f}`."
+            )
+            return
+
+        target: discord.Member | None = None
+        if value:
+            if value.isdigit():
+                target = ctx.guild.get_member(int(value))
+            if target is None:
+                target = discord.utils.find(lambda m: m.display_name.lower() == value.lower(), ctx.guild.members)
+        if target is None:
+            target = ctx.author
+        user = _business_get_user(target.id)
+        await ctx.send(
+            f"Audit user **{target.display_name}**:\n"
+            f"Cash `{_business_money(float(user.get('cash', 0.0)))}`\n"
+            f"Net worth `{_business_money(_business_networth(target.id))}`\n"
+            f"Debt `{_business_money(_business_debt_total(user))}`\n"
+            f"Flags `{user.get('flags', {})}` | Frozen `{_business_is_user_frozen(target.id)}`"
+        )
 
 
 @bot.command(name="join")
@@ -4415,6 +20923,8 @@ async def psych_command(ctx: commands.Context, *, input_text: str | None = None)
 @commands.cooldown(2, 60, commands.BucketType.user)
 @commands.guild_only()
 async def my_vibe_command(ctx: commands.Context, count: int = VIBE_DEFAULT_MESSAGE_COUNT) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
     if not is_ai_configured():
         await ctx.send(ai_setup_message())
         return
@@ -4458,6 +20968,8 @@ async def my_vibe_command(ctx: commands.Context, count: int = VIBE_DEFAULT_MESSA
 async def vibe_command(
     ctx: commands.Context, member: discord.Member, count: int = VIBE_DEFAULT_MESSAGE_COUNT
 ) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
     if member.bot:
         await ctx.send("Bot accounts are not supported for vibe reports.")
         return
@@ -4503,6 +21015,8 @@ async def vibe_command(
 @commands.cooldown(2, 60, commands.BucketType.user)
 @commands.guild_only()
 async def vibecheck_command(ctx: commands.Context, member: discord.Member) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
     if member.bot:
         await ctx.send("Bot accounts are not supported for vibe checks.")
         return
@@ -4541,11 +21055,12 @@ async def roast_command(
     if member.bot:
         await ctx.send("I do not roast bot accounts.")
         return
-    if not is_ai_configured():
-        await ctx.send(ai_setup_message())
+    if not await enforce_fun_rate_limit_ctx(ctx):
         return
 
-    cache_key = (ctx.guild.id, member.id, style)
+    requested_style = style
+    effective_style = resolve_style_for_fun_mode(ctx.guild.id, requested_style)
+    cache_key = (ctx.guild.id, member.id, effective_style)
     now = time.monotonic()
     cached = ROAST_RESULT_CACHE.get(cache_key)
     if cached and now - cached[0] < ROAST_CACHE_SECONDS:
@@ -4571,28 +21086,61 @@ async def roast_command(
                 )
                 return
 
-            prompt = build_personal_roast_prompt(member, style, context)
-            try:
-                roast = await request_fun_ai(prompt, max_tokens=240, temperature=0.9)
-            except Exception as error:
-                print(f"[ROAST ERROR] {error}")
-                roast = generate_personal_roast_local(member, style, context)
+            recent_outputs = get_recent_roast_outputs(ctx.guild.id, member.id, effective_style)
+            prompt = build_personal_roast_prompt(
+                member,
+                effective_style,
+                context,
+                recent_outputs=recent_outputs,
+            )
 
+            if is_ai_configured():
+                fun_mode = get_guild_fun_mode(ctx.guild.id)
+                try:
+                    roast = await request_fun_ai(
+                        prompt,
+                        max_tokens=240,
+                        temperature=0.9,
+                        policy_key="roast",
+                        fun_mode=fun_mode,
+                    )
+                    if any(roast.strip() == previous.strip() for previous in recent_outputs):
+                        roast = await request_fun_ai(
+                            prompt
+                            + "\nGenerate a clearly different roast structure from prior outputs.",
+                            max_tokens=240,
+                            temperature=0.95,
+                            policy_key="roast",
+                            fun_mode=fun_mode,
+                        )
+                except Exception as error:
+                    print(f"[ROAST ERROR] {error}")
+                    roast = generate_personal_roast_local(member, effective_style, context)
+            else:
+                roast = generate_personal_roast_local(member, effective_style, context)
+
+            remember_roast_output(ctx.guild.id, member.id, effective_style, roast)
+            style_label = effective_style
+            if effective_style != requested_style:
+                style_label += " (auto-adjusted by fun mode)"
+            cta = roast_engagement_cta(get_guild_fun_mode(ctx.guild.id))
             result = (
-                f"🔥 Roast mode: **{style}** for {member.mention}\n"
+                f"[ROAST] mode: **{style_label}** for {member.mention}\n"
                 f"{roast}\n\n"
                 f"Based on `{context.message_count}` messages across readable channels.\n"
-                "⚠️ For fun only."
+                f"Engagement prompt: {cta}\n"
+                "[For fun only]"
             )
             ROAST_RESULT_CACHE[cache_key] = (time.monotonic(), result)
 
     await send_chunked(ctx, result)
 
-
 @bot.hybrid_command(name="serverlore")
 @commands.cooldown(2, 60, commands.BucketType.user)
 @commands.guild_only()
 async def serverlore_command(ctx: commands.Context) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
     if not is_ai_configured():
         await ctx.send(ai_setup_message())
         return
@@ -4611,12 +21159,410 @@ async def serverlore_command(ctx: commands.Context) -> None:
             + "\n".join(transcript[-90:])
         )
         try:
-            lore = await request_fun_ai(prompt, max_tokens=320, temperature=0.95)
+            lore = await request_fun_ai(
+                prompt,
+                max_tokens=320,
+                temperature=0.95,
+                policy_key="serverlore",
+            )
         except Exception as error:
             print(f"[SERVERLORE ERROR] {error}")
             await ctx.send(friendly_ai_error(error))
             return
-    await send_chunked(ctx, f"📜 **Server Lore**\n{lore}\n\n⚠️ For fun only.")
+    await send_chunked(ctx, f"ðŸ“œ **Server Lore**\n{lore}\n\nâš ï¸ For fun only.")
+
+
+@bot.hybrid_command(name="replycraft")
+@commands.cooldown(2, 25, commands.BucketType.user)
+@commands.guild_only()
+async def replycraft_command(ctx: commands.Context, message_link: str | None = None) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
+    source_message = await resolve_message_from_context(ctx, message_link)
+    if source_message is None:
+        await ctx.send(
+            f"Reply to a message and run `{PREFIX}replycraft`, or pass a Discord message link."
+        )
+        return
+
+    cache_key = (ctx.guild.id, "replycraft", ctx.author.id, source_message.id)
+    cached = SOCIALINTEL_RESULT_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached[0] < SOCIALINTEL_CACHE_SECONDS:
+        await send_chunked(ctx, cached[1] + "\n\n_(Cached result for speed)_")
+        return
+
+    async with ctx.typing():
+        requester_context = collect_socialintel_context(ctx.guild, ctx.author)
+        if requester_context.target_message_count < 10 or _socialintel_needs_backfill(ctx.guild.id):
+            await maybe_run_socialintel_backfill(ctx.guild)
+            requester_context = collect_socialintel_context(ctx.guild, ctx.author)
+        requester_metrics = requester_context.target_metrics
+        recent_entries = await _socialintel_message_neighborhood(source_message)
+        payload = await _socialintel_generate_replycraft(
+            source_message,
+            requester_metrics=requester_metrics,
+            recent_entries=recent_entries,
+        )
+
+    sparse_reasons: list[str] = []
+    if requester_context.target_message_count < 12:
+        sparse_reasons.append("limited visible history for your style fingerprint")
+    if len(recent_entries) < 4:
+        sparse_reasons.append("very little nearby channel context")
+    confidence_note = payload.get("confidence_note", "").strip() or "Built from visible evidence only."
+    if sparse_reasons:
+        confidence_note += " Sparse-evidence note: " + "; ".join(sparse_reasons) + "."
+    source_excerpt = _socialintel_compact_excerpt(source_message.clean_content or "[attachment]", 150)
+    result = (
+        f"[REPLYCRAFT]\n"
+        f"Target: {get_user_display_name(source_message.author)} in {_socialintel_channel_label(source_message.channel)}\n"
+        f"Context seed: `{source_excerpt}`\n"
+        f"1. safe [{payload.get('safe_tone', 'measured')}]: {payload.get('safe_reply', '').strip()}\n"
+        f"2. playful [{payload.get('playful_tone', 'light banter')}]: {payload.get('playful_reply', '').strip()}\n"
+        f"3. bold [{payload.get('bold_tone', 'direct')}]: {payload.get('bold_reply', '').strip()}\n"
+        f"Confidence: {confidence_note}"
+    )
+    SOCIALINTEL_RESULT_CACHE[cache_key] = (time.monotonic(), result)
+    await send_chunked(ctx, result)
+
+
+@bot.hybrid_command(name="duofit")
+@commands.cooldown(2, 35, commands.BucketType.user)
+@commands.guild_only()
+async def duofit_command(
+    ctx: commands.Context,
+    member_one: discord.Member,
+    member_two: discord.Member,
+) -> None:
+    if member_one.bot or member_two.bot or member_one.id == member_two.id:
+        await ctx.send("Choose two different non-bot members.")
+        return
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
+
+    left_id, right_id = sorted((member_one.id, member_two.id))
+    cache_key = (ctx.guild.id, "duofit", left_id, right_id)
+    cached = SOCIALINTEL_RESULT_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached[0] < SOCIALINTEL_CACHE_SECONDS:
+        await send_chunked(ctx, cached[1] + "\n\n_(Cached result for speed)_")
+        return
+
+    async with ctx.typing():
+        await maybe_run_socialintel_backfill(ctx.guild)
+        context = collect_socialintel_context(ctx.guild, member_one)
+        candidate_row = context.candidate_rows.get(member_two.id)
+        if candidate_row is None:
+            guild_state = get_guild_socialintel_state(ctx.guild.id)
+            users = guild_state.get("users", {}) if isinstance(guild_state.get("users"), dict) else {}
+            candidate_row = users.get(str(member_two.id)) if isinstance(users.get(str(member_two.id)), dict) else None
+        duo_row = (
+            _socialintel_build_duo_row(ctx.guild, member_one, member_two.id, candidate_row, context)
+            if isinstance(candidate_row, dict)
+            else None
+        )
+        if duo_row is None:
+            await ctx.send(
+                "Not enough evidence yet. I need more visible history from both members across readable channels."
+            )
+            return
+        annotate_socialintel_duo_confidences([duo_row], context.target_message_count)
+
+    score_pct = _socialintel_duo_score_percent(float(duo_row.get("heuristic_score", 0.0)))
+    pair_stats = duo_row.get("pair_stats", {}) if isinstance(duo_row.get("pair_stats"), dict) else {}
+    reasons = _socialintel_duo_reason_bits(ctx.guild, duo_row)
+    common_channels = _altfinder_channel_names(ctx.guild, duo_row.get("common_channel_ids", []))
+    common_hours = _altfinder_format_hours(duo_row.get("common_hours", []))
+    coverage = _socialintel_scan_coverage(ctx.guild.id)
+    result = (
+        f"[DUOFIT] {member_one.mention} x {member_two.mention}\n"
+        f"Compatibility score: `{score_pct}%` | confidence `{int(float(duo_row.get('confidence', 0.0)) * 100)}%` ({duo_row.get('confidence_band', 'low')})\n"
+        f"- Style fit: `{float(duo_row.get('style_similarity', 0.0)):.2f}`\n"
+        f"- Schedule overlap: `{float(duo_row.get('schedule_overlap', 0.0)):.2f}` | common hours `{common_hours}`\n"
+        f"- Channel overlap: `{float(duo_row.get('channel_overlap', 0.0)):.2f}` | common channels `{common_channels}`\n"
+        f"- Topic fit: `{float(duo_row.get('topic_overlap', 0.0)):.2f}`\n"
+        f"- Pacing fit: `{float(duo_row.get('pacing_similarity', 0.0)):.2f}`\n"
+        f"- Reply chemistry: `{int(pair_stats.get('reply_forward', 0) or 0) + int(pair_stats.get('reply_back', 0) or 0)}` mutual replies | "
+        f"`{int(pair_stats.get('mention_forward', 0) or 0) + int(pair_stats.get('mention_back', 0) or 0)}` mutual mentions\n"
+        f"- Presence overlap: `{float(duo_row.get('presence_overlap', 0.0)):.2f}`\n"
+        f"Evidence summary: {', '.join(reasons) if reasons else 'light overlap only'}\n"
+        f"Coverage: channels `{coverage.get('channels_fully_scanned', 0)}/{coverage.get('channels_total', 0)}` | indexed msgs `{coverage.get('messages_indexed', 0)}`\n"
+        "Guardrail: this is a friendship, teamwork, or debate-chemistry fit signal only; not romance inference."
+    )
+    SOCIALINTEL_RESULT_CACHE[cache_key] = (time.monotonic(), result)
+    await send_chunked(ctx, result)
+
+
+@bot.hybrid_command(name="duofind")
+@commands.cooldown(2, 45, commands.BucketType.user)
+@commands.guild_only()
+async def duofind_command(ctx: commands.Context, member: discord.Member | None = None) -> None:
+    target = member or ctx.author
+    if target.bot:
+        await ctx.send("Choose a non-bot member.")
+        return
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
+
+    cache_key = (ctx.guild.id, "duofind", target.id)
+    cached = SOCIALINTEL_RESULT_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached[0] < SOCIALINTEL_CACHE_SECONDS:
+        await send_chunked(ctx, cached[1] + "\n\n_(Cached result for speed)_")
+        return
+
+    async with ctx.typing():
+        await maybe_run_socialintel_backfill(ctx.guild)
+        context = collect_socialintel_context(ctx.guild, target)
+        if context.target_message_count < 8:
+            await ctx.send(
+                f"Not enough evidence yet for {target.mention}. I need more visible history first."
+            )
+            return
+        candidate_pool = build_socialintel_duo_candidate_pool(
+            ctx.guild,
+            target,
+            context,
+            limit=max(7, SOCIALINTEL_MAX_RESULTS),
+        )
+        if not candidate_pool:
+            await ctx.send(
+                f"Not enough evidence yet for {target.mention}. No strong compatibility candidates were visible."
+            )
+            return
+        annotate_socialintel_duo_confidences(candidate_pool, context.target_message_count)
+        ranked_ids = await rerank_socialintel_duo_candidates_with_ai(
+            target,
+            candidates=candidate_pool,
+        )
+        ranked_rows = _socialintel_apply_rank_order(candidate_pool, ranked_ids)[:SOCIALINTEL_MAX_RESULTS]
+
+    lines: list[str] = []
+    for index, row in enumerate(ranked_rows[:5], start=1):
+        reasons = _socialintel_duo_reason_bits(ctx.guild, row)
+        lines.append(
+            f"{index}. {row['display_label']} | score `{_socialintel_duo_score_percent(float(row.get('heuristic_score', 0.0)))}%` | "
+            f"confidence `{int(float(row.get('confidence', 0.0)) * 100)}%` ({row.get('confidence_band', 'low')}) | "
+            f"{', '.join(reasons) if reasons else 'light overlap only'}"
+        )
+    coverage = _socialintel_scan_coverage(ctx.guild.id)
+    result = (
+        f"[DUOFIND] for {target.mention}\n"
+        + "\n".join(lines)
+        + f"\nCoverage: channels `{coverage.get('channels_fully_scanned', 0)}/{coverage.get('channels_total', 0)}` | indexed msgs `{coverage.get('messages_indexed', 0)}`\n"
+        + "Guardrail: this ranks friendship, teamwork, or debate compatibility only. Shared-channel-only overlap is capped to low or medium confidence."
+    )
+    SOCIALINTEL_RESULT_CACHE[cache_key] = (time.monotonic(), result)
+    await send_chunked(ctx, result)
+
+
+@bot.hybrid_command(name="threadrevive")
+@commands.cooldown(2, 30, commands.BucketType.user)
+@commands.guild_only()
+async def threadrevive_command(ctx: commands.Context, target: str | None = None) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
+    resolved = resolve_channel_or_thread(ctx.guild, target, default_channel=ctx.channel)
+    if not isinstance(resolved, (discord.TextChannel, discord.Thread)):
+        await ctx.send(
+            f"Usage: `{PREFIX}threadrevive`, `{PREFIX}threadrevive #channel`, or `{PREFIX}threadrevive <thread-name>`."
+        )
+        return
+
+    cache_key = (ctx.guild.id, "threadrevive", resolved.id)
+    cached = SOCIALINTEL_RESULT_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached[0] < SOCIALINTEL_CACHE_SECONDS:
+        await send_chunked(ctx, cached[1] + "\n\n_(Cached result for speed)_")
+        return
+
+    async with ctx.typing():
+        guild_state = get_guild_socialintel_state(ctx.guild.id)
+        row = _socialintel_get_channel_row(guild_state, resolved)
+        prompts = _socialintel_build_threadrevive_prompts(row, limit=3)
+        if not prompts and _socialintel_needs_backfill(ctx.guild.id):
+            await maybe_run_socialintel_backfill(ctx.guild)
+            guild_state = get_guild_socialintel_state(ctx.guild.id)
+            row = _socialintel_get_channel_row(guild_state, resolved)
+            prompts = _socialintel_build_threadrevive_prompts(row, limit=3)
+        if not prompts:
+            await ctx.send(
+                f"Not enough evidence yet in {_socialintel_channel_label(resolved)}. I could not find a grounded unresolved question or conflict."
+            )
+            return
+
+    focus_kind, focus_text = _socialintel_thread_focus(row)
+    topic_words = _socialintel_counter_labels(
+        row.get("recent_topics", {}) if isinstance(row.get("recent_topics"), dict) else {},
+        limit=4,
+    )
+    evidence_note = (
+        f"Built from the last {focus_kind or 'visible'} signal plus recent topics: "
+        f"{', '.join(topic_words) if topic_words else 'limited topic evidence'}."
+    )
+    result = (
+        f"[THREADREVIVE] {_socialintel_channel_label(resolved)}\n"
+        f"Focus: `{_socialintel_compact_excerpt(focus_text, 160)}`\n"
+        f"1. {prompts[0]}\n"
+        f"2. {prompts[1] if len(prompts) > 1 else prompts[0]}\n"
+        f"3. {prompts[2] if len(prompts) > 2 else prompts[-1]}\n"
+        f"Evidence note: {evidence_note}"
+    )
+    SOCIALINTEL_RESULT_CACHE[cache_key] = (time.monotonic(), result)
+    await send_chunked(ctx, result)
+
+
+@bot.hybrid_command(name="jumpin")
+@commands.cooldown(2, 35, commands.BucketType.user)
+@commands.guild_only()
+async def jumpin_command(ctx: commands.Context, member: discord.Member | None = None) -> None:
+    target = member or ctx.author
+    if target.bot:
+        await ctx.send("Choose a non-bot member.")
+        return
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
+
+    cache_key = (ctx.guild.id, "jumpin", target.id)
+    cached = SOCIALINTEL_RESULT_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached[0] < 90:
+        await send_chunked(ctx, cached[1] + "\n\n_(Cached result for speed)_")
+        return
+
+    async with ctx.typing():
+        if _socialintel_needs_backfill(ctx.guild.id):
+            await maybe_run_socialintel_backfill(ctx.guild)
+        rows = await _socialintel_build_jumpin_rows(ctx.guild, target)
+        if not rows:
+            await ctx.send(
+                f"Not enough evidence yet for {target.mention}. I need more visible history or more active channels."
+            )
+            return
+
+    lines: list[str] = []
+    for index, row in enumerate(rows, start=1):
+        channel = row["channel"]
+        lines.append(
+            f"{index}. {_socialintel_channel_label(channel)} | score `{int(min(99, float(row.get('score', 0.0)) * 20))}`\n"
+            f"Reason: {row['reason']}\n"
+            f"Opener: {row['opener']}"
+        )
+    result = f"[JUMPIN] for {target.mention}\n" + "\n".join(lines)
+    SOCIALINTEL_RESULT_CACHE[cache_key] = (time.monotonic(), result)
+    await send_chunked(ctx, result)
+
+
+@bot.hybrid_command(name="driftcheck")
+@commands.cooldown(2, 45, commands.BucketType.user)
+@commands.guild_only()
+async def driftcheck_command(ctx: commands.Context, member: discord.Member) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can use `driftcheck`.")
+        return
+    if member.bot:
+        await ctx.send("Choose a non-bot member.")
+        return
+
+    cache_key = (ctx.guild.id, "driftcheck", member.id)
+    cached = SOCIALINTEL_RESULT_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached[0] < SOCIALINTEL_CACHE_SECONDS:
+        await send_chunked(ctx, cached[1] + "\n\n_(Cached result for speed)_")
+        return
+
+    async with ctx.typing():
+        await maybe_run_socialintel_backfill(ctx.guild)
+        report = await _socialintel_build_driftcheck_report(ctx.guild, member)
+        if report is None:
+            await ctx.send(
+                f"Not enough evidence yet for {member.mention}. I need a stronger recent-vs-baseline sample."
+            )
+            return
+
+    baseline_metrics = report["baseline_metrics"]
+    recent_metrics = report["recent_metrics"]
+    result = (
+        f"[DRIFTCHECK] for {member.mention}\n"
+        f"Anomaly score: `{int(float(report['anomaly_score']) * 100)}%` ({report['band']})\n"
+        f"Comparison windows: recent `{report['recent_count']}` msgs vs baseline `{report['baseline_count']}` msgs\n"
+        f"- Style drift: `{float(report['style_drift']):.2f}` | avg len `{float(baseline_metrics.get('avg_len', 0.0)):.1f} -> {float(recent_metrics.get('avg_len', 0.0)):.1f}` | emoji/msg `{float(baseline_metrics.get('emoji_per_msg', 0.0)):.2f} -> {float(recent_metrics.get('emoji_per_msg', 0.0)):.2f}`\n"
+        f"- Activity-time drift: `{float(report['activity_drift']):.2f}` | baseline hours `{_socialintel_recent_peak_label(baseline_metrics.get('active_hours', {}), kind='hours')}` | recent `{_socialintel_recent_peak_label(recent_metrics.get('active_hours', {}), kind='hours')}`\n"
+        f"- Channel drift: `{float(report['channel_drift']):.2f}` | baseline `{_socialintel_channel_names_from_counter(ctx.guild, baseline_metrics.get('top_channels', {}))}` | recent `{_socialintel_channel_names_from_counter(ctx.guild, recent_metrics.get('top_channels', {}))}`\n"
+        f"- Interaction-target drift: `{float(report['interaction_drift']):.2f}` | baseline `{_socialintel_target_names_from_counter(ctx.guild, baseline_metrics.get('reply_targets', {}))}` | recent `{_socialintel_target_names_from_counter(ctx.guild, recent_metrics.get('reply_targets', {}))}`\n"
+        f"- Presence drift: `{float(report['presence_drift']):.2f}` | current status `{report['current_status']}`\n"
+        f"- Profile drift: `{float(report['profile_drift']):.2f}` | {report['profile_note']}\n"
+        "Caution: Behavioral anomaly only from visible activity; not proof of compromise or account sharing."
+    )
+    SOCIALINTEL_RESULT_CACHE[cache_key] = (time.monotonic(), result)
+    await send_chunked(ctx, result)
+
+
+@bot.hybrid_command(name="arcreport")
+@commands.cooldown(2, 45, commands.BucketType.user)
+@commands.guild_only()
+async def arcreport_command(
+    ctx: commands.Context,
+    target: str | None = None,
+    hours: int = 6,
+) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can use `arcreport`.")
+        return
+    resolved = resolve_channel_or_thread(ctx.guild, target, default_channel=ctx.channel)
+    if not isinstance(resolved, (discord.TextChannel, discord.Thread)):
+        await ctx.send(
+            f"Usage: `{PREFIX}arcreport #channel` or `{PREFIX}arcreport #channel 6`."
+        )
+        return
+    hours = max(1, min(hours, 72))
+
+    cache_key = (ctx.guild.id, "arcreport", resolved.id, hours)
+    cached = SOCIALINTEL_RESULT_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached[0] < 120:
+        await send_chunked(ctx, cached[1] + "\n\n_(Cached result for speed)_")
+        return
+
+    cutoff_dt = _utc_now() - timedelta(hours=hours)
+    async with ctx.typing():
+        if isinstance(resolved, discord.TextChannel):
+            entries = await get_channel_window_cached(
+                resolved,
+                after=cutoff_dt,
+                scan_limit=max(120, min(720, hours * 120)),
+                cache_ttl_seconds=90,
+                include_attachment_marker=True,
+            )
+        else:
+            entries = await collect_messageable_window(
+                resolved,
+                limit=max(120, min(720, hours * 120)),
+                after=cutoff_dt,
+            )
+        report = _socialintel_arc_report_lines(ctx.guild, entries)
+        if report is None:
+            await ctx.send(
+                f"Not enough evidence yet in {_socialintel_channel_label(resolved)} over the last `{hours}` hour(s)."
+            )
+            return
+
+    starter = report["starter"]
+    stamp = datetime.fromtimestamp(starter.created_at_ts, tz=_safe_zoneinfo(get_guild_engagement_timezone(ctx.guild.id))).strftime("%H:%M")
+    guild_state = get_guild_socialintel_state(ctx.guild.id)
+    channel_row = _socialintel_get_channel_row(guild_state, resolved)
+    focus_kind, focus_text = _socialintel_thread_focus(channel_row)
+    unresolved = list(report["unresolved"])
+    if focus_text and all(focus_text not in item for item in unresolved):
+        unresolved.insert(0, _socialintel_compact_excerpt(focus_text, 120))
+    result = (
+        f"[ARCREPORT] {_socialintel_channel_label(resolved)} over last `{hours}`h\n"
+        f"Likely starter: {_socialintel_author_label(ctx.guild, starter.author_id)} at `{stamp}` - `{_socialintel_compact_excerpt(starter.content, 120)}`\n"
+        f"Escalators: {', '.join(report['escalators']) if report['escalators'] else 'none strong enough to call'}\n"
+        f"De-escalators: {', '.join(report['deescalators']) if report['deescalators'] else 'none clearly visible'}\n"
+        f"Conversation pivots:\n" + ("\n".join(f"- {line}" for line in report["pivots"]) if report["pivots"] else "- none clearly visible")
+        + "\nUnresolved points:\n"
+        + ("\n".join(f"- `{item}`" for item in unresolved[:3]) if unresolved else "- none clearly visible")
+        + "\nEvidence snippets:\n"
+        + ("\n".join(f"- {line}" for line in report["evidence_lines"]) if report["evidence_lines"] else "- none captured")
+        + "\nTone: factual moderation summary only; not a punishment recommendation."
+    )
+    SOCIALINTEL_RESULT_CACHE[cache_key] = (time.monotonic(), result)
+    await send_chunked(ctx, result)
 
 
 @bot.hybrid_command(name="aicrush")
@@ -4626,11 +21572,31 @@ async def aicrush_command(ctx: commands.Context, member: discord.Member) -> None
     if member.bot:
         await ctx.send("This command is for server members only.")
         return
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
 
     cache_key = (ctx.guild.id, member.id)
     now = time.monotonic()
+    guild_aicrush_state = get_guild_aicrush_state(ctx.guild.id)
+    channels_state = guild_aicrush_state.get("channels", {})
+    fully_scanned = 0
+    channels_total = len(channels_state) if isinstance(channels_state, dict) else 0
+    if isinstance(channels_state, dict):
+        fully_scanned = sum(
+            1
+            for row in channels_state.values()
+            if isinstance(row, dict) and bool(row.get("fully_scanned"))
+        )
+    meta = guild_aicrush_state.get("meta", {})
+    last_backfill_ts = float(meta.get("last_backfill_ts", 0.0) or 0.0) if isinstance(meta, dict) else 0.0
+    cache_allowed = (
+        channels_total > 0
+        and fully_scanned >= channels_total
+        and last_backfill_ts > 0
+        and (time.time() - last_backfill_ts) <= AICRUSH_STATE_STALE_SECONDS
+    )
     cached = AICRUSH_RESULT_CACHE.get(cache_key)
-    if cached and now - cached[0] < AICRUSH_CACHE_SECONDS:
+    if cache_allowed and cached and now - cached[0] < AICRUSH_CACHE_SECONDS:
         await send_chunked(ctx, cached[1] + "\n\n_(Cached result to avoid rate limits)_")
         return
 
@@ -4641,83 +21607,352 @@ async def aicrush_command(ctx: commands.Context, member: discord.Member) -> None
 
     async with ctx.typing():
         async with scan_lock:
-            total_messages, interaction_points, target_lines, candidate_lines = await collect_aicrush_interactions(
-                ctx.guild, member.id
+            backfill_summary = await run_aicrush_backfill(
+                ctx.guild,
+                message_budget=AICRUSH_COMMAND_MAX_BACKFILL_MESSAGES,
+                time_budget_seconds=AICRUSH_COMMAND_MAX_BACKFILL_SECONDS,
             )
-            if total_messages < 1:
-                await ctx.send(
-                    f"I could not find any visible messages from {member.mention} in accessible channels."
+            context = await collect_aicrush_interactions(ctx.guild, member.id)
+            crush_pool, target_gender = await build_aicrush_directional_candidate_pool(
+                ctx.guild,
+                member,
+                context,
+                direction="crush",
+                limit=10,
+            )
+            admirer_pool, _ = await build_aicrush_directional_candidate_pool(
+                ctx.guild,
+                member,
+                context,
+                direction="admirer",
+                limit=10,
+            )
+
+            if not crush_pool and not admirer_pool:
+                coverage = context.scan_coverage
+                result = (
+                    f"[AI CRUSH] for {member.display_name}\n"
+                    "Not enough evidence yet after deep scan.\n"
+                    f"Coverage: channels `{coverage.get('channels_fully_scanned', 0)}/{coverage.get('channels_total', 0)}` | "
+                    f"indexed msgs `{coverage.get('messages_indexed', 0)}` | "
+                    f"target msgs `{context.target_message_count}` | "
+                    f"freshly scanned `{backfill_summary.get('scanned_messages', 0)}` in `{backfill_summary.get('passes', 0)}` passes.\n"
+                    "No replies, mentions, or plain-name references were concentrated enough around one member yet.\n\n"
+                    "[For fun only]"
                 )
-                return
-            if not interaction_points:
-                await ctx.send(
-                    f"I could not detect enough direct interactions for {member.mention} yet."
-                )
+                AICRUSH_RESULT_CACHE[cache_key] = (time.monotonic(), result)
+                await send_chunked(ctx, result)
                 return
 
-            match_member, target_gender, top_points = await find_best_opposite_gender_match(
-                ctx.guild, member, interaction_points
+            crush_pick_id, crush_reason, crush_ai_conf = await rerank_aicrush_candidates_with_ai(
+                member,
+                target_gender=target_gender,
+                context=context,
+                candidates=crush_pool,
+                direction="crush",
             )
-            if target_gender is None:
-                await ctx.send(
-                    f"I could not detect a clear Male/Female role for {member.mention}. "
-                    "Set a gender role first, then try again."
-                )
-                return
-            if match_member is None:
-                expected_role = "Female" if target_gender == "male" else "Male"
-                await ctx.send(
-                    f"I found interactions, but no opposite-gender match with detectable `{expected_role}` role."
-                )
-                return
-
-            total_points = max(1, sum(interaction_points.values()))
-            dominance = top_points / total_points
-            compatibility = int(max(55, min(97, 54 + dominance * 40 + min(10, top_points * 0.8))))
-            drama_rating = int(max(2, min(10, 3 + (1 - dominance) * 5 + (1 if top_points < 6 else 0))))
-
-            reason = (
-                f"{member.display_name} interacts most with {match_member.display_name}, "
-                f"with `{top_points}` strong interaction points out of `{total_points}` tracked."
+            admirer_pick_id, admirer_reason, admirer_ai_conf = await rerank_aicrush_candidates_with_ai(
+                member,
+                target_gender=target_gender,
+                context=context,
+                candidates=admirer_pool,
+                direction="admirer",
             )
-            if is_ai_configured():
-                user_para = lines_to_paragraph(target_lines, int(AICRUSH_MAX_CONTEXT_CHARS * 0.66))
-                match_para = lines_to_paragraph(
-                    candidate_lines.get(match_member.id, []),
-                    int(AICRUSH_MAX_CONTEXT_CHARS * 0.34),
-                )
-                prompt = (
-                    "Generate one short, playful ship explanation for a Discord AI crush feature.\n"
-                    "No explicit content, no doxxing, no serious claims.\n"
-                    "Keep it to 1-2 lines.\n\n"
-                    f"User A: {member.display_name}\n"
-                    f"User B: {match_member.display_name}\n"
-                    f"User A gender: {target_gender}\n"
-                    f"User B gender: {'female' if target_gender == 'male' else 'male'}\n"
-                    f"Messages found for User A: {total_messages}\n"
-                    f"Interaction dominance: {dominance:.2f}\n"
-                    f"Compatibility score: {compatibility}\n"
-                    f"Drama rating: {drama_rating}/10\n"
-                    "User A all-message paragraph:\n"
-                    f"{user_para}\n\n"
-                    "User B interaction paragraph:\n"
-                    f"{match_para or '(limited interaction text)'}"
-                )
-                try:
-                    reason = await request_fun_ai(prompt, max_tokens=110, temperature=0.8)
-                except Exception as error:
-                    print(f"[AICRUSH AI REASON ERROR] {error}")
+
+            crush_row = _aicrush_pick_row(crush_pool, crush_pick_id)
+            admirer_row = _aicrush_pick_row(admirer_pool, admirer_pick_id)
+            crush_confidence, crush_band = _aicrush_confidence_from_pool(crush_pool)
+            admirer_confidence, admirer_band = _aicrush_confidence_from_pool(admirer_pool)
+            crush_confidence = max(crush_confidence, crush_ai_conf)
+            admirer_confidence = max(admirer_confidence, admirer_ai_conf)
+
+            crush_member = crush_row.get("member") if isinstance(crush_row, dict) else None
+            admirer_member = admirer_row.get("member") if isinstance(admirer_row, dict) else None
+
+            if isinstance(crush_member, discord.Member):
+                history_key = (ctx.guild.id, member.id)
+                previous = AICRUSH_LAST_MATCHES.get(history_key)
+                cooldown_seconds = AICRUSH_MATCH_COOLDOWN_HOURS * 3600
+                if (
+                    previous is not None
+                    and time.monotonic() - previous[1] < cooldown_seconds
+                    and previous[0] == crush_member.id
+                    and len(crush_pool) > 1
+                ):
+                    alt = crush_pool[1]
+                    alt_member = alt.get("member")
+                    if (
+                        isinstance(alt_member, discord.Member)
+                        and float(alt.get("heuristic_score", 0.0))
+                        >= float(crush_row.get("heuristic_score", 0.0)) * 0.72
+                    ):
+                        crush_row = alt
+                        crush_member = alt_member
+                AICRUSH_LAST_MATCHES[history_key] = (crush_member.id, time.monotonic())
+
+            explanation = await build_aicrush_pair_explanation(
+                member,
+                crush_row=crush_row,
+                admirer_row=admirer_row,
+                context=context,
+                crush_confidence=crush_confidence,
+                admirer_confidence=admirer_confidence,
+            )
+
+    mutual_signal = (
+        isinstance(crush_member, discord.Member)
+        and isinstance(admirer_member, discord.Member)
+        and crush_member.id == admirer_member.id
+    )
+    crush_line = (
+        f"{crush_member.mention} | confidence `{int(crush_confidence * 100)}%` ({crush_band})"
+        if isinstance(crush_member, discord.Member)
+        else f"No clear crush target yet | confidence `{int(crush_confidence * 100)}%` ({crush_band})"
+    )
+    admirer_line = (
+        f"{admirer_member.mention} | confidence `{int(admirer_confidence * 100)}%` ({admirer_band})"
+        if isinstance(admirer_member, discord.Member)
+        else f"No clear admirer yet | confidence `{int(admirer_confidence * 100)}%` ({admirer_band})"
+    )
+    low_data_note = ""
+    low_data_reasons: list[str] = []
+    if context.target_message_count <= 4:
+        low_data_reasons.append("very few target-authored messages")
+    if (
+        context.scan_coverage.get("channels_total", 0) > 0
+        and context.scan_coverage.get("channels_fully_scanned", 0)
+        < context.scan_coverage.get("channels_total", 0)
+    ):
+        low_data_reasons.append("historical backfill still in progress")
+    if low_data_reasons:
+        low_data_note = "\nEvidence note: " + "; ".join(low_data_reasons) + "."
+
+    coverage = context.scan_coverage
+    rationale_lines = []
+    if crush_reason:
+        rationale_lines.append(f"Crush rationale: {crush_reason}")
+    if admirer_reason:
+        rationale_lines.append(f"Admirer rationale: {admirer_reason}")
+    rationale_text = "\n".join(rationale_lines)
+    if rationale_text:
+        rationale_text = f"\n{rationale_text}"
 
     result = (
-        f"💘 **AI Crush for {member.display_name}**\n"
-        f"Secret crush guess: {match_member.mention}\n"
-        f"Love compatibility: `{compatibility}%`\n"
-        f"Drama rating: `{drama_rating}/10`\n"
-        f"Reason: {reason}\n\n"
-        "⚠️ For fun only."
+        f"[AI CRUSH] for {member.display_name}\n"
+        f"Likely crush of {member.display_name}: {crush_line}\n"
+        f"Likely admirer of {member.display_name}: {admirer_line}\n"
+        f"Mutual signal: `{'yes' if mutual_signal else 'no'}`\n"
+        f"Why:\n{explanation}{rationale_text}\n"
+        f"Coverage: channels `{coverage.get('channels_fully_scanned', 0)}/{coverage.get('channels_total', 0)}` | "
+        f"indexed msgs `{coverage.get('messages_indexed', 0)}` | "
+        f"target msgs `{context.target_message_count}` | "
+        f"freshly scanned `{backfill_summary.get('scanned_messages', 0)}` in `{backfill_summary.get('passes', 0)}` passes{low_data_note}\n"
+        "Engagement prompt: Reply with the ship-name or call out the plot twist.\n\n"
+        "[For fun only]"
     )
     AICRUSH_RESULT_CACHE[cache_key] = (time.monotonic(), result)
     await send_chunked(ctx, result)
+
+
+@bot.hybrid_command(name="altfinder")
+@commands.cooldown(2, 90, commands.BucketType.user)
+@commands.guild_only()
+async def altfinder_command(ctx: commands.Context, member: discord.Member) -> None:
+    if member.bot:
+        await ctx.send("Bot accounts are not valid AltFinder targets.")
+        return
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can use `altfinder`.")
+        return
+
+    cache_key = (ctx.guild.id, member.id)
+    guild_altfinder_state = get_guild_altfinder_state(ctx.guild.id)
+    channels_state = guild_altfinder_state.get("channels", {})
+    channels_total = len(channels_state) if isinstance(channels_state, dict) else 0
+    channels_fully_scanned = 0
+    if isinstance(channels_state, dict):
+        channels_fully_scanned = sum(
+            1
+            for row in channels_state.values()
+            if isinstance(row, dict) and bool(row.get("fully_scanned"))
+        )
+    meta = guild_altfinder_state.get("meta", {})
+    last_backfill_ts = float(meta.get("last_backfill_ts", 0.0) or 0.0) if isinstance(meta, dict) else 0.0
+    cache_allowed = channels_total > 0 and channels_fully_scanned >= channels_total and last_backfill_ts > 0
+    cached = ALTFINDER_RESULT_CACHE.get(cache_key)
+    if cache_allowed and cached and time.monotonic() - cached[0] < ALTFINDER_CACHE_SECONDS:
+        await send_chunked(ctx, cached[1] + "\n\n_(Cached result after full-history scan)_")
+        return
+
+    scan_lock = ALTFINDER_LOCKS[cache_key]
+    if scan_lock.locked():
+        await ctx.send("`altfinder` scan already running for that user. Try again shortly.")
+        return
+
+    async with ctx.typing():
+        async with scan_lock:
+            fresh_cached = ALTFINDER_RESULT_CACHE.get(cache_key)
+            if cache_allowed and fresh_cached and time.monotonic() - fresh_cached[0] < ALTFINDER_CACHE_SECONDS:
+                await send_chunked(ctx, fresh_cached[1] + "\n\n_(Cached result after full-history scan)_")
+                return
+
+            backfill_summary = await run_altfinder_backfill(
+                ctx.guild,
+                message_budget=ALTFINDER_COMMAND_MAX_BACKFILL_MESSAGES,
+                time_budget_seconds=ALTFINDER_COMMAND_MAX_BACKFILL_SECONDS,
+            )
+            context = collect_altfinder_context(ctx.guild, member)
+            candidate_pool = build_altfinder_candidate_pool(
+                ctx.guild,
+                member,
+                context,
+                limit=max(ALTFINDER_MAX_RESULTS, 5),
+            )
+            ranked_ids = await rerank_altfinder_candidates_with_ai(
+                member,
+                context=context,
+                candidates=candidate_pool,
+            )
+            ranked_rows = _altfinder_apply_rank_order(candidate_pool, ranked_ids)
+            annotate_altfinder_confidences(ranked_rows, context.target_message_count)
+            ranked_rows = ranked_rows[: max(ALTFINDER_MAX_RESULTS, 5)]
+
+            coverage = context.scan_coverage
+            coverage_line = (
+                f"Coverage: channels `{coverage.get('channels_fully_scanned', 0)}/{coverage.get('channels_total', 0)}` | "
+                f"indexed msgs `{coverage.get('messages_indexed', 0)}` | "
+                f"target msgs `{context.target_message_count}` | "
+                f"freshly scanned `{backfill_summary.get('scanned_messages', 0)}` in `{backfill_summary.get('passes', 0)}` passes"
+            )
+            weak_evidence = (
+                not ranked_rows
+                or float(ranked_rows[0].get("confidence", 0.0)) < 0.38
+                or float(ranked_rows[0].get("evidence_density", 0.0)) < 0.18
+                or context.target_message_count < 4
+            )
+            if weak_evidence:
+                suspect_focus_lines = _altfinder_suspect_focus_lines(context.suspect_ids, ranked_rows)
+                result = (
+                    f"[ALT FINDER] for {member.display_name}\n"
+                    "Not enough evidence yet after deep scan.\n"
+                    + (
+                        ("Suspect focus:\n" + "\n".join(suspect_focus_lines) + "\n")
+                        if suspect_focus_lines
+                        else ""
+                    )
+                    +
+                    f"{coverage_line}\n"
+                    "Inference only from visible metadata and chat behavior; not proof of shared ownership."
+                )
+                ALTFINDER_RESULT_CACHE[cache_key] = (time.monotonic(), result)
+                await send_chunked(ctx, result)
+                return
+
+            summary = await build_altfinder_investigation_summary(
+                member,
+                ranked_rows=ranked_rows,
+                context=context,
+            )
+            suspect_focus_lines = _altfinder_suspect_focus_lines(context.suspect_ids, ranked_rows)
+            ranking_lines = [
+                (
+                    f"{index}. {row['display_label']} | confidence "
+                    f"`{int(float(row.get('confidence', 0.0)) * 100)}%` ({row.get('confidence_band', 'low')}) | "
+                    f"{row['scope_label']} | {_altfinder_short_evidence_summary(row)}"
+                )
+                for index, row in enumerate(ranked_rows[:ALTFINDER_MAX_RESULTS], start=1)
+            ]
+            detail_blocks = "\n\n".join(
+                _altfinder_detailed_evidence_block(ctx.guild, row, context=context)
+                for row in ranked_rows[:3]
+            )
+            result = (
+                f"[ALT FINDER] for {member.display_name}\n"
+                + (
+                    ("Suspect focus:\n" + "\n".join(suspect_focus_lines) + "\n\n")
+                    if suspect_focus_lines
+                    else ""
+                )
+                + "Ranked shortlist:\n"
+                + "\n".join(ranking_lines)
+                + "\n\nInvestigation summary:\n"
+                + summary
+                + "\n\nDetailed evidence:\n"
+                + detail_blocks
+                + f"\n\n{coverage_line}\n"
+                + "Inference only from visible metadata and chat behavior; not proof of shared ownership."
+            )
+            ALTFINDER_RESULT_CACHE[cache_key] = (time.monotonic(), result)
+
+    await send_chunked(ctx, result)
+
+
+@bot.hybrid_command(name="suspect")
+@commands.cooldown(2, 20, commands.BucketType.user)
+@commands.guild_only()
+async def suspect_command(
+    ctx: commands.Context,
+    target: discord.Member,
+    suspect1: discord.Member,
+    suspect2: discord.Member | None = None,
+    suspect3: discord.Member | None = None,
+) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can use `suspect`.")
+        return
+    if target.bot:
+        await ctx.send("Target must be a non-bot member.")
+        return
+    suspects_raw = [suspect1, suspect2, suspect3]
+    suspects: list[discord.Member] = []
+    for member in suspects_raw:
+        if member is None or member.bot or member.id == target.id:
+            continue
+        if all(existing.id != member.id for existing in suspects):
+            suspects.append(member)
+        if len(suspects) >= ALTFINDER_MAX_SUSPECTS:
+            break
+    if not suspects:
+        await ctx.send("Provide at least one valid non-bot suspect different from the target.")
+        return
+    set_altfinder_suspects(ctx.guild.id, target.id, [member.id for member in suspects])
+    suspect_labels = ", ".join(member.mention for member in suspects)
+    await ctx.send(
+        f"Stored `{len(suspects)}` suspect account(s) for {target.mention}: {suspect_labels}\n"
+        "AltFinder will compare these accounts first before the wider shortlist."
+    )
+
+
+@bot.hybrid_command(name="suspectshow")
+@commands.cooldown(2, 10, commands.BucketType.user)
+@commands.guild_only()
+async def suspectshow_command(ctx: commands.Context, target: discord.Member) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can use `suspectshow`.")
+        return
+    suspect_ids = get_altfinder_suspects(ctx.guild.id, target.id)
+    if not suspect_ids:
+        await ctx.send(f"No suspects stored for {target.mention}.")
+        return
+    labels: list[str] = []
+    for suspect_id in suspect_ids:
+        suspect_member = ctx.guild.get_member(suspect_id)
+        if suspect_member is not None:
+            labels.append(suspect_member.mention)
+        else:
+            labels.append(f"`{suspect_id}`")
+    await ctx.send(f"Suspects for {target.mention}: {', '.join(labels)}")
+
+
+@bot.hybrid_command(name="suspectclear")
+@commands.cooldown(2, 10, commands.BucketType.user)
+@commands.guild_only()
+async def suspectclear_command(ctx: commands.Context, target: discord.Member) -> None:
+    if not isinstance(ctx.author, discord.Member) or not is_moderator(ctx.author):
+        await ctx.send("Only moderators can use `suspectclear`.")
+        return
+    clear_altfinder_suspects(ctx.guild.id, target.id)
+    await ctx.send(f"Cleared stored suspects for {target.mention}.")
 
 
 @bot.hybrid_command(name="analyze")
@@ -4727,42 +21962,116 @@ async def analyze_command(ctx: commands.Context, member: discord.Member) -> None
     if member.bot:
         await ctx.send("Bot accounts are not supported for analysis.")
         return
-    if not is_ai_configured():
-        await ctx.send(ai_setup_message())
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
+
+    cache_key = (ctx.guild.id, member.id)
+    now = time.monotonic()
+    cached = ANALYZE_CACHE.get(cache_key)
+    if cached and now - cached[0] < ANALYZE_CACHE_SECONDS:
+        await send_chunked(ctx, cached[1] + "\n\n_(Cached result for speed)_")
+        return
+
+    lock = ANALYZE_LOCKS[cache_key]
+    if lock.locked():
+        await ctx.send("Analyze scan already running for that user. Try again in a few seconds.")
         return
 
     async with ctx.typing():
-        user_messages = await collect_recent_user_messages(ctx.channel, member.id, 200)
-        if len(user_messages) < 20:
-            await ctx.send(f"Need more recent messages from {member.mention} in this channel.")
-            return
-        stats = user_style_stats(user_messages)
-        prompt = (
-            "Analyze this Discord user's communication style in a fun, non-clinical way.\n"
-            "No medical or mental-health diagnosis.\n"
-            "Return exactly:\n"
-            "Communication style: ...\n"
-            "Confidence level: ...\n"
-            "Hidden trait: ...\n"
-            "Emoji frequency: ...\n"
-            "Word-usage signature: ...\n\n"
-            f"User: {member.display_name}\n"
-            f"Average message length: {stats['avg_len']}\n"
-            f"Question ratio: {stats['question_ratio']}\n"
-            f"Exclaim ratio: {stats['exclaim_ratio']}\n"
-            f"Emoji per message: {stats['emoji_per_msg']}\n"
-            f"Top words: {stats['top_words']}\n"
-            "Recent message sample:\n"
-            + "\n".join(f"- {m}" for m in user_messages[-30:])
-        )
-        try:
-            result = await request_fun_ai(prompt, max_tokens=230, temperature=0.55)
-        except Exception as error:
-            print(f"[ANALYZE ERROR] {error}")
-            await ctx.send(friendly_ai_error(error))
-            return
-    await send_chunked(ctx, f"🧠 **Analysis for {member.display_name}**\n{result}\n\n⚠️ For fun only.")
+        async with lock:
+            fresh_cached = ANALYZE_CACHE.get(cache_key)
+            if fresh_cached and time.monotonic() - fresh_cached[0] < ANALYZE_CACHE_SECONDS:
+                await send_chunked(ctx, fresh_cached[1] + "\n\n_(Cached result for speed)_")
+                return
 
+            user_messages, user_entries = await collect_recent_user_messages_guild(
+                ctx.guild,
+                member.id,
+                260,
+            )
+            if len(user_messages) < 20:
+                await ctx.send(
+                    f"Need more visible messages from {member.mention} across readable channels."
+                )
+                return
+
+            joined = " ".join(user_messages).lower()
+            tokens = [tok.strip("'") for tok in WORD_PATTERN.findall(joined) if len(tok) > 2]
+            filtered = [tok for tok in tokens if tok not in ROAST_STOP_WORDS]
+            top_words = [word for word, _ in Counter(filtered).most_common(8)]
+            avg_len = sum(len(msg) for msg in user_messages) / max(1, len(user_messages))
+            question_ratio = sum(1 for msg in user_messages if "?" in msg) / max(1, len(user_messages))
+            exclaim_ratio = sum(1 for msg in user_messages if "!" in msg) / max(1, len(user_messages))
+            emoji_per_msg = sum(len(EMOJI_PATTERN.findall(msg)) for msg in user_messages) / max(1, len(user_messages))
+            vocab_diversity = len(set(filtered)) / max(1, len(filtered))
+            confidence = analyze_confidence_band(len(user_messages), vocab_diversity)
+            best_channel_fit, trigger, best_time = derive_analyze_actionables(
+                ctx.guild,
+                user_entries,
+                top_words,
+                question_ratio,
+                exclaim_ratio,
+            )
+
+            deterministic_block = (
+                f"Communication style: {'high-energy conversationalist' if exclaim_ratio >= 0.22 else 'measured conversationalist'}\n"
+                f"Confidence level: {confidence} ({len(user_messages)} messages)\n"
+                f"Hidden trait: {'asks to validate ideas quickly' if question_ratio >= 0.3 else 'prefers statement-led conversation'}\n"
+                f"Emoji frequency: {emoji_per_msg:.2f} per message\n"
+                f"Word-usage signature: {', '.join(top_words[:5]) if top_words else 'general chat vocabulary'}\n"
+                f"Best channel fit: {best_channel_fit}\n"
+                f"Communication trigger: {trigger}\n"
+                f"Best time to engage: {best_time}"
+            )
+
+            narrative = ""
+            if is_ai_configured():
+                prompt = (
+                    "You are writing a concise Discord user behavior analysis.\n"
+                    "Use the deterministic metrics below as source of truth.\n"
+                    "No diagnosis, no medical claims.\n"
+                    "Return only 4 short bullets:\n"
+                    "- Core communication vibe\n"
+                    "- Confidence interpretation\n"
+                    "- Best way to engage this user\n"
+                    "- Risk to avoid\n\n"
+                    f"User: {member.display_name}\n"
+                    f"Message count: {len(user_messages)}\n"
+                    f"Avg length: {avg_len:.1f}\n"
+                    f"Question ratio: {question_ratio:.2f}\n"
+                    f"Exclaim ratio: {exclaim_ratio:.2f}\n"
+                    f"Emoji per message: {emoji_per_msg:.2f}\n"
+                    f"Vocab diversity: {vocab_diversity:.2f}\n"
+                    f"Top words: {', '.join(top_words[:7]) if top_words else 'none'}\n"
+                    f"Best channel fit: {best_channel_fit}\n"
+                    f"Best time to engage: {best_time}\n"
+                    "Message sample:\n"
+                    + "\n".join(f"- {line}" for line in user_messages[-35:])
+                )
+                try:
+                    narrative = await request_fun_ai(
+                        prompt,
+                        max_tokens=230,
+                        temperature=0.45,
+                        policy_key="analyze",
+                    )
+                except Exception as error:
+                    print(f"[ANALYZE ERROR] {error}")
+                    narrative = "- AI narrative unavailable; showing deterministic analysis only."
+
+            result = (
+                f"[ANALYSIS] for {member.display_name}\n"
+                f"{deterministic_block}"
+            )
+            if narrative:
+                result += f"\n\nAI narrative layer:\n{narrative}"
+            result += (
+                "\n\nEngagement prompt: Tag this user and test the suggested communication trigger.\n"
+                "[For fun only]"
+            )
+            ANALYZE_CACHE[cache_key] = (time.monotonic(), result)
+
+    await send_chunked(ctx, result)
 
 @bot.hybrid_command(name="lie_detector")
 @commands.cooldown(3, 45, commands.BucketType.user)
@@ -4770,6 +22079,8 @@ async def analyze_command(ctx: commands.Context, member: discord.Member) -> None
 async def lie_detector_command(
     ctx: commands.Context, member: discord.Member, *, statement: str
 ) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
     if not is_ai_configured():
         await ctx.send(ai_setup_message())
         return
@@ -4790,18 +22101,25 @@ async def lie_detector_command(
             f"Statement: {statement[:350]}"
         )
         try:
-            result = await request_fun_ai(prompt, max_tokens=160, temperature=0.6)
+            result = await request_fun_ai(
+                prompt,
+                max_tokens=160,
+                temperature=0.6,
+                policy_key="liedetector",
+            )
         except Exception as error:
             print(f"[LIE_DETECTOR ERROR] {error}")
             await ctx.send(friendly_ai_error(error))
             return
-    await send_chunked(ctx, f"🕵️ **Lie Detector for {member.display_name}**\n{result}\n\n⚠️ For fun only.")
+    await send_chunked(ctx, f"ðŸ•µï¸ **Lie Detector for {member.display_name}**\n{result}\n\nâš ï¸ For fun only.")
 
 
 @bot.hybrid_command(name="futureme")
 @commands.cooldown(2, 60, commands.BucketType.user)
 @commands.guild_only()
 async def futureme_command(ctx: commands.Context) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
     if not is_ai_configured():
         await ctx.send(ai_setup_message())
         return
@@ -4821,12 +22139,17 @@ async def futureme_command(ctx: commands.Context) -> None:
             + "\n".join(f"- {m}" for m in user_messages[-24:])
         )
         try:
-            result = await request_fun_ai(prompt, max_tokens=220, temperature=0.85)
+            result = await request_fun_ai(
+                prompt,
+                max_tokens=220,
+                temperature=0.85,
+                policy_key="futureme",
+            )
         except Exception as error:
             print(f"[FUTUREME ERROR] {error}")
             await ctx.send(friendly_ai_error(error))
             return
-    await send_chunked(ctx, f"🔮 **FutureMe for {ctx.author.display_name}**\n{result}\n\n⚠️ For fun only.")
+    await send_chunked(ctx, f"ðŸ”® **FutureMe for {ctx.author.display_name}**\n{result}\n\nâš ï¸ For fun only.")
 
 
 @bot.hybrid_command(name="rizzcoach")
@@ -4838,6 +22161,8 @@ async def rizzcoach_command(
     *,
     draft: str | None = None,
 ) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
     if not is_ai_configured():
         await ctx.send(ai_setup_message())
         return
@@ -4870,18 +22195,25 @@ async def rizzcoach_command(
             f"Original draft: {draft_text[:350]}"
         )
         try:
-            result = await request_fun_ai(prompt, max_tokens=260, temperature=0.85)
+            result = await request_fun_ai(
+                prompt,
+                max_tokens=260,
+                temperature=0.85,
+                policy_key="rizzcoach",
+            )
         except Exception as error:
             print(f"[RIZZCOACH ERROR] {error}")
             await ctx.send(friendly_ai_error(error))
             return
-    await send_chunked(ctx, f"💬 **RizzCoach ({normalized_style})**\n{result}")
+    await send_chunked(ctx, f"ðŸ’¬ **RizzCoach ({normalized_style})**\n{result}")
 
 
 @bot.hybrid_command(name="argument")
 @commands.cooldown(3, 45, commands.BucketType.user)
 @commands.guild_only()
 async def argument_command(ctx: commands.Context, *, topic: str) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
     if not is_ai_configured():
         await ctx.send(ai_setup_message())
         return
@@ -4902,7 +22234,7 @@ async def argument_command(ctx: commands.Context, *, topic: str) -> None:
     start_argument_session(ctx.channel.id, ctx.author.id, topic, side)
     await send_chunked(
         ctx,
-        f"⚔️ **Argument Mode** ({side}) on **{topic}**\n"
+        f"âš”ï¸ **Argument Mode** ({side}) on **{topic}**\n"
         f"{result}\n\n"
         "Reply with your points normally in this channel and I'll counter each one. "
         "Say `bell stop argument` to end.",
@@ -4913,6 +22245,8 @@ async def argument_command(ctx: commands.Context, *, topic: str) -> None:
 @commands.cooldown(2, 75, commands.BucketType.user)
 @commands.guild_only()
 async def debate_command(ctx: commands.Context, member: discord.Member, *, topic: str) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
     if member.bot or member.id == ctx.author.id:
         await ctx.send("Pick another non-bot member for debate.")
         return
@@ -4944,15 +22278,56 @@ async def debate_command(ctx: commands.Context, member: discord.Member, *, topic
             f"User B style sample:\n" + "\n".join(f"- {m}" for m in member_msgs[-14:])
         )
         try:
-            result = await request_fun_ai(prompt, max_tokens=320, temperature=0.88)
+            result = await request_fun_ai(
+                prompt,
+                max_tokens=320,
+                temperature=0.88,
+                policy_key="debate",
+            )
         except Exception as error:
             print(f"[DEBATE ERROR] {error}")
             await ctx.send(friendly_ai_error(error))
             return
     await send_chunked(
         ctx,
-        f"🏛️ **Debate Arena**: {ctx.author.mention} vs {member.mention}\nTopic: **{topic}**\n\n{result}",
+        f"ðŸ›ï¸ **Debate Arena**: {ctx.author.mention} vs {member.mention}\nTopic: **{topic}**\n\n{result}",
     )
+
+
+@bot.hybrid_command(name="translate")
+@commands.cooldown(3, 20, commands.BucketType.user)
+async def translate_command(ctx: commands.Context, *, text_or_link: str | None = None) -> None:
+    raw_input = (text_or_link or "").strip()
+    source_message = await resolve_message_from_context(ctx, raw_input)
+    source_text = ""
+
+    if source_message is not None:
+        source_text = (source_message.clean_content or "").strip()
+        if not source_text and source_message.attachments:
+            await ctx.send("That message has no text content to translate.")
+            return
+    else:
+        if raw_input and DISCORD_MESSAGE_LINK_RE.search(raw_input):
+            await ctx.send(
+                "I could not read that Discord message link here. Reply to the message, or pass a readable link from this server."
+            )
+            return
+        source_text = raw_input
+
+    if not source_text:
+        await ctx.send(
+            f"Usage: reply to a message and run `{PREFIX}translate`, or use `{PREFIX}translate <text>`."
+        )
+        return
+    if len(source_text) > 1600:
+        await ctx.send("Translation input is too long. Keep it under `1600` characters.")
+        return
+
+    async with ctx.typing():
+        payload = await translate_text_to_english(source_text)
+
+    translated_text = str(payload.get("translated_text", "") or "").strip() or source_text
+    await send_chunked(ctx, translated_text)
 
 
 @bot.command(name="ai", aliases=["ask"])
@@ -4977,6 +22352,7 @@ async def ai_command(ctx: commands.Context, *, prompt: str | None = None) -> Non
                 messages,
                 max_tokens=AI_MAX_TOKENS,
                 temperature=0.5,
+                policy_key="chat",
             )
         except Exception as error:
             print(f"[AI ERROR] {error}")
@@ -5028,6 +22404,7 @@ async def aisummary_command(ctx: commands.Context, count: int = 25) -> None:
                 messages,
                 max_tokens=AI_SUMMARY_MAX_TOKENS,
                 temperature=0.2,
+                policy_key="summary",
             )
         except Exception as error:
             print(f"[AI SUMMARY ERROR] {error}")
@@ -5035,6 +22412,52 @@ async def aisummary_command(ctx: commands.Context, count: int = 25) -> None:
             return
 
     await send_chunked(ctx, f"Summary of last `{len(transcript)}` messages:\n{summary}")
+
+
+@bot.hybrid_command(name="catchup")
+@commands.cooldown(2, 30, commands.BucketType.user)
+@commands.guild_only()
+async def catchup_command(ctx: commands.Context, hours: int = 24) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
+    if hours < 1 or hours > CATCHUP_MAX_HOURS:
+        await ctx.send(f"`hours` must be between `1` and `{CATCHUP_MAX_HOURS}`.")
+        return
+    await run_catchup_for_channel(ctx, ctx.channel, hours)
+
+
+@bot.hybrid_command(name="catchupchannel")
+@commands.cooldown(2, 35, commands.BucketType.user)
+@commands.guild_only()
+async def catchup_channel_command(
+    ctx: commands.Context, channel: discord.TextChannel, hours: int = 24
+) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
+    if hours < 1 or hours > CATCHUP_MAX_HOURS:
+        await ctx.send(f"`hours` must be between `1` and `{CATCHUP_MAX_HOURS}`.")
+        return
+    if not channel.permissions_for(ctx.author).view_channel:
+        await ctx.send("You do not have access to that channel.")
+        return
+    me = ctx.guild.me
+    if me is None or not channel.permissions_for(me).read_message_history:
+        await ctx.send("I cannot read that channel's history.")
+        return
+    await run_catchup_for_channel(ctx, channel, hours)
+
+
+@bot.hybrid_command(name="serverinsights")
+@commands.cooldown(2, 90, commands.BucketType.user)
+@commands.guild_only()
+@commands.has_permissions(manage_guild=True)
+async def serverinsights_command(ctx: commands.Context, hours: int = 72) -> None:
+    if not await enforce_fun_rate_limit_ctx(ctx):
+        return
+    if hours < 6 or hours > INSIGHTS_MAX_HOURS:
+        await ctx.send(f"`hours` must be between `6` and `{INSIGHTS_MAX_HOURS}`.")
+        return
+    await run_server_insights(ctx, ctx.guild, hours)
 
 
 @bot.command(name="pb")
@@ -5390,8 +22813,18 @@ def main() -> None:
         raise RuntimeError("DISCORD_BOT_TOKEN is missing. Put it in your .env file.")
     ensure_data_files()
     reload_bad_words()
+    load_ai_mod_state()
+    load_engagement_state()
+    load_aicrush_state()
+    load_altfinder_state()
+    load_socialintel_state()
+    load_business_state()
     bot.run(TOKEN)
 
 
 if __name__ == "__main__":
     main()
+
+
+
+

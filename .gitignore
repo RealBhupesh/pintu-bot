@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 data/
 .cache
+slides_project_overview/node_modules/
+slides_project_overview/rendered/
+slides_project_overview/*.pptx
+slides_project_overview/*.mp4
